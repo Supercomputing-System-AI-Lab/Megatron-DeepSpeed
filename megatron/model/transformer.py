@@ -1802,6 +1802,8 @@ class ParallelTransformer(MegatronModule):
                 moe_losses = []
                 for index in range(start, end):
                     layer = self._get_layer(index)
+                    if len(args) > 9:
+                        args = args[:9]
                     output = layer(x_, *args, **kwargs)
                     if isinstance(output, tuple):
                         x_, moe_loss = output
