@@ -1249,13 +1249,13 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     while iteration < args.train_iters and (args.train_tokens is None or \
         args.consumed_train_tokens < args.train_tokens):
         trigger(on_step_begin)
-        update_num_microbatches(args.consumed_train_samples)
-        if args.deepspeed:
-            # inform deepspeed of any batch size changes
-            global_batch_size = mpu.get_data_parallel_world_size() * \
-                                args.micro_batch_size * \
-                                get_num_microbatches()
-            model[0].set_train_batch_size(global_batch_size)
+        # update_num_microbatches(args.consumed_train_samples)
+        # if args.deepspeed:
+        #     # inform deepspeed of any batch size changes
+        #     global_batch_size = mpu.get_data_parallel_world_size() * \
+        #                         args.micro_batch_size * \
+        #                         get_num_microbatches()
+        #     model[0].set_train_batch_size(global_batch_size)
 
         if args.curriculum_learning_legacy and not args.no_pipeline_parallel:
             curriculum_seqlen = args.curriculum_scheduler.update_difficulty( \

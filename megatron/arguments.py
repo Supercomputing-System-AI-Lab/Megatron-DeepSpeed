@@ -6,6 +6,7 @@
 import argparse
 import dataclasses
 import json
+import math
 import os
 import torch
 import deepspeed
@@ -58,6 +59,13 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
         args, _ = parser.parse_known_args()
     else:
         args = parser.parse_args()
+
+    dp_world_size = args.data_parallel_size_arg
+    train_batch = args.global_batch_size
+    micro_batch = args.micro_batch_size
+    aligned_train_batch = math.ceil(train_batch / (micro_batch * dp_world_size)) * micro_batch * dp_world_size
+    args.real_global_batch_size = train_batch
+    args.global_batch_size = aligned_train_batch
 
     # helper argument to set deepspeed pipeline parallel or not
     args.ds_pipeline_enabled = not args.no_pipeline_parallel
@@ -1153,6 +1161,8 @@ def _add_distributed_args(parser):
                         help="use tensor parallelism for expert layers in MoE")
     group.add_argument('--pipeline-model-parallel-size', type=int, default=1,
                        help='Degree of pipeline model parallelism.')
+    group.add_argument('--data-parallel-size-arg', type=int, default=1,
+                       help='Degree of data parallelism for tmp pass.')
     group.add_argument('--pipeline-model-parallel-split-rank',
                        type=int, default=None,
                        help='Rank where encoder and decoder should be split.')

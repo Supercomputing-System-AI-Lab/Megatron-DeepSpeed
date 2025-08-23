@@ -13,7 +13,7 @@ from deepspeed.runtime.dataloader import RepeatingLoader
 
 
 def build_pretraining_data_loader(dataset, consumed_samples):
-    """Buld dataloader given an input dataset."""
+    """Build dataloader given an input dataset."""
 
     if dataset is None:
         return None
@@ -25,6 +25,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             total_samples=len(dataset),
             consumed_samples=consumed_samples,
             micro_batch_size=args.micro_batch_size,
+            real_global_batch_size=args.real_global_batch_size,
             data_parallel_rank=mpu.get_data_parallel_rank(),
             data_parallel_size=mpu.get_data_parallel_world_size())
     elif args.dataloader_type == 'cyclic':
@@ -51,13 +52,15 @@ def build_pretraining_data_loader(dataset, consumed_samples):
 
 class MegatronPretrainingSampler:
 
-    def __init__(self, total_samples, consumed_samples, micro_batch_size,
+    def __init__(self, total_samples, consumed_samples, micro_batch_size, real_global_batch_size,
                  data_parallel_rank, data_parallel_size, drop_last=True):
         # Keep a copy of input params for later use.
         self.total_samples = total_samples
         self.consumed_samples = consumed_samples
         self.micro_batch_size = micro_batch_size
+        self.real_global_batch_size = real_global_batch_size
         self.data_parallel_rank = data_parallel_rank
+        self.data_parallel_size = data_parallel_size
         self.micro_batch_times_data_parallel_size = \
             self.micro_batch_size * data_parallel_size
         self.drop_last = drop_last
@@ -79,7 +82,10 @@ class MegatronPretrainingSampler:
 
     def get_start_end_idx(self):
         start_idx = self.data_parallel_rank * self.micro_batch_size
-        end_idx = start_idx + self.micro_batch_size
+        if self.data_parallel_rank == self.data_parallel_size - 1:
+            end_idx = self.real_global_batch_size
+        else:
+            end_idx = start_idx + self.micro_batch_size
         return start_idx, end_idx
 
     def __iter__(self):
@@ -87,7 +93,7 @@ class MegatronPretrainingSampler:
         # Last batch will be dropped if drop_last is not set False
         for idx in range(self.consumed_samples, self.total_samples):
             batch.append(idx)
-            if len(batch) == self.micro_batch_times_data_parallel_size:
+            if len(batch) == self.real_global_batch_size:
                 start_idx, end_idx = self.get_start_end_idx()
                 yield batch[start_idx:end_idx]
                 batch = []
