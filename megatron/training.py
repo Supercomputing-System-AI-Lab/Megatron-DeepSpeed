@@ -39,7 +39,7 @@ from megatron.core.enums import ModelType
 from megatron.optimizer import get_megatron_optimizer
 from megatron.initialize import initialize_megatron
 from megatron.initialize import write_args_to_tensorboard
-from megatron.initialize import set_jit_fusion_options
+# from megatron.initialize import set_jit_fusion_options
 from megatron.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.utils import check_adlr_autoresume_termination
@@ -136,8 +136,8 @@ def pretrain(train_valid_test_dataset_provider,
         sys.exit()
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
-    if get_accelerator().device_name() == 'cuda':
-        set_jit_fusion_options()
+    # if get_accelerator().device_name() == 'cuda':
+        # set_jit_fusion_options()
 
     # Adjust the startup time so it reflects the largest value.
     # This will be closer to what scheduler will see (outside of
@@ -1554,13 +1554,13 @@ def build_train_valid_test_datasets(build_train_valid_test_datasets_provider):
     if args.train_samples:
         train_samples = args.train_samples
     else:
-        train_samples = args.train_iters * args.global_batch_size
+        train_samples = args.train_iters * args.real_global_batch_size
     eval_iters = (args.train_iters // args.eval_interval + 1) * \
                  args.eval_iters
     test_iters = args.eval_iters
     train_val_test_num_samples = [train_samples,
-                                  eval_iters * args.global_batch_size,
-                                  test_iters * args.global_batch_size]
+                                  eval_iters * args.real_global_batch_size,
+                                  test_iters * args.real_global_batch_size]
     print_rank_0(' > datasets target sizes (minimum size):')
     print_rank_0('    train:      {}'.format(train_val_test_num_samples[0]))
     print_rank_0('    validation: {}'.format(train_val_test_num_samples[1]))
