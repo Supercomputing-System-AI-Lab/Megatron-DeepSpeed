@@ -268,7 +268,7 @@ def get_parameters_in_billions(model):
     return approx_parameters_in_billions*gpus_per_model/(1e9)
 
 def throughput_calculator(model, args, iteration_time, total_iterations):
-    batch_size = args.micro_batch_size * get_num_microbatches() * args.data_parallel_size
+    batch_size = args.real_global_batch_size
     approx_parameters_in_billions = None if (model is None) else get_parameters_in_billions(model)
     elapsed_time_per_iter = iteration_time/total_iterations
     samples_per_second = batch_size / elapsed_time_per_iter
