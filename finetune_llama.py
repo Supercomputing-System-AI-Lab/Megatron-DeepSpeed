@@ -18,6 +18,9 @@ from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group, update_rotary_pos_emb
 from megatron.arguments import core_transformer_config_from_args
+from megatron.model.transformer import ParallelMLP
+from torch.profiler import profile, record_function, ProfilerActivity, schedule
+import torch.distributed as dist
 
 import deepspeed
 from deepspeed.runtime.utils import see_memory_usage
@@ -27,7 +30,65 @@ import subprocess
 
 from torch import nn
 import torch.nn.functional as F
-from transformers import AutoTokenizer
+
+import os
+import datetime
+from datetime import timedelta
+
+
+from deepspeed.moe.layer import MoE
+
+master_port = "29500"
+default_pg_timeout = timedelta(minutes=1)
+# def setup_distributed_env(init_method=None, rank = 0, world_size=16):
+#     from mpi4py import MPI
+#     comm = MPI.COMM_WORLD
+#     world_size = comm.Get_size()
+#     world_rank = rank = comm.Get_rank()
+#     backend = None
+#     os.environ['MASTER_ADDR'] = master_addr
+#     os.environ['MASTER_PORT'] = master_port
+#     os.environ['WORLD_SIZE'] = str(world_size)
+#     os.environ['RANK'] = str(world_rank)
+#     os.environ['LOCAL_RANK'] = "0"#str(world_rank % 8)
+#     print("initialization parameters:", init_method, backend, rank, world_size)
+#     torch.distributed.init_process_group(backend,
+#                                         timeout=default_pg_timeout,
+#                                         init_method=init_method,
+#                                         rank=rank,
+#                                         world_size=world_size)
+#     using_mpi = torch.distributed.get_backend() == 'mpi'
+#     print("using_mpi=", using_mpi)
+
+def _set_env_variables(args):
+    from mpi4py import MPI
+    # Call the init process
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    world_size = comm.Get_size()
+    master_addr = args.master_addr
+
+    proc_name = MPI.Get_processor_name()
+    all_procs = comm.allgather(proc_name)
+    local_rank = sum([i == proc_name for i in all_procs[:rank]])
+    os.environ['RANK'] = str(rank)
+    os.environ['WORLD_SIZE'] = str(world_size)
+    os.environ['LOCAL_RANK'] = "0"#str(local_rank)
+    os.environ['MASTER_ADDR'] = master_addr
+    os.environ['MASTER_PORT'] = str(29500)
+    print("world_size, rank, master_addr, local_rank:", world_size, rank, master_addr, local_rank)
+    using_mpi = torch.distributed.get_backend() == 'mpi'
+    print("using_mpi=", using_mpi)
+
+def get_env_variables(args):
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = os.environ['LOCAL_RANK']
+    master_addr = os.environ['MASTER_ADDR']
+    master_port = os.environ['MASTER_PORT']
+    print("world_size, rank, master_addr, master_port, local_rank:", world_size, rank, master_addr, master_port, local_rank)
+    using_mpi = torch.distributed.get_backend() == 'mpi'
+    print("using_mpi=", using_mpi)
 
 
 def model_provider(pre_process=True, post_process=True):
@@ -254,22 +315,94 @@ def calculate_mos_loss(args, stu_output, teacher_model, tokens, position_ids, at
         mos_loss = mos_loss.div(args.seq_length) * beta
     return mos_loss
 
+# timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+
 def forward_step(data_iterator, model):
     """Forward step."""
     args = get_args()
     timers = get_timers()
 
-    # Get the batch.
-    timers('batch-generator', log_level=2).start()
-    tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
-        data_iterator)
-    timers('batch-generator').stop()
+    # """
+    # def trace_handler(prof):
+    #     from mpi4py import MPI
+    #     comm = MPI.COMM_WORLD
+    #     rank = comm.Get_rank()
+    #     world_size = comm.Get_size()
+    #     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
+    #     # prof.export_chrome_trace(f"/lustre/orion/gen150/scratch/pinaster/smore/layer_test/system-benchmark/tmp/test_trace_{rank}_of_{world_size}_" + str(prof.step_num) + ".json")
+        
+    #     base_dir = f"../scripts/torch_profile/prof_one"
+    #     os.makedirs(base_dir, exist_ok=True)
+    #     prof.export_chrome_trace (os.path.join(base_dir, f"trace_rank{rank}_of_{world_size}_step{prof.step_num}.json"))
+    def _get_rank_world():
+        # Works under DeepSpeed/Megatron once dist is initialized
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank(), dist.get_world_size()
+        # Fallback (single process)
+        return 0, 1
 
-    if args.data_efficiency_curriculum_learning:
-        args.curriculum_seqlen = tokens.size()[1]
-        if hasattr(args, 'data_efficiency_curriculum_learning_seqlen_type') and \
-            args.data_efficiency_curriculum_learning_seqlen_type == 'seqlen_reshape':
-            args.data_efficiency_curriculum_learning_numel = torch.numel(tokens)
+    def trace_handler(prof):
+        # _PROFILE_DIR = os.path.abspath("../scripts/torch_profile/ds_prof_yes_torch_tensor_v2")
+        _PROFILE_DIR = os.path.abspath("../scripts/torch_profile/xmoe_prof_yes_torch_tensor_v3")
+        rank, world = _get_rank_world()
+        # Defensive: re-ensure dir exists inside handler (writer thread)
+        try:
+            os.makedirs(_PROFILE_DIR, exist_ok=True)
+        except Exception:
+            pass
+        # Unique, stable filename per rank/step
+        fname = os.path.join(
+            _PROFILE_DIR,
+            f"trace_rank{rank}_of_{world}_step{prof.step_num}.json"
+        )
+        # Print table to the rank’s stdout (optional)
+        try:
+            print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
+        except Exception:
+            pass
+        # Export trace
+        prof.export_chrome_trace(fname)
+
+    sched = schedule(wait=1, warmup=1, active=5, repeat=1)
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], 
+        schedule=sched,
+        record_shapes=True, 
+        with_stack=True,
+        with_flops=True,
+        with_modules=True,
+        profile_memory=True,
+        # on_trace_ready=torch.profiler.tensorboard_trace_handler('./log_dir')  # Save trace for TensorBoard
+        on_trace_ready=trace_handler
+    ) as prof:
+
+        with record_function("get_batch"):
+            tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator)
+
+        # Forward pass
+        with record_function("forward_pass"):
+            if args.mos or args.kd:
+                stu_output, other_losses = model(tokens, position_ids, attention_mask)
+                output_tensor = tensor_parallel.vocab_parallel_cross_entropy(stu_output.contiguous().float(), labels)
+            else:
+                output_tensor, other_losses = model(tokens, position_ids, attention_mask, labels=labels)
+
+        # Loss calculation
+        with record_function("loss_calculation"):
+            moe_losses = [moe_loss for moe_loss in other_losses if moe_loss is not None]
+            moe_loss = sum(moe_losses) * args.moe_loss_coeff
+
+            mos_loss = 0
+            if args.mos or args.kd:
+                if args.teacher_forward and args.teacher_model is not None:
+                    mos_loss = calculate_mos_loss(args, stu_output, args.teacher_model[0], tokens, position_ids, attention_mask)
+            loss = partial(loss_func, loss_mask, moe_loss, mos_loss)
+
+        # Backward pass (in pretrain function, for example)
+        prof.step()  # Record each iteration or step
+    return output_tensor, loss
+    """
+    tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator)
 
     if args.mos or args.kd:
         # The forward func can return either the loss or the logits, depending on whether passing in the labels or not.
@@ -299,6 +432,7 @@ def forward_step(data_iterator, model):
 
     # Output_tensor stores the standard loss, loos_func calculates the total loss.
     return output_tensor, partial(loss_func, loss_mask, moe_loss, mos_loss)
+    """
 
 
 def prompt_train_valid_test_datasets_provider(train_val_test_num_samples):
@@ -343,7 +477,55 @@ def git_ds_info():
 
 if __name__ == "__main__":
     git_ds_info()
-    pretrain(prompt_train_valid_test_datasets_provider,
+    
+    # def _get_rank_world():
+    #     # Works under DeepSpeed/Megatron once dist is initialized
+    #     if dist.is_available() and dist.is_initialized():
+    #         return dist.get_rank(), dist.get_world_size()
+    #     # Fallback (single process)
+    #     return 0, 1
+
+    # def trace_handler(prof):
+    #     _PROFILE_DIR = os.path.abspath("../scripts/torch_profile/xmoe_2_steps_prof_yes_torch_tensor_v2")
+    #     rank, world = _get_rank_world()
+    #     # Defensive: re-ensure dir exists inside handler (writer thread)
+    #     try:
+    #         os.makedirs(_PROFILE_DIR, exist_ok=True)
+    #     except Exception:
+    #         pass
+    #     # Unique, stable filename per rank/step
+    #     fname = os.path.join(
+    #         _PROFILE_DIR,
+    #         f"trace_rank{rank}_of_{world}_step{prof.step_num}.json"
+    #     )
+    #     # Print table to the rank’s stdout (optional)
+    #     try:
+    #         print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
+    #     except Exception:
+    #         pass
+    #     # Export trace
+    #     prof.export_chrome_trace(fname)
+
+    # with profile(
+    #     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], 
+    #     record_shapes=True, 
+    #     with_stack=True,
+    #     with_flops=False,
+    #     with_modules=True,
+    #     profile_memory=True,
+    #     # on_trace_ready=torch.profiler.tensorboard_trace_handler('./log_dir')  # Save trace for TensorBoard
+    #     on_trace_ready=trace_handler
+    # ) as prof:
+    #     with record_function("begin training"):
+    #         pretrain(train_valid_test_datasets_provider,
+    #             model_provider,
+    #             ModelType.encoder_or_decoder,
+    #             forward_step,
+    #             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+    #             data_post_process=data_post_process)
+
+        
+    pretrain(train_valid_test_datasets_provider,
              model_provider,
              ModelType.encoder_or_decoder,
              forward_step,
