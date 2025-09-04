@@ -446,12 +446,12 @@ def get_optimizer_param_scheduler(optimizer):
     if args.train_iters:
         if args.lr_decay_iters is None:
             args.lr_decay_iters = args.train_iters
-        lr_decay_steps = args.lr_decay_iters * args.global_batch_size
-        wd_incr_steps = args.train_iters * args.global_batch_size
+        lr_decay_steps = args.lr_decay_iters * args.real_global_batch_size
+        wd_incr_steps = args.train_iters * args.real_global_batch_size
         if args.lr_warmup_fraction is not None:
             lr_warmup_steps = args.lr_warmup_fraction * lr_decay_steps
         else:
-            lr_warmup_steps = args.lr_warmup_iters * args.global_batch_size
+            lr_warmup_steps = args.lr_warmup_iters * args.real_global_batch_size
     # Sample-based training.
     elif args.train_samples:
         # We need to set training iters for later use. Technically
