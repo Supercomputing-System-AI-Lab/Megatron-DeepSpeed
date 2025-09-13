@@ -21,3 +21,6 @@ logs
 
 # Data folder
 bookcorpus_data/
+
+# data
+examples_xmoe/data/
