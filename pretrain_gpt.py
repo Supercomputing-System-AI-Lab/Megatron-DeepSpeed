@@ -215,6 +215,14 @@ def loss_func(loss_mask, moe_loss, mos_loss, output_tensor):
     loss_mask = loss_mask.view(-1).float()
     loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
 
+    #get Σm（
+    m_local = loss_mask.sum()
+    m_total = m_local.detach().clone()
+    torch.distributed.all_reduce(m_total, group=mpu.get_data_parallel_group())
+    dp = torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
+
+   
+    loss = loss * (m_local * dp) / (m_total)
     # Reduce loss for logging.
     averaged_loss = average_losses_across_data_parallel_group([loss])
     if args.mos or args.kd:
