@@ -15,7 +15,7 @@ export DATA_PATH=../data/my-gpt2_text_document
 
 NUM_GPUS=$1
 BATCH_SIZE=$2
-GLOBAL_BATCH_SIZE=$((BATCH_SIZE * NUM_GPUS * 8))
+GLOBAL_BATCH_SIZE=$((BATCH_SIZE * NUM_GPUS))
 DIR=`pwd`
 ###############################################################################
 ### Main configs
@@ -23,6 +23,7 @@ DIR=`pwd`
 SEQ_LEN=2048
 
 NUM_LAYERS=28 # TODO
+# NUM_LAYERS=12 # TODO
 
 ## GPT-3 13B
 MODEL_SIZE=10.1
@@ -41,7 +42,8 @@ MIN_LR=1.0e-6
 
 TRAIN_TOKENS=300000000000
 
-TRAIN_ITERS=50
+TRAIN_ITERS=20
+# TRAIN_ITERS=4
 
 EXIT_DURATION=30000000
 WARMUP_TOKENS=375000000
@@ -300,6 +302,10 @@ echo "MASTER_ADDR=" $MASTER_ADDR
 #         --checkpoint-layernorm \
 #         --checkpoint-intermediate"
 
+export TRITON_DISABLE_CACHE=1
+export to_profile="False"
+# export to_profile="True"
+
 # source export_DDP_vars.sh
 torchrun --nnodes 1 --nproc_per_node ${NUM_GPUS} ../pretrain_gpt_deepspeed.py \
         ${megatron_options} \
@@ -307,6 +313,17 @@ torchrun --nnodes 1 --nproc_per_node ${NUM_GPUS} ../pretrain_gpt_deepspeed.py \
         ${deepspeed_options} \
         --master-addr=$MASTER_ADDR \
         --zero-stage 1 \
-        --use-flash-attn-v2 \
         2>&1 | tee n${NUM_GPUS}-Small-DeepSpeed-MoE-batch${BATCH_SIZE}.log
+
+# torchrun --nnodes 1 --nproc_per_node ${NUM_GPUS} ../pretrain_gpt_deepspeed.py \
+#         ${megatron_options} \
+#         ${data_options} \
+#         ${deepspeed_options} \
+#         --master-addr=$MASTER_ADDR \
+#         --zero-stage 1 \
+#         --use-flash-attn-v2 \
+#         2>&1 | tee n${NUM_GPUS}-Small-DeepSpeed-MoE-batch${BATCH_SIZE}.log
+
+python analyze_log.py n8-Small-DeepSpeed-MoE-batch${BATCH_SIZE}.log
+
 echo ${run_cmd}

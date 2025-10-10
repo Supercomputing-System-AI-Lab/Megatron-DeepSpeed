@@ -308,11 +308,77 @@ def initialize_model_parallel(
             if rank in ranks:
                 _AMAX_REDUCTION_GROUP = group
 
+    print_parallel_group_info() 
+
     # Initialize global memory buffer
     # This isn't really "parallel state" but there isn't another good place to
     # put this. If we end up with a more generic initialization of megatron-core
     # we could stick it there
     _set_global_memory_buffer()
+    
+
+
+# Alternative: Add this function to print group info after initialization
+def print_parallel_group_info():
+    """Print parallel group information for current rank."""
+    import os 
+    rank = os.getenv ('RANK')
+    print (f'[print] rank={rank}')
+    
+    if not torch.distributed.is_initialized():
+        print("PyTorch distributed not initialized!")
+        return
+        
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+    
+    print(f"\n=== PARALLEL GROUP INFO FOR RANK {rank} ===")
+    
+    # You'll need to import these from your parallel state module
+    # For example, if using Megatron:
+    try:
+        from megatron.core import parallel_state
+        
+        # Tensor Parallel info
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        tp_world_size = parallel_state.get_tensor_model_parallel_world_size()
+        
+        print(f"[Rank {rank}] Tensor Parallel:")
+        print(f"[Rank {rank}]   - TP Rank: {tp_rank}/{tp_world_size}")
+        print(f"[Rank {rank}]   - TP Group: {parallel_state.get_tensor_model_parallel_group()}")
+        
+        # Pipeline Parallel info  
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        pp_world_size = parallel_state.get_pipeline_model_parallel_world_size()
+        
+        print(f"[Rank {rank}] Pipeline Parallel:")
+        print(f"[Rank {rank}]   - PP Rank: {pp_rank}/{pp_world_size}")
+        print(f"[Rank {rank}]   - PP Group: {parallel_state.get_pipeline_model_parallel_group()}")
+        
+        # Data Parallel info
+        dp_rank = parallel_state.get_data_parallel_rank()
+        dp_world_size = parallel_state.get_data_parallel_world_size()
+        
+        print(f"[Rank {rank}] Data Parallel:")
+        print(f"[Rank {rank}]   - DP Rank: {dp_rank}/{dp_world_size}")
+        print(f"[Rank {rank}]   - DP Group: {parallel_state.get_data_parallel_group()}")
+        
+        # Expert Parallel info (if available)
+        try:
+            ep_rank = parallel_state.get_expert_model_parallel_rank()
+            ep_world_size = parallel_state.get_expert_model_parallel_world_size()
+            
+            print(f"[Rank {rank}] Expert Parallel:")
+            print(f"[Rank {rank}]   - EP Rank: {ep_rank}/{ep_world_size}")
+            print(f"[Rank {rank}]   - EP Group: {parallel_state.get_expert_model_parallel_group()}")
+        except:
+            print(f"[Rank {rank}] Expert Parallel: Not available")
+            
+    except ImportError:
+        print(f"[Rank {rank}] Megatron parallel_state not available")
+        print(f"[Rank {rank}] Use manual calculation based on your setup")
+
 
 
 def is_unitialized():

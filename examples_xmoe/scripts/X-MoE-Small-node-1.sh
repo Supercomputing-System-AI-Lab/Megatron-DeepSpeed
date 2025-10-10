@@ -15,14 +15,16 @@ export DATA_PATH=../data/my-gpt2_text_document
 
 NUM_GPUS=$1
 BATCH_SIZE=$2
-GLOBAL_BATCH_SIZE=$((BATCH_SIZE * NUM_GPUS * 8))
+# GLOBAL_BATCH_SIZE=$((BATCH_SIZE * NUM_GPUS))
+GLOBAL_BATCH_SIZE=$((BATCH_SIZE * 32))
 DIR=`pwd`
 ###############################################################################
 ### Main configs
 ## GPT-3 models use 2K sequence length/context window
 SEQ_LEN=2048
 
-NUM_LAYERS=28 # TODO
+# NUM_LAYERS=24 # TODO
+NUM_LAYERS=16 # TODO
 
 ## GPT-3 13B
 MODEL_SIZE=10.1
@@ -40,8 +42,10 @@ LR=1.2e-4
 MIN_LR=1.0e-6
 
 TRAIN_TOKENS=300000000000
+# TRAIN_TOKENS=3000000000
 
-TRAIN_ITERS=50
+TRAIN_ITERS=20
+# TRAIN_ITERS=4
 
 EXIT_DURATION=30000000
 WARMUP_TOKENS=375000000
@@ -50,8 +54,8 @@ LR_DECAY_TOKENS=300000000000
 
 MP_SIZE=1
 PP_SIZE=1
-EP_SIZE=64
-EP_PARALLEL_SIZE=8
+EP_SIZE=24
+EP_PARALLEL_SIZE=4
 
 if [[ $EP_PARALLEL_SIZE -gt $NUM_GPUS ]]; then
     EP_PARALLEL_SIZE=$NUM_GPUS
@@ -242,7 +246,8 @@ fi
 # megatron_options="${megatron_options} \
 #         --checkpoint-intermediate"
 
-WALL_CLOCK_BREAKDOWN="false"
+# WALL_CLOCK_BREAKDOWN="false"
+WALL_CLOCK_BREAKDOWN="true"
 
 template_json="../ds_config_gpt_TEMPLATE.json"
 config_json="ds_config_gpt_Zero0_${NAME}.json"
@@ -283,6 +288,8 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export OMP_NUM_THREADS=2
 
 export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((NUM_GPUS-1)))
+# export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
 
 export NCCL_NET_GDR_LEVEL=3
 export FI_MR_CACHE_MONITOR=userfaultfd
@@ -302,6 +309,10 @@ echo "MASTER_ADDR=" $MASTER_ADDR
 #         --checkpoint-layernorm \
 #         --checkpoint-intermediate"
 
+export TRITON_DISABLE_CACHE=1
+export to_profile="False"
+# export to_profile="True"
+
 # source export_DDP_vars.sh
 torchrun --nnodes 1 --nproc_per_node ${NUM_GPUS} ../pretrain_gpt_deepspeed.py \
         ${megatron_options} \
@@ -309,6 +320,21 @@ torchrun --nnodes 1 --nproc_per_node ${NUM_GPUS} ../pretrain_gpt_deepspeed.py \
         ${deepspeed_options} \
         --master-addr=$MASTER_ADDR \
         --zero-stage 1 \
-        --use-flash-attn-v2 \
         2>&1 | tee n${NUM_GPUS}-Small-XMoE-batch${BATCH_SIZE}.log
+
+# torchrun --nnodes 1 --nproc_per_node ${NUM_GPUS} -m omnitrace  ../pretrain_gpt_deepspeed.py \
+#         ${megatron_options} \
+#         ${data_options} \
+#         ${deepspeed_options} \
+#         --master-addr=$MASTER_ADDR \
+#         --zero-stage 1 \
+#         2>&1 | tee n${NUM_GPUS}-Small-XMoE-batch${BATCH_SIZE}.log
+
+        # --use-flash-attn-v2 \
+
+python analyze_log.py n${NUM_GPUS}-Small-XMoE-batch${BATCH_SIZE}.log
+
 echo ${run_cmd}
+
+
+# bash X-MoE-Small-node-1.sh 8 2

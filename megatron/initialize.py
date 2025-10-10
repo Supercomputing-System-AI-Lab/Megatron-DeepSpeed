@@ -155,12 +155,19 @@ def _compile_dependencies():
     if is_rank_0():
         start_time = time.time()
         print('> compiling and loading fused kernels ...', flush=True)
+        print (f'{os.getenv ("CUDA_VISIBLE_DEVICES")=}')
         if get_accelerator().device_count() > 0: # Skip when CPU-only
             fused_kernels.load(args)
+        print ('after loading before barrier')
         torch.distributed.barrier()
+        print ('after barrier')
     else:
+        rank = os.getenv ('RANK')
+        print (f'{rank=} before baerrir')
         torch.distributed.barrier()
+        print (f'{rank=} after baerrir, loading')
         fused_kernels.load(args)
+        print (f'{rank=} after loading')
     # Simple barrier to make sure all ranks have passed the
     # compilation phase successfully before moving on to the
     # rest of the program. We think this might ensure that
@@ -224,7 +231,22 @@ def _set_env_variables(args):
 
 def _initialize_distributed():
     """Initialize torch.distributed and core model parallel."""
+    
+    
+    import torch.distributed as dist
+
+    if dist.is_available() and dist.is_initialized():
+        rank = dist.get_rank()          # global rank (0 .. world_size-1)
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ["LOCAL_RANK"])   # rank within this node
+        node_rank = int(os.environ.get("NODE_RANK", 0))  # if torchrun set it
+    else:
+        rank, world_size, local_rank, node_rank = 0, 1, 0, 0
+    
     args = get_args()
+    
+    print (f'manually get_args, args.rank={args.rank}')
+    
     if args.using_mpi:
         _set_env_variables(args)
     device_count = get_accelerator().device_count()
@@ -242,6 +264,14 @@ def _initialize_distributed():
         # Manually set the device ids.
         if device_count > 0:
             device = args.rank % device_count
+            
+            print (f'\n'* 7)
+            print (f'{device_count=}')
+            print (f'{args.rank=}')
+            print (f'{device=}')
+            print (f'{args.local_rank=}')
+            print (f'\n'* 7)
+            
             if args.local_rank is not None:
                 assert args.local_rank == device, \
                     'expected local-rank to be the same as rank % device-count.'
@@ -252,7 +282,18 @@ def _initialize_distributed():
 
     # Call the init process
     print("args values:", args)
+    # import os, socket
+    # print("BOOTSTRAP:",
+    #     "MASTER_ADDR=", os.getenv("MASTER_ADDR"),
+    #     "MASTER_PORT=", os.getenv("MASTER_PORT"),
+    #     "RANK=", os.getenv("RANK"),
+    #     "LOCAL_RANK=", os.getenv("LOCAL_RANK"),
+    #     "WORLD_SIZE=", os.getenv("WORLD_SIZE"),
+    #     "NCCL_SOCKET_IFNAME=", os.getenv("NCCL_SOCKET_IFNAME"),
+    #     "GLOO_SOCKET_IFNAME=", os.getenv("GLOO_SOCKET_IFNAME"),
+    #     "RESOLVES_TO=", socket.gethostbyname(os.getenv("MASTER_ADDR")))
     if args.deepspeed or args.ds_inference:
+        print("deepspeed.init_distributed():" )
         deepspeed.init_distributed()
     else:
         print("before init_process_group:" )
