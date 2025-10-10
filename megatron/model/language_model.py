@@ -520,12 +520,28 @@ class TransformerLanguageModel(MegatronModule):
                 pooling_sequence_index=0,
                 enc_hidden_states=None, output_enc_hidden=False):
         args = get_args()
+        import os 
+        rank = os.getenv ('RANK')
+        # print (f'[language_model.py] {rank=} {enc_input_ids.shape=}')
         # Encoder embedding.
         if self.pre_process:
+            # print (f'[language_model.py] {rank=} if self.pre_process:')
             encoder_input = self.embedding(enc_input_ids, enc_position_ids,
                                            tokentype_ids=tokentype_ids)
         else:
-            encoder_input = None
+            # print (f'[language_model.py] else NOT self.pre_process:')
+            a=1
+            
+            if os.getenv ("TORCH_PP_TOY") == "True": 
+                encoder_input = 1 * enc_input_ids 
+                # print (f'[language_model.py] setting encoder_input=enc_input_ids for PP middle stages')
+            else: 
+                # print (f'[language_model.py] defaulting encoder_input = None according to original code')
+                encoder_input = None
+            
+        
+        # print (f'[language_model.py] Entering {rank=}, {enc_input_ids.requires_grad=}, {enc_input_ids=} {enc_input_ids.shape=}, {encoder_input=}')
+        
 
         # Retriever embedding.
         if self.add_retriever and self.pre_process:
@@ -577,7 +593,18 @@ class TransformerLanguageModel(MegatronModule):
             if self.add_pooler and self.post_process:
                 return encoder_output, pooled_output, encoder_moe_losses
             else:
+                # import os 
+                # toy_pp = os.getenv ("TORCH_PP_TOY")
+                # print (f'{toy_pp=}')
+                # if toy_pp == "True":
+                #     print(f"[language_model.py] Returning  {type(encoder_output)=} {encoder_output.shape=} {encoder_output=}")
+                #     return encoder_output
+                # else:     
+                #     print(f"[language_model.py] Returning ELSE {type(encoder_output)=} {encoder_output.shape=} {encoder_output=}")
+                    # return encoder_output, encoder_moe_losses
+                # print(f"[language_model.py] Returning ELSE {type(encoder_output)=} {encoder_output.requires_grad=} {encoder_output.shape=} {encoder_output=}")
                 return encoder_output, encoder_moe_losses
+                
 
         # Decoder embedding.
         if self.pre_process:

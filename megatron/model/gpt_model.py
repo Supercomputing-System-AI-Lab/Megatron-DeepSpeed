@@ -2,7 +2,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """GPT-2 model."""
-
+import time 
 import torch
 from collections import OrderedDict
 
@@ -41,35 +41,34 @@ def post_language_model_processing(lm_output, labels, logit_weights,
                                    fp16_lm_cross_entropy):
 
     # Output. Format [s b h]
-    args = get_args()
-    if args.ds_sequence_parallel_fpdt:
-        seq_len = lm_output.shape[0]
-        num_chunks_ce = int(seq_len // (args.ds_sequence_parallel_fpdt_chunk_size // mpu.get_sequence_parallel_world_size() // 32))
-        loss = FPDT_LogitsLoss.apply(lm_output, labels, logit_weights, mpu.get_sequence_parallel_rank(), mpu.get_sequence_parallel_world_size(), mpu.get_sequence_parallel_group(), num_chunks_ce)
-        return loss
+    output = parallel_lm_logits(
+        lm_output,
+        logit_weights,
+        parallel_output)
+    
+    import os 
+    rank = os.getenv ('RANK')
+    # print (f'[gpt_model.py] {rank=} post_language_model_processing {output.shape=}, {labels=}, {output=}')
+
+    if labels is None:
+        # print (f'[gpt_model.py] {rank=} post_language_model_processing returning output.transpose(0,1).contiguous() {type(output.transpose(0,1).contiguous())=}')
+        # [s b h] => [b s h]
+        return output.transpose(0,1).contiguous()
     else:
-        output = parallel_lm_logits(
-            lm_output,
-            logit_weights,
-            parallel_output)
-
-        if labels is None:
-            # [s b h] => [b s h]
-            return output.transpose(0,1).contiguous()
+        # [b s] => [s b]
+        labels = labels.transpose(0,1).contiguous()
+        cross_entropy = sequence_parallel.vocab_sequence_parallel_cross_entropy if mpu.get_sequence_parallel_world_size() > 1 \
+            else tensor_parallel.vocab_parallel_cross_entropy
+        if fp16_lm_cross_entropy:
+            assert output.dtype == torch.half
+            loss = cross_entropy(output, labels)
         else:
-            # [b s] => [s b]
-            labels = labels.transpose(0,1).contiguous()
-            cross_entropy = sequence_parallel.vocab_sequence_parallel_cross_entropy if mpu.get_sequence_parallel_world_size() > 1 \
-                else tensor_parallel.vocab_parallel_cross_entropy
-            if fp16_lm_cross_entropy:
-                assert output.dtype == torch.half
-                loss = cross_entropy(output, labels)
-            else:
-                loss = cross_entropy(output.float(), labels)
+            loss = cross_entropy(output.float(), labels)
 
-            # [s b] => [b, s]
-            loss = loss.transpose(0,1).contiguous()
-            return loss
+        # [s b] => [b, s]
+        loss = loss.transpose(0,1).contiguous()
+        print (f'[gpt_model.py] {rank=} post_language_model_processing returning loss')
+        return loss
 
 
 class UniversalCheckpointInfo:
@@ -204,6 +203,8 @@ class GPTModel(MegatronModule):
         self.fp16_lm_cross_entropy = args.fp16_lm_cross_entropy
         self.return_moe_loss = return_moe_loss
         self.untie_embeddings_and_output_weights = args.untie_embeddings_and_output_weights
+        
+        print (f'[gpt_model.py] {args.num_experts=}')
 
         self.language_model, self._language_model_key = get_language_model(
             config=config,
@@ -227,6 +228,17 @@ class GPTModel(MegatronModule):
                 retriever_attn_mask=None,
                 labels=None, tokentype_ids=None, inference_params=None,
                 curriculum_seqlen=None):
+        
+        # torch.cuda.synchronize ()
+        # s = time.time() 
+        import os 
+        rank = os.getenv ('RANK')
+        # if (rank == '1'): 
+        #     # assert False 
+        #     print (f'{self=}')
+        #     # raise (RuntimeError, 'hi')
+        # print (f'[gpt_model.py] Entering {rank=}, {self.return_moe_loss=},{input_ids.requires_grad=}, {input_ids=}, {input_ids.shape=}, {position_ids.shape=}, {position_ids=}')
+        
         args = get_args()
         if curriculum_seqlen is not None:
             args.curriculum_seqlen = curriculum_seqlen
@@ -255,13 +267,31 @@ class GPTModel(MegatronModule):
             inference_params=inference_params)
 
         if self.post_process:
+            # print (f'[gpt_model.py] {rank=} if self.post_process. {self.untie_embeddings_and_output_weights=}')
             lm_output = post_language_model_processing(
                 lm_output, labels,
                 self.language_model.output_layer.weight if self.untie_embeddings_and_output_weights else self.shared_embedding_or_output_weight(),
                 self.parallel_output,
                 self.fp16_lm_cross_entropy)
-
-        return lm_output, moe_losses if self.return_moe_loss else lm_output
+        
+        
+        # print (f'[gpt_model.py] Returning {rank=}, {self.return_moe_loss=}, {lm_output.requires_grad=}, {lm_output.shape=}, {lm_output=}')
+        
+        # ****************************************************************************************************
+        # Zixian: 09/17/2025: 
+        # It NEEDS TO BE an explicit if-else statement. 
+        # This guarantees consistent return type behavior. 
+        # Otherwise, when torch.distributed.pipelining sending dummy example with device="meta"
+        # to capture input/output shape for buffers, it will DEFAULT return lm_output.clone(), moe_losses
+        # when the if-statement is a 1-line if.
+        # ****************************************************************************************************
+        if self.return_moe_loss: 
+            # print (f'[gpt_model.py] return lm_output.clone(), moe_losses')
+            return lm_output.clone(), moe_losses
+        else: 
+            # print (f'[gpt_model.py] return lm_output.clone() {lm_output.clone().shape=} {len (lm_output.clone())=}')
+            return lm_output.clone() 
+        # return lm_output.clone(), moe_losses if self.return_moe_loss else lm_output.clone() 
 
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
 
@@ -386,17 +416,13 @@ class GPTModelPipe(PipelineModule,MegatronModule):
         for layer_idx in range(args.num_layers):
             self.specs.append(
                 LayerSpec(ParallelTransformerLayerPipe,
-                          config,
-                          layer_number=layer_idx,
-                          self_attn_mask_type=AttnMaskType.causal,
-                          num_experts=experts_per_layer[layer_idx],
-                          input_aggregated_moe_loss=(self.is_moe_model and layer_idx > 0),
-                          return_aggregated_moe_loss=self.is_moe_model))
-
-        # if model has experts, add a layer to get and cache the aggregated moe loss from the
-        # last transformer layer
-        if self.is_moe_model:
-            self.specs.append(self._calculate_moe_loss)
+                    config,
+                    layer_number=layer_idx,
+                    self_attn_mask_type=AttnMaskType.causal, 
+                    
+                    # Zixian: 2025-09-26: Adding num_experts=args.num_experts in PP model init
+                    num_experts=args.num_experts[0], 
+                    ))
 
         # Final layernorm after transformer layers
         if args.normalization == 'layernorm':

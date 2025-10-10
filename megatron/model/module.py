@@ -138,7 +138,10 @@ def fp32_to_float16(val, float16_convertor):
         val_typecheck = val
         if isinstance(val_typecheck, (Parameter, Variable)):
             val_typecheck = val.data
-        if val_typecheck.dtype in _FLOAT_TYPES:
+        # Zixian: 09/23/2025: More robust type check to prevent lazy cuda init during PP, 
+        #                     where _FLOAT_TYPES's 2nd term in a partial
+        if isinstance(val_typecheck, torch.Tensor) and val_typecheck.dtype == torch.float32:
+        # if isinstance(val_typecheck, _FLOAT_TYPES):
             val = float16_convertor(val)
         return val
     return conversion_helper(val, half_conversion)
@@ -155,7 +158,10 @@ def float16_to_fp32(val):
         val_typecheck = val
         if isinstance(val_typecheck, (Parameter, Variable)):
             val_typecheck = val.data
-        if val_typecheck.dtype in _BF16_TYPES + _HALF_TYPES:
+        # Zixian: 09/23/2025: More robust type check to prevent lazy cuda init during PP, 
+        #                     where _HALF_TYPES's 2nd term in a partial
+        # if isinstance(val_typecheck, (_BF16_TYPES, _HALF_TYPES)):
+        if isinstance(val_typecheck, torch.Tensor) and val_typecheck.dtype in (torch.float16, torch.bfloat16):
             val = val.float()
         return val
     return conversion_helper(val, float_conversion)

@@ -673,6 +673,7 @@ def train_step(forward_step_func, data_iterator,
 
     if args.deepspeed and args.ds_pipeline_enabled:
         num_zeros_in_grad = 0
+        # print (f'[megatron/training.py] {model[0]=}')
         assert isinstance(model[0], deepspeed.PipelineEngine)
         loss = model[0].train_batch(data_iter=data_iterator)
         additional_losses = model[0].get_additional_losses()
@@ -1205,6 +1206,62 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler):
     checkpoint_throughput_calculator(model, timers('save-checkpoint').elapsed(reset=False))
     timers.log(['save-checkpoint'])
 
+# #############################################################################################################
+# ---------------------------
+# Global profiler object
+# ---------------------------
+import os
+from torch.profiler import profile, record_function, ProfilerActivity, schedule
+_PROF = None
+
+
+def _get_rank_world():
+    # Works under DeepSpeed/Megatron once dist is initialized
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size()
+    return 0, 1
+
+def _trace_handler(prof):
+    # out_dir = os.path.abspath("../scripts/torch_profile/xmoe_prof_yes_torch_tensor_v3")
+    out_dir = os.path.abspath(os.getenv ('profile_dir'))
+    os.makedirs(out_dir, exist_ok=True)
+    r, w = _get_rank_world()
+    fname = os.path.join(out_dir, f"trace_rank{r}_of_{w}.json")
+
+    # optional: print summary to stdout
+    try:
+        print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
+    except Exception:
+        pass
+
+    # export *one* json per rank containing multiple steps
+    prof.export_chrome_trace(fname)
+
+def _get_profiler():
+    """Create the global profiler if not yet created."""
+    global _PROF
+    if _PROF is None:
+        sched = schedule(wait=2, warmup=3, active=2, repeat=1)
+        _PROF = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=sched,
+            record_shapes=True,
+            with_stack=True,
+            with_flops=True,
+            with_modules=True,
+            profile_memory=True,
+            on_trace_ready=_trace_handler,
+        )
+        _PROF.__enter__()   # manually enter context once
+    return _PROF
+
+def finalize_profiler():
+    """Call this once at the very end of training (after pretrain)."""
+    global _PROF
+    if _PROF is not None:
+        _PROF.__exit__(None, None, None)
+        _PROF = None
+# #############################################################################################################
 
 def train(forward_step_func, model, optimizer, opt_param_scheduler,
           train_data_iterator, valid_data_iterator,
@@ -1212,6 +1269,12 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     """Train the model function."""
     args = get_args()
     timers = get_timers()
+    
+    # Zixian: 10/01/2025: Try to profile megatron pp 
+    to_profile=os.getenv ("to_profile")
+    print (f'[training.py] {to_profile=}')
+    if to_profile=='True': 
+        prof = _get_profiler()
 
     # Write args to tensorboard
     write_args_to_tensorboard()
@@ -1265,13 +1328,26 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                     update_rotary_pos_emb(curriculum_seqlen)
             args.curriculum_seqlen = curriculum_seqlen
         args.curr_iteration = iteration
-        loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
-            train_step(forward_step_func,
-                       train_data_iterator,
-                       model,
-                       optimizer,
-                       opt_param_scheduler,
-                       config)
+        
+        # Zixian: 10/01/2025: profiling 
+        if to_profile=='True': 
+            with record_function("pretrain"):
+                loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
+                train_step(forward_step_func,
+                        train_data_iterator,
+                        model,
+                        optimizer,
+                        opt_param_scheduler,
+                        config)
+            prof.step()
+        else: 
+            loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
+                train_step(forward_step_func,
+                        train_data_iterator,
+                        model,
+                        optimizer,
+                        opt_param_scheduler,
+                        config)
         iteration += 1
         args.iteration = iteration
         new_samples = mpu.get_data_parallel_world_size() * \
