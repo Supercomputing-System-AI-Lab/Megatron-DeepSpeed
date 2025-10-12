@@ -933,6 +933,16 @@ def bias_dropout_add_fused_inference(x: torch.Tensor,
     return bias_dropout_add(x, bias, residual, prob, False)
 
 
+def log_mem(file_name, rank, message):
+    alloc = torch.cuda.memory_allocated() / 1e9
+    max_alloc = torch.cuda.max_memory_allocated() / 1e9
+    reserved = torch.cuda.memory_reserved() / 1e9
+    max_reserved = torch.cuda.max_memory_reserved() / 1e9
+    print(f"MEM-UTIL-CHECK: [{file_name}] - {message} - rank-{rank} alloc={alloc:.1f}GB | peak_alloc={max_alloc:.1f}GB | "
+          f"reserved={reserved:.1f}GB | peak_reserved={max_reserved:.1f}GB")
+    torch.cuda.reset_peak_memory_stats()
+    
+
 class ParallelTransformerLayer(MegatronModule):
     """A single transformer layer.
 
@@ -1437,6 +1447,9 @@ class ParallelTransformerLayer(MegatronModule):
         #     print(f"layer [{self.layer_number}]:")
         
         # print(f"[megatron/model/transformer.py - ParallelTransformerLayer - forward] {rank=}, {self.layer_number=}, before ATTENTION")
+        
+        print(f"[MEM-UTIL-CHECK] [megatron/model/transformer.py - ParallelTransformerLayer - forward] before ATTENTION {rank=}, {self.layer_number=}, ")
+        log_mem (file_name = 'megatron/model/transformer.py - ParallelTransformerLayer - forward', rank=rank, message=f'layer-{self.layer_number} before ATTENTION')
 
         # Layer norm at the beginning of the transformer layer.
 
@@ -1502,6 +1515,7 @@ class ParallelTransformerLayer(MegatronModule):
         # mlp_bias = None                             # only create if truly needed
 
         # print (f'BEFORE MLP, {rank=}, {self.layer_number=} {layernorm_output.shape=}, {layernorm_output=}') 
+        log_mem (file_name = 'megatron/model/transformer.py - ParallelTransformerLayer - forward', rank=rank, message=f'layer-{self.layer_number} before MOE')
         if self.num_experts == 1:
             with record_function(f"MLP-{self.layer_number}"):
                 mlp_output, mlp_bias = self.mlp(layernorm_output)
