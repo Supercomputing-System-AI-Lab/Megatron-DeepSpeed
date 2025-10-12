@@ -23,4 +23,9 @@ logs
 bookcorpus_data/
 
 # data
-examples_xmoe/data/
+examples_xmoe/data/*.txt
+examples_xmoe/data/*.json
+examples_xmoe/data/*.bin
+examples_xmoe/data/*.idx
+examples_xmoe/data/*.jsonl
+examples_xmoe/data/index-cache/
