@@ -63,6 +63,9 @@ default_pg_timeout = timedelta(minutes=1)
 
 def _set_env_variables(args):
     from mpi4py import MPI
+    
+    print (f'[pretrain_gpt_deepspeed.py] inside _set_env_variables')
+    
     # Call the init process
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
@@ -86,6 +89,8 @@ def _set_env_variables(args):
     print("world_size, rank, master_addr, local_rank:", world_size, rank, master_addr, local_rank)
     using_mpi = torch.distributed.get_backend() == 'mpi'
     print("using_mpi=", using_mpi)
+    
+    print (f'[pretrain_gpt_deepspeed.py] after _set_env_variables')
 
 def get_env_variables(args):
     rank = int(os.environ["RANK"])
@@ -111,10 +116,20 @@ def model_provider(pre_process=True, post_process=True):
     args = get_args()
     if args.using_mpi:
         _set_env_variables(args)
+        # print (f'[pretrain_gpt_deepspeed.py] commenting out _set_env_variables(args)')
     else:
         get_env_variables(args)
 
     config = core_transformer_config_from_args(args)
+    
+    
+    if os.getenv ('profile_memory') == 'True': 
+        print (f'[pretrain_gpt_deepspeed.py] init_memory_logger() ')
+        from profiling_utils.memory_profiler import init_memory_logger
+        init_memory_logger() 
+    else: 
+        print (f'[pretrain_gpt_deepspeed.py] DISABLED init_memory_logger() ')
+    
     
     
     
