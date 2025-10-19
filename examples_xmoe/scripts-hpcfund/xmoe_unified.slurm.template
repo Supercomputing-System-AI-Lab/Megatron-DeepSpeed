@@ -7,7 +7,7 @@
 #SBATCH -N {{NODES}}
 #SBATCH -n {{TOTAL_GPUS}}
 #SBATCH -p {{PARTITION}}
-#SBATCH --exclude=k005-004,k005-005,k003-001
+#SBATCH --exclude=k005-004,k005-005,k003-001,k004-006,k004-003
 
 # --- Parameters passed from hyper-script ---
 BATCH_SIZE={{BATCH_SIZE}}
@@ -173,6 +173,7 @@ megatron_options=" \
         --moe-train-capacity-factor 1.25 \
 	    --expert-interval 1 \
 	    --topk $topk \
+        --using-torchrun \
 	--use-rotary-position-embeddings"
 
 # Conditionally append flags based on the MoE type
@@ -219,19 +220,58 @@ export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((NUM_GPUS-1)))
 export NCCL_NET_GDR_LEVEL=3
 export FI_MR_CACHE_MONITOR=userfaultfd
 
-readarray -t arr < <(scontrol show hostnames $SLURM_NODELIST)
-first=${arr[0]}
-ips=$(ssh "$first" hostname -I)
-read -ra ip_arr <<< "$ips"
-export MASTER_ADDR=${ip_arr[0]}
-echo "MASTER_ADDR=${MASTER_ADDR}"
+# readarray -t arr < <(scontrol show hostnames $SLURM_NODELIST)
+# first=${arr[0]}
+# ips=$(ssh "$first" hostname -I)
+# read -ra ip_arr <<< "$ips"
+# export MASTER_ADDR=${ip_arr[0]}
+# echo "MASTER_ADDR=${MASTER_ADDR}"
 
+# ======================= FINAL CORRECTED SCRIPT =======================
+
+# 1. Define the Ethernet interface and port.
+export ETHERNET_INTERFACE=eth0
+export MASTER_PORT=29500
+
+# 2. Tell the GPU communication library (NCCL) to use this interface.
+export NCCL_SOCKET_IFNAME=${ETHERNET_INTERFACE}
+echo "NCCL will use interface: ${NCCL_SOCKET_IFNAME}"
+
+# 3. Find the master node's IP address on that specific interface.
+readarray -t arr < <(scontrol show hostnames $SLURM_NODELIST)
+first_node=${arr[0]}
+master_ip=$(ssh $first_node "ip -4 addr show ${ETHERNET_INTERFACE} | grep 'inet ' | awk '{print \$2}' | cut -d/ -f1")
+
+if [[ -z "${master_ip}" ]]; then
+    echo "ERROR: Could not determine MASTER_ADDR for ${ETHERNET_INTERFACE} on master node ${first_node}."
+    exit 1
+fi
+
+# 4. Export the clean MASTER_ADDR and MASTER_PORT.
+export MASTER_ADDR=$master_ip
+echo "MASTER_ADDR has been set to the Ethernet IP: ${MASTER_ADDR}"
+echo "MASTER_PORT has been set to: ${MASTER_PORT}"
+
+# ============================ END OF CONFIGURATION ============================
+
+
+
+# export NCCL_DEBUG=INFO
+# export NCCL_PROTO=Simple
+# export RCCL_DEBUG=INFO
+# export NCCL_DEBUG_SUBSYS=ALL
 export TRITON_DISABLE_CACHE=1
 export to_profile="False"
+# export to_profile="True"
+export profile_memory="False"
+# export profile_memory="True"
 export profile_dir="../scripts/torch_profile/${current_time}/"
 
 srun -N $node -n $total_gpu -c 2 --gpu-bind=closest \
-    bash -c "export RANK=\$SLURM_PROCID; \
+    bash -c "export OMPI_MCA_pml=ob1; \
+            export OMPI_MCA_btl=self,tcp; \
+            export OMPI_MCA_btl_tcp_if_include=${ETHERNET_INTERFACE}; \
+            export RANK=\$SLURM_PROCID; \
              export WORLD_SIZE=\$SLURM_NTASKS; \
              export LOCAL_RANK=\$SLURM_LOCALID; \
              python ../pretrain_gpt_deepspeed.py \
@@ -241,6 +281,8 @@ srun -N $node -n $total_gpu -c 2 --gpu-bind=closest \
              --master-addr=$MASTER_ADDR \
              --zero-stage 1 \
              2>&1 | tee n${total_gpu}-Small-XMoE-${RUN_TYPE}.log"
+
+
 
 
 # --- Analysis Script ---
