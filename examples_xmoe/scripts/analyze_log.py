@@ -36,10 +36,10 @@ def parse_arguments():
     
     return parser.parse_args()
 
-def analyze_log(log_file, num_layers, warmup_steps=5):
+def analyze_log(log_file, num_layers, warmup_steps, args):
     """
-    Analyzes the log file to extract performance metrics, including detailed
-    GEMM timings, calculating averages after excluding warmup steps.
+    Analyzes the log file to extract performance metrics, and calculates
+    theoretical FLOPs and hardware utilization.
     """
     iteration_pattern = re.compile(
         r"iteration\s+\d+/\s+\d+\s+\|.*?"
@@ -49,23 +49,14 @@ def analyze_log(log_file, num_layers, warmup_steps=5):
         r".*?samples per second:\s+([0-9.]+)\s+\|"
         r"\s+TFLOPs:\s+([0-9.]+)"
     )
-    
-    time_pattern = re.compile(
-        r"1st_a2a:\s+([0-9.]+),\s+experts:\s+([0-9.]+),\s+2nd_a2a:\s+([0-9.]+)"
-    )
+    time_pattern = re.compile(r"1st_a2a:\s+([0-9.]+),\s+experts:\s+([0-9.]+),\s+2nd_a2a:\s+([0-9.]+)")
+    gemm_pattern = re.compile(r"qkv_gemm:\s+([0-9.]+)\s+\|\s+attn_gemm:\s+([0-9.]+)\s+\|\s+out_gemm:\s+([0-9.]+)")
 
-    # --- NEW: Regex for attention GEMM timings ---
-    gemm_pattern = re.compile(
-        r"qkv_gemm:\s+([0-9.]+)\s+\|\s+attn_gemm:\s+([0-9.]+)\s+\|\s+out_gemm:\s+([0-9.]+)"
-    )
-
-    # Main lists for per-iteration values
     tflops_values, samples_per_sec_values, elapsed_times = [], [], []
     lm_losses, moe_losses = [], []
     first_a2a_values, experts_values, second_a2a_values = [], [], []
     qkv_gemm_values, attn_gemm_values, out_gemm_values = [], [], []
 
-    # Temp lists to average GEMM timings within a single iteration
     temp_qkv, temp_attn, temp_out = [], [], []
 
     with open(log_file, "r") as f:
@@ -75,16 +66,12 @@ def analyze_log(log_file, num_layers, warmup_steps=5):
             time_match = time_pattern.search(line)
 
             if iteration_match:
-                # A new iteration line is found. First, process the GEMM values
-                # collected for the *previous* iteration.
-                if temp_qkv: # Check if we have values from micro-batches to process
+                if temp_qkv:
                     qkv_gemm_values.append(statistics.mean(temp_qkv))
                     attn_gemm_values.append(statistics.mean(temp_attn))
                     out_gemm_values.append(statistics.mean(temp_out))
-                    # Reset temp lists for the new iteration
                     temp_qkv, temp_attn, temp_out = [], [], []
 
-                # Now, process the current iteration line as usual
                 elapsed_times.append(float(iteration_match.group(1)))
                 lm_losses.append(float(iteration_match.group(2)))
                 moe_losses.append(float(iteration_match.group(3)) if iteration_match.group(3) else 0.0)
@@ -97,61 +84,82 @@ def analyze_log(log_file, num_layers, warmup_steps=5):
                 second_a2a_values.append(float(time_match.group(3)))
 
             if gemm_match:
-                # A GEMM line was found. Add its values to the temp lists.
                 temp_qkv.append(float(gemm_match.group(1)))
                 temp_attn.append(float(gemm_match.group(2)))
                 temp_out.append(float(gemm_match.group(3)))
 
-    # After the loop, process the GEMM values for the very last iteration
     if temp_qkv:
         qkv_gemm_values.append(statistics.mean(temp_qkv))
         attn_gemm_values.append(statistics.mean(temp_attn))
         out_gemm_values.append(statistics.mean(temp_out))
 
-    if not tflops_values:
-        return None
+    if not tflops_values: return None
 
-    # Exclude warmup steps for all metrics
+    # Determine the starting index for calculations (post-warmup)
     if len(tflops_values) > warmup_steps:
-        tflops_for_calc = tflops_values[warmup_steps:]
-        samples_for_calc = samples_per_sec_values[warmup_steps:]
-        first_a2a_for_calc = first_a2a_values[warmup_steps:]
-        experts_for_calc = experts_values[warmup_steps:]
-        second_a2a_for_calc = second_a2a_values[warmup_steps:]
-        qkv_for_calc = qkv_gemm_values[warmup_steps:]
-        attn_for_calc = attn_gemm_values[warmup_steps:]
-        out_for_calc = out_gemm_values[warmup_steps:]
+        start_index = warmup_steps
     else:
         print(f"Warning: Less than {warmup_steps} iterations found. Calculating stats over all available iterations.", file=sys.stderr)
-        tflops_for_calc, samples_for_calc = tflops_values, samples_per_sec_values
-        first_a2a_for_calc, experts_for_calc, second_a2a_for_calc = first_a2a_values, experts_values, second_a2a_values
-        qkv_for_calc, attn_for_calc, out_for_calc = qkv_gemm_values, attn_gemm_values, out_gemm_values
+        start_index = 0
 
-    # Perform final calculations on post-warmup data
-    avg_tflops = statistics.mean(tflops_for_calc) if tflops_for_calc else 0.0
-    avg_1st_a2a = statistics.mean(first_a2a_for_calc) if first_a2a_for_calc else 0.0
-    avg_experts = statistics.mean(experts_for_calc) if experts_for_calc else 0.0
-    avg_2nd_a2a = statistics.mean(second_a2a_for_calc) if second_a2a_for_calc else 0.0
+    # Safely slice each list, creating new lists for calculation
+    tflops_for_calc = tflops_values[start_index:]
+    samples_for_calc = samples_per_sec_values[start_index:]
+    elapsed_for_calc = elapsed_times[start_index:]
+    first_a2a_for_calc = first_a2a_values[start_index:]
+    experts_for_calc = experts_values[start_index:]
+    second_a2a_for_calc = second_a2a_values[start_index:]
+    qkv_for_calc = qkv_gemm_values[start_index:]
+    attn_for_calc = attn_gemm_values[start_index:]
+    out_for_calc = out_gemm_values[start_index:]
     
-    avg_qkv_gemm = statistics.mean(qkv_for_calc) if qkv_for_calc else 0.0
-    avg_attn_gemm = statistics.mean(attn_for_calc) if attn_for_calc else 0.0
-    avg_out_gemm = statistics.mean(out_for_calc) if out_for_calc else 0.0
+    avg_tflops = statistics.mean(tflops_for_calc) if tflops_for_calc else 0.0
+    tflops_std_dev = statistics.stdev(tflops_for_calc) if len(tflops_for_calc) > 1 else 0.0
+    avg_samples = statistics.mean(samples_for_calc) if samples_for_calc else 0.0
+    avg_elapsed = statistics.mean(elapsed_for_calc) if elapsed_for_calc else 0.0
+    
+    avg_experts_time_pl = (statistics.mean(experts_for_calc) / num_layers) if experts_for_calc and num_layers > 0 else 0.0
+    avg_qkv_gemm_time = statistics.mean(qkv_for_calc) if qkv_for_calc else 0.0
+    avg_attn_gemm_time = statistics.mean(attn_for_calc) if attn_for_calc else 0.0
+    avg_out_gemm_time = statistics.mean(out_for_calc) if out_for_calc else 0.0
+    
+    THEORETICAL_MAX_TFLOPS = 181.0
+    b, s, h, h_ffn, topk, ep = args.mbs, args.seqlen, args.hidden_dim, args.expert_dim, args.topk, args.ep
+
+    flops_expert = (2 * 2 * b * s * topk * h * h_ffn) / ep if ep > 0 else 0
+    flops_qkv = 2 * 3 * b * s * h**2
+    flops_attention = 4 * b * s**2 * h
+    flops_out = 2 * b * s * h**2
+    
+    def get_tflops(flops, time_ms):
+        if time_ms == 0: return 0.0
+        return (flops / 1e12) / (time_ms / 1e3)
+
+    tflops_expert = get_tflops(flops_expert, avg_experts_time_pl)
+    tflops_qkv = get_tflops(flops_qkv, avg_qkv_gemm_time)
+    tflops_attn = get_tflops(flops_attention, avg_attn_gemm_time)
+    tflops_out = get_tflops(flops_out, avg_out_gemm_time)
+    
+    util_expert = (tflops_expert / THEORETICAL_MAX_TFLOPS) * 100 if THEORETICAL_MAX_TFLOPS > 0 else 0.0
+    util_qkv = (tflops_qkv / THEORETICAL_MAX_TFLOPS) * 100 if THEORETICAL_MAX_TFLOPS > 0 else 0.0
+    util_attn = (tflops_attn / THEORETICAL_MAX_TFLOPS) * 100 if THEORETICAL_MAX_TFLOPS > 0 else 0.0
+    util_out = (tflops_out / THEORETICAL_MAX_TFLOPS) * 100 if THEORETICAL_MAX_TFLOPS > 0 else 0.0
 
     return {
         "matched_iterations": len(tflops_values),
-        "avg_tflops": avg_tflops,
-        "tflops_std_dev": statistics.stdev(tflops_for_calc) if len(tflops_for_calc) > 1 else 0.0,
-        "avg_samples": statistics.mean(samples_for_calc) if samples_for_calc else 0.0,
-        "avg_elapsed": statistics.mean(elapsed_times[warmup_steps:]) if len(elapsed_times) > warmup_steps else statistics.mean(elapsed_times) if elapsed_times else 0.0,
+        "avg_tflops": avg_tflops, "tflops_std_dev": tflops_std_dev,
+        "avg_samples": avg_samples, "avg_elapsed": avg_elapsed,
         "final_lm_loss": lm_losses[-1] if lm_losses else 0.0,
         "final_moe_loss": moe_losses[-1] if moe_losses else 0.0,
         "lm_losses": lm_losses,
-        "avg_1st_a2a_per_layer": (avg_1st_a2a / num_layers) if num_layers > 0 else 0.0,
-        "avg_experts_per_layer": (avg_experts / num_layers) if num_layers > 0 else 0.0,
-        "avg_2nd_a2a_per_layer": (avg_2nd_a2a / num_layers) if num_layers > 0 else 0.0,
-        "avg_qkv_gemm": avg_qkv_gemm,
-        "avg_attn_gemm": avg_attn_gemm,
-        "avg_out_gemm": avg_out_gemm,
+        "avg_1st_a2a_per_layer": (statistics.mean(first_a2a_for_calc) / num_layers) if first_a2a_for_calc and num_layers > 0 else 0.0,
+        "avg_experts_per_layer": avg_experts_time_pl,
+        "avg_2nd_a2a_per_layer": (statistics.mean(second_a2a_for_calc) / num_layers) if second_a2a_for_calc and num_layers > 0 else 0.0,
+        "avg_qkv_gemm": avg_qkv_gemm_time, "avg_attn_gemm": avg_attn_gemm_time, "avg_out_gemm": avg_out_gemm_time,
+        "flops_expert": flops_expert, "tflops_expert": tflops_expert, "util_expert": util_expert,
+        "flops_qkv": flops_qkv, "tflops_qkv": tflops_qkv, "util_qkv": util_qkv,
+        "flops_attention": flops_attention, "tflops_attn": tflops_attn, "util_attn": util_attn,
+        "flops_out": flops_out, "tflops_out": tflops_out, "util_out": util_out,
     }
 
 def write_to_xlsx(data, args):
@@ -159,34 +167,25 @@ def write_to_xlsx(data, args):
     date_str = datetime.now().strftime("%Y-%m-%d")
     filename = f"{date_str}-{args.seqlen}-{args.num_layers}-{args.num_experts}-{args.expert_dim}-{args.topk}-{args.hidden_dim}-results.xlsx"
     file_path = f"/work1/mzhang/zixianw4/{filename}"
-
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
     
     run_id = f"{args.moe_type}-PP{args.pp}-EP{args.ep}-GBS{args.gbs}-MBS{args.mbs}-SLURM_ID-{args.slurm_job_id}"
 
-    # --- UPDATED: Header with new GEMM timing columns ---
     header = [
         "Name", "MOE Type", "Model Size", "AVG TFLOPs", "TFLOPs Std Dev", "Iterations", "Actual Iterations", 
         "Nodes", "GPUs/node", "PP", "EP", "DP", "TP", "GBS", "MBS",
         "Final lm_loss", 
         "1st_a2a_PL (ms)", "experts_PL (ms)", "2nd_a2a_PL (ms)",
         "QKV GEMM PL (ms)", "Attn GEMM PL (ms)", "Out GEMM PL (ms)",
+        "Expert Util (%)", "QKV Util (%)", "Attn Util (%)", "Out Util (%)",
         "SLURM_JOB_ID"
     ]
     
-    # --- UPDATED: Main row dictionary with new GEMM data ---
     main_row_dict = {
-        "Name": run_id, 
-        "MOE Type": args.moe_type,
-        "Model Size": args.model_size,
-        "AVG TFLOPs": f"{data['avg_tflops']:.2f}",
-        "TFLOPs Std Dev": f"{data['tflops_std_dev']:.2f}",
-        "Iterations": args.iterations, 
-        "Actual Iterations": data['matched_iterations'],
-        "Nodes": args.nodes,
-        "GPUs/node": args.gpus_per_node, 
-        "MBS": args.mbs, 
-        "GBS": args.gbs,
+        "Name": run_id, "MOE Type": args.moe_type, "Model Size": args.model_size,
+        "AVG TFLOPs": f"{data['avg_tflops']:.2f}", "TFLOPs Std Dev": f"{data['tflops_std_dev']:.2f}",
+        "Iterations": args.iterations, "Actual Iterations": data['matched_iterations'],
+        "Nodes": args.nodes, "GPUs/node": args.gpus_per_node, "MBS": args.mbs, "GBS": args.gbs,
         "Final lm_loss": f"{data['final_lm_loss']:.6f}", 
         "PP": args.pp, "EP": args.ep, "DP": args.dp, "TP": args.tp, 
         "1st_a2a_PL (ms)": f"{data['avg_1st_a2a_per_layer']:.2f}",
@@ -195,6 +194,10 @@ def write_to_xlsx(data, args):
         "QKV GEMM PL (ms)": f"{data['avg_qkv_gemm']:.2f}",
         "Attn GEMM PL (ms)": f"{data['avg_attn_gemm']:.2f}",
         "Out GEMM PL (ms)": f"{data['avg_out_gemm']:.2f}",
+        "Expert Util (%)": f"{data['util_expert']:.2f}",
+        "QKV Util (%)": f"{data['util_qkv']:.2f}",
+        "Attn Util (%)": f"{data['util_attn']:.2f}",
+        "Out Util (%)": f"{data['util_out']:.2f}",
         "SLURM_JOB_ID": args.slurm_job_id,
     }
     new_main_df = pd.DataFrame([main_row_dict])[header]
@@ -208,7 +211,6 @@ def write_to_xlsx(data, args):
         with pd.ExcelFile(file_path) as xls:
             existing_main_df = pd.read_excel(xls, 'Main_Results')
             existing_loss_df = pd.read_excel(xls, 'Loss_per_Iteration')
-        
         combined_main_df = pd.concat([existing_main_df, new_main_df], ignore_index=True)
         combined_loss_df = pd.concat([existing_loss_df, new_loss_df], ignore_index=True)
     except FileNotFoundError:
@@ -224,29 +226,71 @@ def write_to_xlsx(data, args):
 def main():
     """Main function to run the analysis and save results."""
     args = parse_arguments()
-    analysis_results = analyze_log(args.log_file, args.num_layers, args.warmup_steps)
+    analysis_results = analyze_log(args.log_file, args.num_layers, args.warmup_steps, args)
 
     if analysis_results:
         output_file = write_to_xlsx(analysis_results, args)
-        print(f'\n\n'
-              f'================================================================================\n'
-              f'--- Analyzing FLOPS Utilization from Logs ---\n'
-              f'Log Directory: {output_file}\n'
+        
+        metric_names = ["Log Directory", "Actual ran iterations", "Average TFLOPs", "TFLOPs Standard Deviation",
+                        "Average samples/sec", "Average elapsed time per iteration (ms)", "Average 1st a2a time per layer (ms)",
+                        "Average experts time per layer (ms)", "Average 2nd a2a time per layer (ms)", "Average QKV GEMM time (ms)",
+                        "Average Attn GEMM time (ms)", "Average Out GEMM time (ms)", "Final lm_loss", "Final moe_loss"]
+        max_width = max(len(name) for name in metric_names)
+        align_width = max_width + 2 
+
+        print(f'\n\n================================================================================\n'
+              f'--- Analyzing Performance from Logs ---\n'
               f'================================================================================')
-        print(f"Actual ran iterations: {analysis_results['matched_iterations']}")
-        print(f"Average TFLOPs (post-warmup): {analysis_results['avg_tflops']:.2f}")
-        print(f"TFLOPs Standard Deviation (post-warmup): {analysis_results['tflops_std_dev']:.2f}")
-        print(f"Average samples/sec (post-warmup): {analysis_results['avg_samples']:.3f}")
-        print(f"Average elapsed time per iteration (ms) (post-warmup): {analysis_results['avg_elapsed']:.1f}")
-        print(f"Average 1st a2a time per layer (ms): {analysis_results['avg_1st_a2a_per_layer']:.2f}")
-        print(f"Average experts time per layer (ms): {analysis_results['avg_experts_per_layer']:.2f}")
-        print(f"Average 2nd a2a time per layer (ms): {analysis_results['avg_2nd_a2a_per_layer']:.2f}")
-        # --- NEW: Print GEMM timing results ---
-        print(f"Average QKV GEMM time (ms): {analysis_results['avg_qkv_gemm']:.2f}")
-        print(f"Average Attn GEMM time (ms): {analysis_results['avg_attn_gemm']:.2f}")
-        print(f"Average Out GEMM time (ms): {analysis_results['avg_out_gemm']:.2f}")
-        print(f"Final lm_loss: {analysis_results['final_lm_loss']:.6f}")
-        print(f"Final moe_loss: {analysis_results['final_moe_loss']:.6f}")
+        
+        print(f"{'Log Directory:':<{align_width}} {output_file}")
+        print(f"{'Actual ran iterations:':<{align_width}} {analysis_results['matched_iterations']}")
+        print(f"{'Average TFLOPs:':<{align_width}} {analysis_results['avg_tflops']:.2f}")
+        print(f"{'TFLOPs Standard Deviation:':<{align_width}} {analysis_results['tflops_std_dev']:.2f}")
+        print(f"{'Average samples/sec:':<{align_width}} {analysis_results['avg_samples']:.3f}")
+        print(f"{'Average elapsed time per iteration (ms):':<{align_width}} {analysis_results['avg_elapsed']:.1f}")
+        print(f"{'Average 1st a2a time per layer (ms):':<{align_width}} {analysis_results['avg_1st_a2a_per_layer']:.2f}")
+        print(f"{'Average experts time per layer (ms):':<{align_width}} {analysis_results['avg_experts_per_layer']:.2f}")
+        print(f"{'Average 2nd a2a time per layer (ms):':<{align_width}} {analysis_results['avg_2nd_a2a_per_layer']:.2f}")
+        print(f"{'Average QKV GEMM time (ms):':<{align_width}} {analysis_results['avg_qkv_gemm']:.2f}")
+        print(f"{'Average Attn GEMM time (ms):':<{align_width}} {analysis_results['avg_attn_gemm']:.2f}")
+        print(f"{'Average Out GEMM time (ms):':<{align_width}} {analysis_results['avg_out_gemm']:.2f}")
+        print(f"{'Final lm_loss:':<{align_width}} {analysis_results['final_lm_loss']:.6f}")
+        print(f"{'Final moe_loss:':<{align_width}} {analysis_results['final_moe_loss']:.6f}")
+        
+        print(f'================================================================================\n'
+              f'--- FLOPS Utilization Analysis (Per Layer @ 181 TFLOPS (MI250 FP16) Max) ---\n'
+              f'================================================================================')
+        
+        b, s, h, h_ffn, topk, ep = args.mbs, args.seqlen, args.hidden_dim, args.expert_dim, args.topk, args.ep
+        
+        print("Expert Kernels:")
+        print(f"  - {'FLOPs Formula:':<20} (2 * 2 * b * s * topk * h * h_ffn) / ep")
+        # --- UPDATED: Print in TFLOPs ---
+        print(f"  - {'Calculation:':<20} (2*2*{b}*{s}*{topk}*{h}*{h_ffn})/{ep}")
+        print(f"  - {'Achieved TFLOPS:':<20} {analysis_results['tflops_expert']:.2f}")
+        print(f"  - {'Utilization:':<20} {analysis_results['util_expert']:.2f}%\n")
+
+        print("QKV GEMM:")
+        print(f"  - {'FLOPs Formula:':<20} 2 * 3 * b * s * h^2")
+        # --- UPDATED: Print in TFLOPs ---
+        print(f"  - {'Calculation:':<20} 2*3*{b}*{s}*{h}^2")
+        print(f"  - {'Achieved TFLOPS:':<20} {analysis_results['tflops_qkv']:.2f}")
+        print(f"  - {'Utilization:':<20} {analysis_results['util_qkv']:.2f}%\n")
+        
+        print("Attention GEMM (QK^T + attn*V):")
+        print(f"  - {'FLOPs Formula:':<20} 4 * b * s^2 * h")
+        # --- UPDATED: Print in TFLOPs ---
+        print(f"  - {'Calculation:':<20} 4*{b}*{s}^2*{h}")
+        print(f"  - {'Achieved TFLOPS:':<20} {analysis_results['tflops_attn']:.2f}")
+        print(f"  - {'Utilization:':<20} {analysis_results['util_attn']:.2f}%\n")
+
+        print("Output GEMM:")
+        print(f"  - {'FLOPs Formula:':<20} 2 * b * s * h^2")
+        # --- UPDATED: Print in TFLOPs ---
+        print(f"  - {'Calculation:':<20} 2*{b}*{s}*{h}^2")
+        print(f"  - {'Achieved TFLOPS:':<20} {analysis_results['tflops_out']:.2f}")
+        print(f"  - {'Utilization:':<20} {analysis_results['util_out']:.2f}%")
+
         print(f'================================================================================')
     else:
         print("No iteration stats found in log.")
