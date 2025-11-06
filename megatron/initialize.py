@@ -264,21 +264,25 @@ def _initialize_distributed():
         # Manually set the device ids.
         if device_count > 0:
             device = args.rank % device_count
-            
-            print (f'\n'* 7)
-            print (f'{device_count=}')
-            print (f'{args.rank=}')
-            print (f'{device=}')
-            print (f'{args.local_rank=}')
-            print (f'\n'* 7)
-            
             if args.local_rank is not None:
                 assert args.local_rank == device, \
                     'expected local-rank to be the same as rank % device-count.'
             else:
                 args.local_rank = device
-
+                
+            print (f'[megatron/initialize.py]')
+            print (f'\n'* 7)
+            print (f'{device_count=}')
+            print (f'{args.rank=}')
+            print (f'{device=}')
+            print (f'{args.local_rank=}')
+            print (f'{os.getenv ("RANK")=}')
+            print (f'{os.getenv ("LOCAL_RANK")=}')
+            # print (f'Zixian: Oct 18: torch.cuda.set_device(local_rank)')
+            # torch.cuda.set_device(local_rank)
             get_accelerator().set_device(device) # only do so when device_count > 0
+            print (f'after setting device')
+            print (f'\n'* 7)
 
     # Call the init process
     print("args values:", args)

@@ -679,6 +679,7 @@ def train_step(forward_step_func, data_iterator,
     # Forward pass.
     timers('forward-backward', log_level=1).start(
         barrier=args.barrier_with_L1_time)
+    print (f'[megatron/training] after forward-backward timer')
     forward_backward_func = get_forward_backward_func()
     if args.mos or args.kd:
         # args.teacher_forward is used as global variable to enable kd loss
