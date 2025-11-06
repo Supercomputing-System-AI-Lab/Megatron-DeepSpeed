@@ -119,7 +119,7 @@ class ParallelMLP(MegatronModule):
         args = get_args()
 
         self.add_bias = config.add_bias_linear
-
+        self.add_bias = False
         ffn_hidden_size = config.ffn_hidden_size
         if config.gated_linear_unit:
             ffn_hidden_size *= 2
@@ -156,6 +156,7 @@ class ParallelMLP(MegatronModule):
             self.activation_func = squared_relu
         else:
             self.bias_gelu_fusion = args.bias_gelu_fusion
+            self.bias_gelu_fusion = False
             self.activation_func = F.gelu
 
         # Project back to h.
@@ -1067,7 +1068,7 @@ class ParallelTransformerLayer(MegatronModule):
                                     enable_expert_tensor_parallelism=enable_expert_tensor_parallelism)
                 else:   
                     # print (f'[transformer.py] Using Fine-grained MoE \n'*10)
-                    self.mlp = MoE(args.hidden_size,
+                    self.mlp = MoE(args.hidden_size, config, 
                                 ParallelMLP(config,
                                     moe=True,
                                     enable_expert_tensor_parallelism=enable_expert_tensor_parallelism),
@@ -1084,6 +1085,7 @@ class ParallelTransformerLayer(MegatronModule):
                                 use_uneven_all2all=args.use_uneven_all_to_all,
                                 use_pft=args.use_pft,
                                 use_rbd=args.use_rbd,
+                                use_groupedGEMM=args.use_groupedGEMM,
                                 rbd_mesh_size=args.rbd_mesh_size)
 
         # Set bias+dropout+add fusion grad_enable execution handler.

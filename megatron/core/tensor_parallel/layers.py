@@ -630,6 +630,7 @@ class ColumnParallelLinear(torch.nn.Module):
         else:
             input_parallel = copy_to_tensor_model_parallel_region(input_)
         # Matrix multiply.
+        # print("h to 4h weight shape:", weight.shape)
         output_parallel = linear_with_grad_accumulation_and_async_allreduce(
             input=input_parallel,
             weight=weight,
@@ -769,6 +770,7 @@ class RowParallelLinear(torch.nn.Module):
             assert not self.sequence_parallel
             input_parallel = scatter_to_tensor_model_parallel_region(input_)
         # Matrix multiply.
+        # print("4h to h weight shape:", self.weight.shape)
         output_parallel = linear_with_grad_accumulation_and_async_allreduce(
             input=input_parallel,
             weight=self.weight,

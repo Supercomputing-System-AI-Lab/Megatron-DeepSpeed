@@ -1,8 +1,8 @@
 #!/bin/bash
 
 #SBATCH -J {{MOE_TYPE}}-{{RUN_TYPE}}-gbs{{GLOBAL_BATCH_SIZE}}
-#SBATCH -o /work1/mzhang/zixianw4/xmoe-{{RUN_TYPE}}-%j.o
-#SBATCH -t 2:00:00
+#SBATCH -o /work1/mzhang/henryj/xmoe-{{RUN_TYPE}}-%j.o
+#SBATCH -t 1:00:00
 #SBATCH -p batch
 #SBATCH -N {{NODES}}
 #SBATCH -n {{TOTAL_GPUS}}
@@ -36,8 +36,10 @@ fi
 
 
 # --- Environment & Setup ---
-source /work1/mzhang/zixianw4/miniconda3/etc/profile.d/conda.sh
-conda activate xmoe
+echo "Activating conda environment..."
+source /work1/mzhang/henryj/miniforge3/etc/profile.d/conda.sh
+conda activate /work1/mzhang/henryj/TORCH-ROCM6.3.1_env
+echo "Conda environment activated."
 
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
@@ -63,9 +65,19 @@ if [[ "${MODEL_SIZE}" == "16B" ]]; then
     NUM_ATTN_HEADS=16
     EP_SIZE=64
     topk=6
+elif [[ "${MODEL_SIZE}" == "190B_1L" ]]; then
+    echo "Configuring 190B Model But with only 1 layer"
+    NUM_LAYERS=1
+    MODEL_SIZE=190_div_28
+    HIDDEN_SIZE=7168
+    FFN_HIDDEN_SIZE=2048
+    NUM_ATTN_HEADS=56
+    EP_SIZE=256
+    topk=8
+    SEQ_LEN=4096
 else 
     echo "Configuring custom model size"
-    NUM_LAYERS=24
+    NUM_LAYERS=18
     MODEL_SIZE=10.1
     HIDDEN_SIZE=2048
     FFN_HIDDEN_SIZE=1408
@@ -178,6 +190,8 @@ megatron_options=" \
 # Conditionally append flags based on the MoE type
 if [[ "${MOE_TYPE}" == "X-MOE" ]]; then
     megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft"
+elif [[ "${MOE_TYPE}" == "X-MOE-GroupedGEMM" ]]; then
+    megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-groupedGEMM"
 fi
 
 if [ "${ACTIVATION_CHECKPOINT}" = "true" ]; then
@@ -244,9 +258,31 @@ srun -N $node -n $total_gpu -c 2 --gpu-bind=closest \
 
 
 # --- Analysis Script ---
+# gpus_per_node=$(( total_gpu / node ))
+# ANALYSIS_LOG_FILE="/work1/mzhang/henryj/xmoe-${RUN_TYPE}-$SLURM_JOB_ID.o"
+# python  /work1/mzhang/henryj/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe/scripts/analyze_log.py \
+#         ${ANALYSIS_LOG_FILE} \
+#         --iterations $TRAIN_ITERS \
+#         --nodes $node \
+#         --gpus_per_node $gpus_per_node \
+#         --megatron_pp $PP_SIZE \
+#         --ep $EP_PARALLEL_SIZE \
+#         --dp $(( total_gpu / PP_SIZE / MP_SIZE )) \
+#         --tp $MP_SIZE \
+#         --gbs $GLOBAL_BATCH_SIZE \
+#         --mbs $BATCH_SIZE \
+#         --slurm_job_id $SLURM_JOB_ID \
+#         --seqlen $SEQ_LEN \
+#         --num_layers $NUM_LAYERS \
+#         --num_experts $EP_SIZE \
+#         --expert_dim $FFN_HIDDEN_SIZE \
+#         --topk $topk \
+#         --hidden_dim $HIDDEN_SIZE \
+#         --moe_type $MOE_TYPE 
+
 gpus_per_node=$(( total_gpu / node ))
-ANALYSIS_LOG_FILE="/work1/mzhang/zixianw4/xmoe-${RUN_TYPE}-$SLURM_JOB_ID.o"
-python  /work1/mzhang/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe/scripts/analyze_log.py \
+ANALYSIS_LOG_FILE="/work1/mzhang/henryj/xmoe-${RUN_TYPE}-$SLURM_JOB_ID.o"
+python  /work1/mzhang/henryj/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe/scripts/analyze_log.py \
         ${ANALYSIS_LOG_FILE} \
         --iterations $TRAIN_ITERS \
         --nodes $node \
@@ -264,4 +300,5 @@ python  /work1/mzhang/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe/scri
         --expert_dim $FFN_HIDDEN_SIZE \
         --topk $topk \
         --hidden_dim $HIDDEN_SIZE \
-        --moe_type $MOE_TYPE 
+        --moe_type $MOE_TYPE \
+        --model_size $MODEL_SIZE

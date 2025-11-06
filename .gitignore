@@ -29,3 +29,12 @@ examples_xmoe/data/*.bin
 examples_xmoe/data/*.idx
 examples_xmoe/data/*.jsonl
 examples_xmoe/data/index-cache/
+
+# auto-generated json files and logs   
+*.json
+*.log
+
+# fused_kernels hip files
+megatron/fused_kernels/*_hip.cpp
+megatron/fused_kernels/*_hip.h
+megatron/fused_kernels/*_hip.hip

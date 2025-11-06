@@ -1150,7 +1150,7 @@ def _get_profiler():
     """Create the global profiler if not yet created."""
     global _PROF
     if _PROF is None:
-        sched = schedule(wait=2, warmup=3, active=2, repeat=1)
+        sched = schedule(wait=2, warmup=3, active=1, repeat=1)
         _PROF = profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
             schedule=sched,

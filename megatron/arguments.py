@@ -928,6 +928,8 @@ def _add_training_args(parser):
                        help='Use Tutel optimization for MoE')
     group.add_argument('--use-pft', action='store_true',
                        help='Use Tutel optimization for MoE')
+    group.add_argument('--use-groupedGEMM', action='store_true',
+                       help='Use groupedGEMM for MoE')
     group.add_argument('--use-tutel-moe', action='store_true',
                        help='Use Tutel MoE')
     group.add_argument('--inference', action='store_true',
