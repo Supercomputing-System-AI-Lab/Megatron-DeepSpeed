@@ -33,7 +33,7 @@
       "difficulty_step": 8
     }
   },
-  "wall_clock_breakdown" : WALL_CLOCK_BREAKDOWN,
+  "wall_clock_breakdown" : true,
 
   "profiling": {
     "enabled": true,

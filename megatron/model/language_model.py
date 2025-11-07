@@ -576,34 +576,6 @@ class TransformerLanguageModel(MegatronModule):
                 encoder_output = self.encoder_hidden_state
         else:
             encoder_output, encoder_moe_losses = enc_hidden_states.to(encoder_input.dtype), []
-            
-        
-        # Zixian: 10/27/2025: Time attention's kernel time 
-        try: 
-            if os.getenv("WALL_CLOCK_BREAKDOWN") == "true":
-                # print (f'{self.encoder=}')
-                
-                # Get timer object 
-                layer_timers_object = self.encoder._get_layer(0).timers
-                attention_timers_object = self.encoder._get_layer(0).self_attention.timers
-                
-                # Use the timers assigned names (transformer.py)
-                attention_timers_to_log = [
-                    'qkv_gemm', 
-                    'attn_gemm', 
-                    'out_gemm'
-                ]
-                layer_timers_to_log = [
-                    'self_attention', 
-                    'mlp', 
-                ]
-                
-                # Single call to print the beautifully formatted average.
-                layer_timers_object.log_global_average_times(names=layer_timers_to_log, reset=True)
-                attention_timers_object.log_global_average_times(names=attention_timers_to_log, reset=True)
-                
-        except Exception as e: 
-            print (f'[megatron/model/language_model.py] exception: {e}')
 
         if self.post_process:
             if self.add_pooler:

@@ -71,7 +71,6 @@ class Timer(TimerBase):
         # Note that None will default to the global process group
         self._barrier_group = None
         self._start_time = time.time()
-        self._num_calls = 0    # Zixian: 10/27/2025: included for record attention timer
 
 
     def set_barrier_group(self, barrier_group):
@@ -96,14 +95,12 @@ class Timer(TimerBase):
         get_accelerator().synchronize()
         self._elapsed += (time.time() - self._start_time)
         self._started = False
-        self._num_calls += 1  
 
 
     def reset(self):
         """Reset timer."""
         self._elapsed = 0.0
         self._started = False
-        self._num_calls = 0
 
 
     def elapsed(self, reset=True, barrier=False):
@@ -310,63 +307,3 @@ class Timers:
             for name in name_to_min_max_time:
                 _, max_time = name_to_min_max_time[name]
                 writer.add_scalar(name + '-time', max_time, iteration)
-
-
-    def log_global_average_times(self, names, reset=True):
-        """
-        Zixian: 10/27/2025: 
-        Calculates and logs the average time for given timers across all calls,
-        all layers, all microbatches, and all ranks.
-        
-        This function should be called only once after all timing is complete 
-        (e.g., at the end of a training step).
-        """
-        world_size = torch.distributed.get_world_size()
-        rank = torch.distributed.get_rank()
-
-        # Create a tensor to hold this rank's data: [total_elapsed_time, num_calls] for each timer.
-        # Using float64 for accumulators is safer to avoid precision issues.
-        local_data = torch.zeros((2, len(names)), dtype=torch.float64,
-                                 device=get_accelerator().current_device_name())
-
-        # Populate the tensor with data from the timers on this rank.
-        for i, name in enumerate(names):
-            if name in self._timers:
-                timer = self._timers[name]
-                # Access the internal accumulated values from the Timer object
-                local_data[0, i] = timer._elapsed
-                local_data[1, i] = timer._num_calls
-                if reset:
-                    timer.reset()
-
-        # Prepare a tensor to receive the data from all ranks.
-        # Shape: [world_size, 2 (for time/calls), num_timers]
-        global_data = torch.zeros((world_size, 2, len(names)), dtype=torch.float64,
-                                  device=get_accelerator().current_device_name())
-
-        # Each rank sends its `local_data` and receives the data from all ranks into `global_data`.
-        torch.distributed.all_gather_into_tensor(global_data, local_data)
-
-        # Only Rank 0 will perform the final calculation and printing.
-        if rank == 0:
-            # Sum the total times and total calls from all ranks.
-            # We sum along the 'world_size' dimension (dim=0).
-            # The result is a [2, num_timers] tensor with global totals.
-            global_totals = torch.sum(global_data, dim=0)
-
-            output_string = "Global Averages (ms) ->"
-            for i, name in enumerate(names):
-                total_time = global_totals[0, i].item()
-                total_calls = global_totals[1, i].item()
-
-                avg_time_ms = 0.0
-                if total_calls > 0:
-                    # Calculate the average time and convert it to milliseconds.
-                    avg_time_ms = (total_time / total_calls) * 1000
-                
-                # Format the name for consistent alignment
-                formatted_name = (name + ':').ljust(18)
-                output_string += f" {formatted_name}{avg_time_ms:<7.2f} |"
-
-            # Print the final, single-line report. `[:-2]` removes the trailing " |".
-            print(output_string[:-2], flush=True)
