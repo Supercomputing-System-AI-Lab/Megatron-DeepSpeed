@@ -21,18 +21,20 @@ def parse_arguments():
     parser.add_argument("--gbs", type=int, required=True, help="Global Batch Size.")
     parser.add_argument("--mbs", type=int, required=True, help="Micro Batch Size.")
     parser.add_argument("--slurm_job_id", type=str, required=True, help="SLURM Job ID.")
-
-    # --- New Arguments ---
     parser.add_argument("--seqlen", type=int, required=True, help="Sequence length.")
     parser.add_argument("--num_layers", type=int, required=True, help="Number of layers.")
     parser.add_argument("--num_experts", type=int, required=True, help="Number of experts.")
     parser.add_argument("--expert_dim", type=int, required=True, help="Expert dimension.")
     parser.add_argument("--topk", type=int, required=True, help="Top-K for MoE.")
     parser.add_argument("--hidden_dim", type=int, required=True, help="Hidden dimension.")
-    parser.add_argument("--warmup_steps", type=int, default=5, required=False, help="Warmup steps before recording TFLOPS, default 5")
-    # --- ADDED MOE_TYPE ARGUMENT ---
+    parser.add_argument("--warmup_steps", type=int, default=10, required=False, help="Warmup steps before recording TFLOPS, default 5")
     parser.add_argument("--moe_type", type=str, required=True, help="Type of the MoE implementation (e.g., X-MOE, DS-MOE).")
     parser.add_argument("--model_size", type=str, default="10B", required=False, help="Size of the model (e.g., 7b, 13b).")
+
+    # --- NEWLY ADDED ARGUMENTS ---
+    parser.add_argument("--activation_checkpointing", type=str, required=True, help="Activation checkpointing status (e.g., true/false).")
+    parser.add_argument("--checkpoint_interval", type=int, required=True, help="The interval for saving model checkpoints.")
+
 
     return parser.parse_args()
 
@@ -51,7 +53,6 @@ def analyze_log(log_file, num_layers, warmup_steps, args):
     )
     time_pattern = re.compile(r"1st_a2a:\s+([0-9.]+),\s+experts:\s+([0-9.]+),\s+2nd_a2a:\s+([0-9.]+)")
     gemm_pattern = re.compile(r"qkv_gemm:\s+([0-9.]+)\s+\|\s+attn_gemm:\s+([0-9.]+)\s+\|\s+out_gemm:\s+([0-9.]+)")
-    # --- NEW: Regex for peak memory ---
     peak_mem_pattern = re.compile(r"Overall Peak Reserved:\s+([0-9.]+)\s+GB")
 
 
@@ -59,7 +60,6 @@ def analyze_log(log_file, num_layers, warmup_steps, args):
     lm_losses, moe_losses = [], []
     first_a2a_values, experts_values, second_a2a_values = [], [], []
     qkv_gemm_values, attn_gemm_values, out_gemm_values = [], [], []
-    # --- NEW: List to store peak memory values ---
     peak_mem_values = []
 
 
@@ -70,7 +70,6 @@ def analyze_log(log_file, num_layers, warmup_steps, args):
             iteration_match = iteration_pattern.search(line)
             gemm_match = gemm_pattern.search(line)
             time_match = time_pattern.search(line)
-            # --- NEW: Search for peak memory match ---
             peak_mem_match = peak_mem_pattern.search(line)
 
 
@@ -97,7 +96,6 @@ def analyze_log(log_file, num_layers, warmup_steps, args):
                 temp_attn.append(float(gemm_match.group(2)))
                 temp_out.append(float(gemm_match.group(3)))
             
-            # --- NEW: If a match is found, append the value ---
             if peak_mem_match:
                 peak_mem_values.append(float(peak_mem_match.group(1)))
 
@@ -109,14 +107,13 @@ def analyze_log(log_file, num_layers, warmup_steps, args):
 
     if not tflops_values: return None
 
-    # Determine the starting index for calculations (post-warmup)
     if len(tflops_values) > warmup_steps:
         start_index = warmup_steps
+        print (f'analyze_log: warmup_steps: {warmup_steps}')
     else:
         print(f"Warning: Less than {warmup_steps} iterations found. Calculating stats over all available iterations.", file=sys.stderr)
         start_index = 0
 
-    # Safely slice each list, creating new lists for calculation
     tflops_for_calc = tflops_values[start_index:]
     samples_for_calc = samples_per_sec_values[start_index:]
     elapsed_for_calc = elapsed_times[start_index:]
@@ -166,7 +163,6 @@ def analyze_log(log_file, num_layers, warmup_steps, args):
         "final_lm_loss": lm_losses[-1] if lm_losses else 0.0,
         "final_moe_loss": moe_losses[-1] if moe_losses else 0.0,
         "lm_losses": lm_losses,
-        # --- NEW: Add peak memory to the returned dictionary (use max in case it's reported multiple times) ---
         "peak_mem_gb": max(peak_mem_values) if peak_mem_values else 0.0,
         "avg_1st_a2a_per_layer": (statistics.mean(first_a2a_for_calc) / num_layers) if first_a2a_for_calc and num_layers > 0 else 0.0,
         "avg_experts_per_layer": avg_experts_time_pl,
@@ -183,13 +179,13 @@ def write_to_xlsx(data, args):
     date_str = datetime.now().strftime("%Y-%m-%d")
     filename = f"{date_str}-results.xlsx"
     file_path = f"{filename}"
-    # os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
     run_id = f"{args.moe_type}-PP{args.pp}-EP{args.ep}-GBS{args.gbs}-MBS{args.mbs}-SLURM_ID-{args.slurm_job_id}"
 
-    # --- UPDATED: Header with new peak_mem(GB) column ---
+    # --- UPDATED: Header with new columns ---
     header = [
-        "Name", "MOE Type", "Model Size", "AVG TFLOPs", "TFLOPs Std Dev", "Iterations", "Actual Iterations",
+        "Name", "MOE Type", "Model Size", "AVG TFLOPs", "TFLOPs Std Dev", 
+        "Activation Checkpointing", "ckpt_interval", "Iterations", "Actual Iterations",
         "Nodes", "GPUs/node", "PP", "EP", "DP", "TP", "GBS", "MBS",
         "Final lm_loss", "peak_mem(GB)",
         "1st_a2a_PL (ms)", "experts_PL (ms)", "2nd_a2a_PL (ms)",
@@ -199,10 +195,12 @@ def write_to_xlsx(data, args):
         "SLURM_JOB_ID"
     ]
 
-    # --- UPDATED: Main row dictionary with new peak memory data ---
+    # --- UPDATED: Main row dictionary with new data ---
     main_row_dict = {
         "Name": run_id, "MOE Type": args.moe_type, "Model Size": args.model_size,
         "AVG TFLOPs": f"{data['avg_tflops']:.2f}", "TFLOPs Std Dev": f"{data['tflops_std_dev']:.2f}",
+        "Activation Checkpointing": args.activation_checkpointing,
+        "ckpt_interval": args.checkpoint_interval,
         "Iterations": args.iterations, "Actual Iterations": data['matched_iterations'],
         "Nodes": args.nodes, "GPUs/node": args.gpus_per_node, "MBS": args.mbs, "GBS": args.gbs,
         "Final lm_loss": f"{data['final_lm_loss']:.6f}",
@@ -260,7 +258,6 @@ def main():
                         "Average samples/sec", "Average elapsed time per iteration (ms)", "Average 1st a2a time per layer (ms)",
                         "Average experts time per layer (ms)", "Average 2nd a2a time per layer (ms)", "Average QKV GEMM time (ms)",
                         "Average Attn GEMM time (ms)", "Average Out GEMM time (ms)", "Final lm_loss", "Final moe_loss",
-                        # --- NEW: Add metric name for console output ---
                         "Peak Memory (GB)"]
         max_width = max(len(name) for name in metric_names)
         align_width = max_width + 2
@@ -283,7 +280,6 @@ def main():
         print(f"{'Average Out GEMM time (ms):':<{align_width}} {analysis_results['avg_out_gemm']:.2f}")
         print(f"{'Final lm_loss:':<{align_width}} {analysis_results['final_lm_loss']:.6f}")
         print(f"{'Final moe_loss:':<{align_width}} {analysis_results['final_moe_loss']:.6f}")
-        # --- NEW: Print the peak memory to the console ---
         print(f"{'Peak Memory (GB):':<{align_width}} {analysis_results['peak_mem_gb']:.4f}")
 
         print(f'================================================================================\n'

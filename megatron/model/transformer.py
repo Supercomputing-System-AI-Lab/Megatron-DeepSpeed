@@ -2001,6 +2001,8 @@ class ParallelTransformer(MegatronModule):
             return custom_forward
         
         if args.deepspeed and args.deepspeed_activation_checkpointing:
+            print (f'[megatron/model/transformer.py]: enabling deepspeed"s activation checkpointing')
+            print (f'[megatron/model/transformer.py]: uniform activation checkpointing for every {self.checkpoint_num_layers} layers')
             moe_losses = []
             # Make sure memory is freed.
             tensor_parallel.reset_checkpointed_activations_memory_buffer()
@@ -2015,6 +2017,7 @@ class ParallelTransformer(MegatronModule):
 
             return hidden_states, moe_losses
         else:
+            print (f'[megatron/model/transformer.py]: enabling megatron"s activation recomputation')
             moe_losses = []
             te_forward_kwargs = {}
             if self.transformer_impl == 'transformer_engine':
@@ -2026,6 +2029,7 @@ class ParallelTransformer(MegatronModule):
                 # Uniformly divide the total number of Transformer layers and
                 # checkpoint the input activation of each divided chunk.
                 # A method to further reduce memory usage reducing checkpoints.
+                print (f'[megatron/model/transformer.py]: recompute by uniform of {self.recompute_num_layers} layers')
                 l = 0
                 while l < self.num_layers:
                     if self.transformer_impl == 'transformer_engine':
@@ -2049,6 +2053,7 @@ class ParallelTransformer(MegatronModule):
                 # Checkpoint the input activation of only a set number of individual
                 # Transformer layers and skip the rest.
                 # A method fully use the device memory removing redundant re-computation.
+                print (f'[megatron/model/transformer.py]: recompute by block of {self.recompute_num_layers} layers')
                 for l in range(self.num_layers):
                     if l < self.recompute_num_layers:
                         if self.transformer_impl == 'transformer_engine':
