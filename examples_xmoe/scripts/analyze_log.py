@@ -34,7 +34,10 @@ def parse_arguments():
     # --- NEWLY ADDED ARGUMENTS ---
     parser.add_argument("--activation_checkpointing", type=str, required=True, help="Activation checkpointing status (e.g., true/false).")
     parser.add_argument("--checkpoint_interval", type=int, required=True, help="The interval for saving model checkpoints.")
-
+    
+    # Updated to include defaults as requested
+    parser.add_argument("--dynamic_checkpoint", type=str, required=False, default="False", help="Whether dynamic checkpointing activations. True if arg is str(True)")
+    parser.add_argument("--uneven_pp_partition", type=str, required=False, default="False", help="Whether use uneven pipeline layer partitioning. True if arg is str(True)")
 
     return parser.parse_args()
 
@@ -185,7 +188,9 @@ def write_to_xlsx(data, args):
     # --- UPDATED: Header with new columns ---
     header = [
         "Name", "MOE Type", "Model Size", "AVG TFLOPs", "TFLOPs Std Dev", 
-        "Activation Checkpointing", "ckpt_interval", "Iterations", "Actual Iterations",
+        "Activation Checkpointing", "ckpt_interval", 
+        "Dynamic Checkpoint", "Uneven PP Partition", # <--- Added here
+        "Iterations", "Actual Iterations",
         "Nodes", "GPUs/node", "PP", "EP", "DP", "TP", "GBS", "MBS",
         "Final lm_loss", "peak_mem(GB)",
         "1st_a2a_PL (ms)", "experts_PL (ms)", "2nd_a2a_PL (ms)",
@@ -201,6 +206,8 @@ def write_to_xlsx(data, args):
         "AVG TFLOPs": f"{data['avg_tflops']:.2f}", "TFLOPs Std Dev": f"{data['tflops_std_dev']:.2f}",
         "Activation Checkpointing": args.activation_checkpointing,
         "ckpt_interval": args.checkpoint_interval,
+        "Dynamic Checkpoint": args.dynamic_checkpoint,      # <--- Added value
+        "Uneven PP Partition": args.uneven_pp_partition,    # <--- Added value
         "Iterations": args.iterations, "Actual Iterations": data['matched_iterations'],
         "Nodes": args.nodes, "GPUs/node": args.gpus_per_node, "MBS": args.mbs, "GBS": args.gbs,
         "Final lm_loss": f"{data['final_lm_loss']:.6f}",
