@@ -5,7 +5,7 @@
 #SBATCH -J {{MOE_TYPE}}-{{RUN_TYPE}}-gbs{{GLOBAL_BATCH_SIZE}}
 #SBATCH -o logs/xmoe-{{RUN_TYPE}}-%j.o
 #SBATCH -e logs/xmoe-{{RUN_TYPE}}-%j.e
-#SBATCH -t 01:00:00
+#SBATCH -t 00:05:00
 #SBATCH -p {{PARTITION}}
 #SBATCH -N {{NODES}}
 #SBATCH -d singleton
@@ -26,10 +26,12 @@ RUN_TYPE="{{RUN_TYPE}}"
 PARTITION="{{PARTITION}}"
 ACTIVATION_CHECKPOINT="{{ACTIVATION_CHECKPOINT}}"
 CHECKPOINT_NUM_LAYERS="{{CHECKPOINT_NUM_LAYERS}}"
+DYNAMIC_CHECKPOINT="{{DYNAMIC_CHECKPOINT}}"
+UNEVEN_PP_PARTITION="{{UNEVEN_PP_PARTITION}}"
+
 
 # ACTIVATION_CHECKPOINT="false"
 # ACTIVATION_CHECKPOINT="true"
-
 
 echo "MICRO_BATCH_SIZE: $BATCH_SIZE"
 echo "GLOBAL_BATCH_SIZE: $GLOBAL_BATCH_SIZE"
@@ -38,11 +40,22 @@ echo "EP_SIZE: $EP_PARALLEL_SIZE"
 echo "MP_SIZE: $MP_SIZE"
 echo "NODES: $NODES"
 echo "TOTAL_GPUS: $TOTAL_GPUS"
+echo "TRAIN_ITERS: $TRAIN_ITERS"
+echo "MOE_TYPE: $MOE_TYPE"
+echo "RUN_TYPE: $RUN_TYPE"
+echo "PARTITION: $PARTITION"
+echo "ACTIVATION_CHECKPOINT: $ACTIVATION_CHECKPOINT"
+echo "CHECKPOINT_NUM_LAYERS: $CHECKPOINT_NUM_LAYERS"
+echo "DYNAMIC_CHECKPOINT: $DYNAMIC_CHECKPOINT"
+echo "UNEVEN_PP_PARTITION: $UNEVEN_PP_PARTITION"
+
+export DYNAMIC_CHECKPOINT=$DYNAMIC_CHECKPOINT
+export UNEVEN_PP_PARTITION=$UNEVEN_PP_PARTITION
 
 # --- 3. Environment Setup ---
 source /lustre/orion/world-shared/gen150/zixianw4/TORCH-ROCM6.4.1_env/bin/activate
 
-export ROCM_HOME=/opt/rocm-5.7.0
+# export ROCM_HOME=/opt/rocm-5.7.0
 export LD_PRELOAD="/usr/lib64/libcrypto.so /usr/lib64/libssh.so.4 /usr/lib64/libssl.so.1.1"
 
 export TRANSFORMERS_OFFLINE=1
@@ -61,7 +74,7 @@ mkdir -p logs
 
 # --- 4. Dynamic Model Configuration ---
 if [[ "${MODEL_SIZE}" == "10B" ]]; then
-    NUM_LAYERS=28
+    NUM_LAYERS=24
     HIDDEN_SIZE=2048
     FFN_HIDDEN_SIZE=1408
     NUM_ATTN_HEADS=16
@@ -71,7 +84,17 @@ if [[ "${MODEL_SIZE}" == "10B" ]]; then
 elif [[ "${MODEL_SIZE}" == "50B" ]]; then
     echo "Configuring 50B Model"
     NUM_LAYERS=24
-    MODEL_SIZE=50B
+    # MODEL_SIZE=50B
+    HIDDEN_SIZE=5120
+    FFN_HIDDEN_SIZE=1536
+    NUM_ATTN_HEADS=40
+    EP_SIZE=128
+    topk=6
+    SEQ_LEN=4096
+elif [[ "${MODEL_SIZE}" == "63B" ]]; then
+    echo "Configuring 63B Model"
+    NUM_LAYERS=32
+    # MODEL_SIZE=63B
     HIDDEN_SIZE=5120
     FFN_HIDDEN_SIZE=1536
     NUM_ATTN_HEADS=40
@@ -81,7 +104,7 @@ elif [[ "${MODEL_SIZE}" == "50B" ]]; then
 elif [[ "${MODEL_SIZE}" == "173B" ]]; then
     echo "Configuring 173B Model"
     NUM_LAYERS=24
-    MODEL_SIZE=173B
+    # MODEL_SIZE=173B
     HIDDEN_SIZE=7168
     FFN_HIDDEN_SIZE=2048
     NUM_ATTN_HEADS=56
@@ -91,7 +114,7 @@ elif [[ "${MODEL_SIZE}" == "173B" ]]; then
 elif [[ "${MODEL_SIZE}" == "537B" ]]; then
     echo "Configuring 537B Model"
     NUM_LAYERS=60
-    MODEL_SIZE=537B
+    # MODEL_SIZE=537B
     HIDDEN_SIZE=7168
     FFN_HIDDEN_SIZE=2560
     NUM_ATTN_HEADS=56
@@ -101,7 +124,7 @@ elif [[ "${MODEL_SIZE}" == "537B" ]]; then
 elif [[ "${MODEL_SIZE}" == "50B_6L" ]]; then
     echo "Configuring 50B Model"
     NUM_LAYERS=6
-    MODEL_SIZE=50B_6L
+    # MODEL_SIZE=50B_6L
     HIDDEN_SIZE=5120
     FFN_HIDDEN_SIZE=1536
     NUM_ATTN_HEADS=40
@@ -111,7 +134,7 @@ elif [[ "${MODEL_SIZE}" == "50B_6L" ]]; then
 elif [[ "${MODEL_SIZE}" == "50B_12L" ]]; then
     echo "Configuring 50B Model"
     NUM_LAYERS=12
-    MODEL_SIZE=50B_12L
+    # MODEL_SIZE=50B_12L
     HIDDEN_SIZE=5120
     FFN_HIDDEN_SIZE=1536
     NUM_ATTN_HEADS=40
@@ -121,7 +144,7 @@ elif [[ "${MODEL_SIZE}" == "50B_12L" ]]; then
 elif [[ "${MODEL_SIZE}" == "50B_18L" ]]; then
     echo "Configuring 50B Model"
     NUM_LAYERS=18
-    MODEL_SIZE=50B_18L
+    # MODEL_SIZE=50B_18L
     HIDDEN_SIZE=5120
     FFN_HIDDEN_SIZE=1536
     NUM_ATTN_HEADS=40
@@ -131,7 +154,7 @@ elif [[ "${MODEL_SIZE}" == "50B_18L" ]]; then
 elif [[ "${MODEL_SIZE}" == "173B_8L" ]]; then
     echo "Configuring 173B Model"
     NUM_LAYERS=8
-    MODEL_SIZE=173B_8L
+    # MODEL_SIZE=173B_8L
     HIDDEN_SIZE=7168
     FFN_HIDDEN_SIZE=2048
     NUM_ATTN_HEADS=56
@@ -141,7 +164,7 @@ elif [[ "${MODEL_SIZE}" == "173B_8L" ]]; then
 elif [[ "${MODEL_SIZE}" == "173B_6L" ]]; then
     echo "Configuring 173B Model"
     NUM_LAYERS=6
-    MODEL_SIZE=173B_6L
+    # MODEL_SIZE=173B_6L
     HIDDEN_SIZE=7168
     FFN_HIDDEN_SIZE=2048
     NUM_ATTN_HEADS=56
@@ -165,7 +188,7 @@ elif [[ "${MODEL_SIZE}" == "10B-4" ]]; then
     topk=6
     SEQ_LEN=2048
 elif [[ "${MODEL_SIZE}" == "10B-8" ]]; then
-    NUM_LAYERS=20
+    NUM_LAYERS=8
     HIDDEN_SIZE=2048
     FFN_HIDDEN_SIZE=1408
     NUM_ATTN_HEADS=16
@@ -207,7 +230,7 @@ elif [[ "${MODEL_SIZE}" == "31B" ]]; then
 elif [[ "${MODEL_SIZE}" == "173B_1L" ]]; then
     echo "Configuring 173B Model But with only 1 layer"
     NUM_LAYERS=1
-    MODEL_SIZE=190_div_28
+    # MODEL_SIZE=190_div_28
     HIDDEN_SIZE=7168
     FFN_HIDDEN_SIZE=2048
     NUM_ATTN_HEADS=56
@@ -332,10 +355,10 @@ if [[ ${PP_SIZE} -gt 1 ]]; then
     export WALL_CLOCK_BREAKDOWN="false"
 else
     DEEPSPEED_PIPELINE_FLAG="--no-pipeline-parallel"
-    # WALL_CLOCK_BREAKDOWN="true"
-    # export WALL_CLOCK_BREAKDOWN="true"
-    WALL_CLOCK_BREAKDOWN="false"
-    export WALL_CLOCK_BREAKDOWN="false"
+    WALL_CLOCK_BREAKDOWN="true"
+    export WALL_CLOCK_BREAKDOWN="true"
+    # WALL_CLOCK_BREAKDOWN="false"
+    # export WALL_CLOCK_BREAKDOWN="false"
 fi
 
 if [[ "${MOE_TYPE}" == "X-MOE" ]]; then
@@ -451,6 +474,8 @@ current_time=$(date +%Y-%m-%d_%H-%M-%S)
 export profile_dir="torch_profile/${current_time}/"
 export OMP_NUM_THREADS=2
 
+export NCCL_P2P_DISABLE=1
+
 # --- Final srun Launch Command ---
 gpus_per_node=$(( TOTAL_GPUS / NODES ))
 LOG_FILE="logs/n${TOTAL_GPUS}-gbs${GLOBAL_BATCH_SIZE}-${MOE_TYPE}-${RUN_TYPE}.log"
@@ -470,7 +495,7 @@ srun -N ${NODES} -n ${TOTAL_GPUS} -c2 --ntasks-per-node=${gpus_per_node} --gpus-
 srun -N ${NODES} -n ${TOTAL_GPUS} -c2 \
      --ntasks-per-node=${gpus_per_node} \
      --gpus-per-node=${gpus_per_node} \
-     --export=ALL,FI_MR_CACHE_MONITOR,FI_CXI_DEFAULT_CQ_SIZE,FI_CXI_RX_MATCH_MODE,NCCL_DEBUG \
+     --export=ALL,FI_MR_CACHE_MONITOR,FI_CXI_DEFAULT_CQ_SIZE,FI_CXI_RX_MATCH_MODE,NCCL_DEBUG,UNEVEN_PP_PARTITION \
      python ../pretrain_gpt_deepspeed.py \
         ${megatron_options} \
         ${data_options} \
@@ -505,6 +530,8 @@ python  /lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/exa
         --moe_type $MOE_TYPE \
         --model_size $MODEL_SIZE \
         --activation_checkpointing $ACTIVATION_CHECKPOINT \
-        --checkpoint_interval $CHECKPOINT_NUM_LAYERS
+        --checkpoint_interval $CHECKPOINT_NUM_LAYERS \
+        --dynamic_checkpoint $DYNAMIC_CHECKPOINT \
+        --uneven_pp_partition $UNEVEN_PP_PARTITION
 
 echo "After python analyze log"
