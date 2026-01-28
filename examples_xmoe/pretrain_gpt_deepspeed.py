@@ -110,6 +110,8 @@ def model_provider(pre_process=True, post_process=True):
 
     args = get_args()
     if args.using_mpi:
+        print("master addr setup via mpi")
+        print("args.master_addr=", args.master_addr)
         _set_env_variables(args)
     else:
         get_env_variables(args)

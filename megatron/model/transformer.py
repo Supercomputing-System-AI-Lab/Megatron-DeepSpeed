@@ -1086,6 +1086,7 @@ class ParallelTransformerLayer(MegatronModule):
                                 use_pft=args.use_pft,
                                 use_rbd=args.use_rbd,
                                 use_groupedGEMM=args.use_groupedGEMM,
+                                use_triton=args.use_triton,
                                 rbd_mesh_size=args.rbd_mesh_size)
 
         # Set bias+dropout+add fusion grad_enable execution handler.
@@ -1451,7 +1452,7 @@ class ParallelTransformerLayer(MegatronModule):
         # print(f"[megatron/model/transformer.py - ParallelTransformerLayer - forward] {rank=}, {self.layer_number=}, before ATTENTION")
         
         print(f"[MEM-UTIL-CHECK] [megatron/model/transformer.py - ParallelTransformerLayer - forward] before ATTENTION {rank=}, {self.layer_number=}, ")
-        log_mem (file_name = 'megatron/model/transformer.py - ParallelTransformerLayer - forward', rank=rank, message=f'layer-{self.layer_number} before ATTENTION')
+        # log_mem (file_name = 'megatron/model/transformer.py - ParallelTransformerLayer - forward', rank=rank, message=f'layer-{self.layer_number} before ATTENTION')
 
         # Layer norm at the beginning of the transformer layer.
 
@@ -1526,7 +1527,8 @@ class ParallelTransformerLayer(MegatronModule):
                 mlp_output, moe_loss, _ = self.mlp(layernorm_output)
         if TIMING:
             self.moe_timer.stop()
-            
+        
+        log_mem (file_name = 'megatron/model/transformer.py - ParallelTransformerLayer - forward', rank=rank, message=f'layer-{self.layer_number} after MOE')
         # print (f'AFTER MLP, {rank=}, {self.layer_number=} {layernorm_output.shape=}, {mlp_output=}') 
 
         # Second residual connection.

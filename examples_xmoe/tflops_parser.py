@@ -60,7 +60,7 @@ def main():
     log_file_path = sys.argv[1]
 
     # If you want to include 'end_iter' in the range, use range(start_iter, end_iter+1)
-    iteration_range = range(4, 30)
+    iteration_range = range(10, 50)
 
     max_tflops, avg_tflops = parse_tflops_in_range(log_file_path, iteration_range)
 

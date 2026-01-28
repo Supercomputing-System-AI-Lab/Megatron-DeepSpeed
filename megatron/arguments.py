@@ -13,7 +13,6 @@ from packaging import version
 
 import torch.nn.functional as F
 from megatron.global_vars import set_retro_args, get_retro_args
-from tools.retro.utils import get_args_path as get_retro_args_path
 
 from megatron.core.transformer import TransformerConfig
 
@@ -930,6 +929,8 @@ def _add_training_args(parser):
                        help='Use Tutel optimization for MoE')
     group.add_argument('--use-groupedGEMM', action='store_true',
                        help='Use groupedGEMM for MoE')
+    group.add_argument('--use-triton', action='store_true',
+                       help='Use groupedGEMM from triton for MoE')
     group.add_argument('--use-tutel-moe', action='store_true',
                        help='Use Tutel MoE')
     group.add_argument('--inference', action='store_true',
@@ -1458,8 +1459,8 @@ def _add_zero_args(parser):
                        help='Use reduce scatter if specified')
     group.add_argument('--zero-contigious-gradients', action='store_true',
                        help='Use contigious memory optimizaiton if specified')
-    group.add_argument("--zero-reduce-bucket-size", type=int, default=0.0)
-    group.add_argument("--zero-allgather-bucket-size", type=int, default=0.0)
+    group.add_argument("--zero-reduce-bucket-size", type=int, default=1000000000)
+    group.add_argument("--zero-allgather-bucket-size", type=int, default=1000000000)
     group.add_argument('--remote-device', type=str, default='none', choices=['none', 'cpu', 'nvme'],
                       help='Remote device for ZeRO-3 initialized parameters.')
     group.add_argument('--use-pin-memory', action='store_true',

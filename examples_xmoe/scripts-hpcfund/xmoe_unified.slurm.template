@@ -2,12 +2,12 @@
 
 #SBATCH -J {{MOE_TYPE}}-{{RUN_TYPE}}-gbs{{GLOBAL_BATCH_SIZE}}
 #SBATCH -o /work1/mzhang/henryj/xmoe-{{RUN_TYPE}}-%j.o
-#SBATCH -t 1:00:00
+#SBATCH -t 0:40:00
 #SBATCH -p batch
 #SBATCH -N {{NODES}}
 #SBATCH -n {{TOTAL_GPUS}}
 #SBATCH -p {{PARTITION}}
-#SBATCH --exclude=k005-004,k005-005,k003-001
+#SBATCH --exclude=k005-004,k005-005,k003-001,k004-006,k004-003,k004-004
 
 # --- Parameters passed from hyper-script ---
 BATCH_SIZE={{BATCH_SIZE}}
@@ -23,7 +23,6 @@ MOE_TYPE="{{MOE_TYPE}}"
 MODEL_SIZE="{{MODEL_SIZE}}"
 
 # --- Conditional Logic ---
-# Set DeepSpeed flags and other settings based on whether this is a PP run.
 if [[ ${PP_SIZE} -gt 1 ]]; then
     DEEPSPEED_PIPELINE_FLAG="--pipeline-model-parallel-size ${PP_SIZE}"
     WALL_CLOCK_BREAKDOWN="false"
@@ -38,7 +37,21 @@ fi
 # --- Environment & Setup ---
 echo "Activating conda environment..."
 source /work1/mzhang/henryj/miniforge3/etc/profile.d/conda.sh
-conda activate /work1/mzhang/henryj/TORCH-ROCM6.3.1_env
+conda activate test_new_hardware
+module load rocm/6.3.1
+export ROCM_HOME=/opt/rocm-6.3.1
+export HIP_PATH=/opt/rocm-6.3.1
+export CUDA_HOME=/opt/rocm-6.3.1
+export CC=/opt/rocm-6.3.1/bin/hipcc
+export CXX=/opt/rocm-6.3.1/bin/hipcc
+
+export PATH=$ROCM_HOME/bin:$PATH
+export GPU_ARCHS="gfx90a"
+export PYTORCH_ROCM_ARCH="gfx90a"
+export PYTHONPATH=$PYTHONPATH:/work1/mzhang/henryj/X-MoE/Megatron-DeepSpeed-X-MoE
+export TRITON_PRINT_AUTOTUNING=1
+echo PYTORCH_ROCM_ARCH=$PYTORCH_ROCM_ARCH
+export PYTORCH_ALLOC_CONF=expandable_segments:True
 echo "Conda environment activated."
 
 export TRANSFORMERS_OFFLINE=1
@@ -53,43 +66,227 @@ export MERGE_FILE=../data/gpt2-merges.txt
 export DATA_PATH=../data/my-gpt2_text_document
 
 DIR=`pwd`
+
+
 ###############################################################################
 ### Main configs (These are now common to all runs)
+### Main configs (These are now common to all runs)
 
-if [[ "${MODEL_SIZE}" == "16B" ]]; then
-    echo "Configuring DeepSeek-V1 16B"
-    NUM_LAYERS=28
-    MODEL_SIZE=16
+# if [[ "${MODEL_SIZE}" == "10B" ]]; then
+#     echo "Configuring fine-grained DeepSeek-V1 10B"
+#     SEQ_LEN=2048
+#     HIDDEN_SIZE=2048
+#     FFN_HIDDEN_SIZE=1408
+#     NUM_ATTN_HEADS=16
+#     EP_SIZE=64
+#     topk=8
+#     NUM_LAYERS=2
+#     # Re-assigning MODEL_SIZE for internal tracking if needed
+#     MODEL_SIZE="10B"
+if [[ "${MODEL_SIZE}" == "10B" ]]; then
+    echo "Configuring coarse-grained DeepSeek-V1 10B"
+    SEQ_LEN=2048
     HIDDEN_SIZE=2048
-    FFN_HIDDEN_SIZE=1408
+    FFN_HIDDEN_SIZE=11264
     NUM_ATTN_HEADS=16
-    EP_SIZE=64
-    topk=6
-elif [[ "${MODEL_SIZE}" == "190B_1L" ]]; then
-    echo "Configuring 190B Model But with only 1 layer"
-    NUM_LAYERS=1
-    MODEL_SIZE=190_div_28
+    EP_SIZE=8
+    topk=1
+    NUM_LAYERS=2
+    # Re-assigning MODEL_SIZE for internal tracking if needed
+    MODEL_SIZE="10B"
+elif [[ "${MODEL_SIZE}" == "50B" ]]; then
+    echo "Configuring fine-grained DeepSeek-V1 50B"
+    SEQ_LEN=4096
+    HIDDEN_SIZE=5120
+    FFN_HIDDEN_SIZE=1536
+    NUM_ATTN_HEADS=40
+    EP_SIZE=128
+    topk=8
+    NUM_LAYERS=2
+    MODEL_SIZE="50B"
+# elif [[ "${MODEL_SIZE}" == "50B" ]]; then
+#     echo "Configuring coarse-grained DeepSeek-V1 50B"
+#     SEQ_LEN=4096
+#     HIDDEN_SIZE=5120
+#     FFN_HIDDEN_SIZE=12288
+#     NUM_ATTN_HEADS=40
+#     EP_SIZE=16
+#     topk=1
+#     NUM_LAYERS=4
+#     MODEL_SIZE="50B"
+
+# elif [[ "${MODEL_SIZE}" == "63B" ]]; then
+#     echo "Configuring fine-grained DeepSeek-V1 63B"
+#     SEQ_LEN=4096
+#     HIDDEN_SIZE=5120
+#     FFN_HIDDEN_SIZE=1536
+#     NUM_ATTN_HEADS=40
+#     EP_SIZE=128
+#     topk=8
+#     NUM_LAYERS=2
+#     MODEL_SIZE="63B"
+elif [[ "${MODEL_SIZE}" == "63B" ]]; then
+    echo "Configuring coarse-grained DeepSeek-V1 63B"
+    SEQ_LEN=4096
+    HIDDEN_SIZE=5120
+    FFN_HIDDEN_SIZE=12288
+    NUM_ATTN_HEADS=40
+    EP_SIZE=16
+    topk=1
+    NUM_LAYERS=2
+    MODEL_SIZE="63B"
+elif [[ "${MODEL_SIZE}" == "173B" ]]; then
+    echo "Configuring fine-grained DeepSeek-V1 173B"
+    SEQ_LEN=4096
     HIDDEN_SIZE=7168
     FFN_HIDDEN_SIZE=2048
     NUM_ATTN_HEADS=56
     EP_SIZE=256
     topk=8
+    NUM_LAYERS=1
+    MODEL_SIZE="173B"
+# elif [[ "${MODEL_SIZE}" == "173B" ]]; then
+#     echo "Configuring fine-grained DeepSeek-V1 173B"
+#     SEQ_LEN=4096
+#     HIDDEN_SIZE=7168
+#     FFN_HIDDEN_SIZE=16384
+#     NUM_ATTN_HEADS=56
+#     EP_SIZE=32
+#     topk=1
+#     NUM_LAYERS=2
+#     MODEL_SIZE="173B"
+# elif [[ "${MODEL_SIZE}" == "537B" ]]; then
+#     echo "Configuring DeepSeek-V1 537B"
+#     SEQ_LEN=4096
+#     HIDDEN_SIZE=7168
+#     FFN_HIDDEN_SIZE=2560
+#     NUM_ATTN_HEADS=56
+#     EP_SIZE=256
+#     topk=8
+#     NUM_LAYERS=2
+#     MODEL_SIZE="537B"
+elif [[ "${MODEL_SIZE}" == "537B" ]]; then
+    echo "Configuring coarse-grained DeepSeek-V1 537B"
     SEQ_LEN=4096
-else 
-    echo "Configuring custom model size"
-    NUM_LAYERS=18
-    MODEL_SIZE=10.1
+    HIDDEN_SIZE=7168
+    FFN_HIDDEN_SIZE=20480
+    NUM_ATTN_HEADS=56
+    EP_SIZE=32
+    topk=1
+    NUM_LAYERS=2
+    MODEL_SIZE="537B"
+elif [[ "${MODEL_SIZE}" == "1T" ]]; then
+    echo "Configuring DeepSeek-V1 1T"
+    SEQ_LEN=4096
+    HIDDEN_SIZE=7168
+    FFN_HIDDEN_SIZE=2560
+    NUM_ATTN_HEADS=56
+    EP_SIZE=512
+    topk=8
+    NUM_LAYERS=60
+    MODEL_SIZE="1T"
+
+else
+    echo "Configuring custom/default model size (Defaulting to 10B specs)"
+    SEQ_LEN=2048
     HIDDEN_SIZE=2048
     FFN_HIDDEN_SIZE=1408
     NUM_ATTN_HEADS=16
     EP_SIZE=64
     topk=6
-fi 
+    NUM_LAYERS=24
+    MODEL_SIZE="10B"
+fi
 
+
+# if [[ "${MODEL_SIZE}" == "10B" ]]; then
+#     echo "Configuring Small DeepSeek-V1 10B"
+#     SEQ_LEN=2048
+#     HIDDEN_SIZE=2048
+#     FFN_HIDDEN_SIZE=1408
+#     EP_SIZE=64
+#     topk=6
+#     NUM_LAYERS=28
+#     MODEL_SIZE=10.1
+#     NUM_ATTN_HEADS=16
+    
+# elif [[ "${MODEL_SIZE}" == "55B" ]]; then
+#     echo "Configuring Medium DeepSeek-V1 55B"
+#     SEQ_LEN=4096
+#     HIDDEN_SIZE=5120
+#     FFN_HIDDEN_SIZE=1536
+#     EP_SIZE=128
+#     topk=6
+#     NUM_LAYERS=10
+#     MODEL_SIZE=55.2
+#     NUM_ATTN_HEADS=16
+    
+# elif [[ "${MODEL_SIZE}" == "200B" ]]; then
+#     echo "Configuring Large DeepSeek-V1 200B"
+#     SEQ_LEN=4096
+#     HIDDEN_SIZE=7168
+#     FFN_HIDDEN_SIZE=2048
+#     EP_SIZE=256
+#     topk=8
+#     NUM_LAYERS=8
+#     MODEL_SIZE=201.4
+#     NUM_ATTN_HEADS=16
+
+# elif [[ "${MODEL_SIZE}" == "500B" ]]; then
+#     echo "Configuring Super DeepSeek-V1 500B"
+#     SEQ_LEN=4096
+#     HIDDEN_SIZE=7168
+#     FFN_HIDDEN_SIZE=2560
+#     EP_SIZE=256
+#     topk=8
+#     NUM_LAYERS=1
+#     MODEL_SIZE=545.4
+#     NUM_ATTN_HEADS=16
+
+# elif [[ "${MODEL_SIZE}" == "16B" ]]; then
+#     echo "Configuring DeepSeek-V1 16B"
+#     NUM_LAYERS=4
+#     MODEL_SIZE=16
+#     HIDDEN_SIZE=2048
+#     FFN_HIDDEN_SIZE=1408
+#     NUM_ATTN_HEADS=16
+#     EP_SIZE=128
+#     topk=6
+# elif [[ "${MODEL_SIZE}" == "30B" ]]; then
+#     echo "Configuring DeepSeek-V1 16B"
+#     NUM_LAYERS=4
+#     MODEL_SIZE=16
+#     HIDDEN_SIZE=7168
+#     FFN_HIDDEN_SIZE=2048
+#     NUM_ATTN_HEADS=16
+#     EP_SIZE=64
+#     topk=6
+#     SEQ_LEN=4096
+# elif [[ "${MODEL_SIZE}" == "190B_1L" ]]; then
+#     echo "Configuring 190B Model But with only 1 layer"
+#     NUM_LAYERS=1
+#     MODEL_SIZE=190_div_28
+#     HIDDEN_SIZE=7168
+#     FFN_HIDDEN_SIZE=2048
+#     NUM_ATTN_HEADS=56
+#     EP_SIZE=256
+#     topk=8
+#     SEQ_LEN=4096
+# else 
+#     echo "Configuring custom model size"
+#     NUM_LAYERS=18
+#     MODEL_SIZE=10.1
+#     HIDDEN_SIZE=2048
+#     FFN_HIDDEN_SIZE=1408
+#     NUM_ATTN_HEADS=16
+#     EP_SIZE=64
+#     topk=6
+# fi 
+
+echo EP_SIZE=${EP_SIZE}
 node=${NODES}
 total_gpu=${TOTAL_GPUS}
 NUM_GPUS=$total_gpu
-SEQ_LEN=2048
 
 LR=1.2e-4
 MIN_LR=1.0e-6
@@ -113,7 +310,8 @@ EVAL_ITERS=5
 EVAL_INTERVAL=100
 SAVE_INTERVAL=50
 INIT_STD=0.014
-ACTIVATION_CHECKPOINT="false"
+# ACTIVATION_CHECKPOINT="false"
+ACTIVATION_CHECKPOINT="true"
 ###############################################################################
 ### Output and data configs
 current_time=$(date "+%Y.%m.%d-%H.%M.%S")
@@ -183,20 +381,27 @@ megatron_options=" \
         --tensorboard-dir ${TENSORBOARD_DIR} \
         --eval-iters 0 \
         --moe-train-capacity-factor 1.25 \
-	    --expert-interval 1 \
-	    --topk $topk \
-	--use-rotary-position-embeddings"
+        --expert-interval 1 \
+        --topk $topk \
+        --using-torchrun \
+        --use-flash-attn-v2 \
+    --use-rotary-position-embeddings"
 
 # Conditionally append flags based on the MoE type
 if [[ "${MOE_TYPE}" == "X-MOE" ]]; then
     megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft"
-elif [[ "${MOE_TYPE}" == "X-MOE-GroupedGEMM" ]]; then
+elif [[ "${MOE_TYPE}" == "X-MOE-GroupedGEMM-triton" ]]; then
+    megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-groupedGEMM --use-triton"
+elif [[ "${MOE_TYPE}" == "X-MOE-GroupedGEMM-primus" ]]; then
     megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-groupedGEMM"
 fi
 
+
 if [ "${ACTIVATION_CHECKPOINT}" = "true" ]; then
     megatron_options="${megatron_options} --checkpoint-activations"
+    megatron_options="${megatron_options} --checkpoint-num-layers 1"
 fi
+
 if [[ $EP_SIZE -gt 1 ]]; then
     megatron_options="${megatron_options} --create-moe-param-group"
 fi
@@ -215,10 +420,10 @@ sed "s/CONFIG_BATCH_SIZE/${GLOBAL_BATCH_SIZE}/" ${template_json} \
     | sed "s/CONFIG_CL_MAX/${SEQ_LEN}/" \
     | sed "s/CONFIG_CL_DURATION/${CL_STEP}/" \
     | sed "s/WALL_CLOCK_BREAKDOWN/${WALL_CLOCK_BREAKDOWN}/" \
-	  > ${config_json}
+      > ${config_json}
 
 deepspeed_options=" \
-		    --deepspeed \
+            --deepspeed \
             --deepspeed_config ${config_json} \
             ${DEEPSPEED_PIPELINE_FLAG}"
 
@@ -233,52 +438,137 @@ export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((NUM_GPUS-1)))
 export NCCL_NET_GDR_LEVEL=3
 export FI_MR_CACHE_MONITOR=userfaultfd
 
-readarray -t arr < <(scontrol show hostnames $SLURM_NODELIST)
-first=${arr[0]}
-ips=$(ssh "$first" hostname -I)
-read -ra ip_arr <<< "$ips"
-export MASTER_ADDR=${ip_arr[0]}
-echo "MASTER_ADDR=${MASTER_ADDR}"
 
 export TRITON_DISABLE_CACHE=1
 export to_profile="False"
 export profile_dir="../scripts/torch_profile/${current_time}/"
 
-srun -N $node -n $total_gpu -c 2 --gpu-bind=closest \
+# srun -N $node -n $total_gpu -c 2 --gpu-bind=closest \
+#     bash -c "export RANK=\$SLURM_PROCID; \
+#              export WORLD_SIZE=\$SLURM_NTASKS; \
+#              export LOCAL_RANK=\$SLURM_LOCALID; \
+#              python ../pretrain_gpt_deepspeed.py \
+#              ${megatron_options} \
+#              ${data_options} \
+#              ${deepspeed_options} \
+#              --master-addr=$MASTER_ADDR \
+#              --zero-stage 1 \
+#              2>&1 | tee n${total_gpu}-Small-XMoE-${RUN_TYPE}.log"
+
+if [[ $node -gt 1 ]]; then 
+
+    # ======================= FINAL CORRECTED SCRIPT =======================
+    # export ETHERNET_INTERFACE=eth0
+    # export IB_INTERFACE=ib0
+    # export MASTER_PORT=29500
+
+    # # 2. Tell the GPU communication library (NCCL) to use this interface.
+    # export NCCL_SOCKET_IFNAME=${ETHERNET_INTERFACE}
+    # echo "NCCL will use interface: ${NCCL_SOCKET_IFNAME}"
+
+    # # 3. Find the master node's IP address on that specific interface.
+    # readarray -t arr < <(scontrol show hostnames $SLURM_NODELIST)
+    # first_node=${arr[0]}
+    # # This command is now more specific to get the IP of the chosen interface.
+    # master_ip=$(ssh $first_node "ip -4 addr show ${ETHERNET_INTERFACE} | grep 'inet' | awk '{print \$2}' | cut -d/ -f1")
+
+
+    # if [[ -z "${master_ip}" ]]; then
+    #     echo "ERROR: Could not determine MASTER_ADDR for ${ETHERNET_INTERFACE} on master node ${first_node}."
+    #     exit 1
+    # fi
+
+    # # 4. Export the clean MASTER_ADDR and MASTER_PORT.
+    # export MASTER_ADDR=$master_ip
+    # echo "nodes>1: MASTER_ADDR=${MASTER_ADDR}"
+    # echo "first_node: ${first_node}"
+    # echo "master_ip: ${master_ip}"
+    # # echo "MASTER_ADDR has been set to the Ethernet IP: ${MASTER_ADDR}"
+    # # echo "MASTER_PORT has been set to: ${MASTER_PORT}"
+
+
+    # srun -N $node -n $total_gpu -c 2 --gpu-bind=closest \
+    # bash -c "export OMPI_MCA_pml=ob1; \
+    #         export OMPI_MCA_btl=self,tcp; \
+    #         export OMPI_MCA_btl_tcp_if_include=${ETHERNET_INTERFACE}; \
+    #         export RANK=\$SLURM_PROCID; \
+    #          export WORLD_SIZE=\$SLURM_NTASKS; \
+    #          export LOCAL_RANK=\$SLURM_LOCALID; \
+    #          python ../pretrain_gpt_deepspeed.py \
+    #          ${megatron_options} \
+    #          ${data_options} \
+    #          ${deepspeed_options} \
+    #          --master-addr=$MASTER_ADDR \
+    #          --zero-stage 1 \
+    #          2>&1 | tee n${total_gpu}-Small-XMoE-${RUN_TYPE}.log"
+        # 1. Define the subnet for the high-speed InfiniBand network.
+    #    This is more reliable than a hardcoded interface name.
+    IB_SUBNET="10.0.200."
+    export MASTER_PORT=29500
+
+    # 2. Find the master node's InfiniBand interface and IP address programmatically.
+    readarray -t arr < <(scontrol show hostnames $SLURM_NODELIST)
+    first_node=${arr[0]}
+
+    # This command finds the interface name and IP on the master node that matches the IB_SUBNET
+    # It's a bit complex, but very reliable.
+    ib_info=$(ssh $first_node "ip -4 a | grep 'inet ${IB_SUBNET}'")
+    if [[ -z "${ib_info}" ]]; then
+        echo "ERROR: Could not find an interface on the IB_SUBNET (${IB_SUBNET}) on master node ${first_node}."
+        exit 1
+    fi
+    master_ip=$(echo $ib_info | awk '{print $2}' | cut -d/ -f1)
+    ib_interface=$(echo $ib_info | awk '{print $NF}') # $NF gets the last field, which is the interface name
+
+    # 3. Export the discovered values for the training job.
+    export MASTER_ADDR=$master_ip
+    export NCCL_SOCKET_IFNAME=${ib_interface}
+
+    echo "Discovered InfiniBand Interface: ${ib_interface}"
+    echo "NCCL will use interface: ${NCCL_SOCKET_IFNAME}"
+    echo "nodes>1: MASTER_ADDR=${MASTER_ADDR}"
+    echo "first_node: ${first_node}"
+
+
+    srun -N $node -n $total_gpu -c 2 --gpu-bind=closest \
+    bash -c "export OMPI_MCA_pml=ob1; \
+            export OMPI_MCA_btl=self,tcp; \
+            export OMPI_MCA_btl_tcp_if_include=${NCCL_SOCKET_IFNAME}; \
+            export RANK=\$SLURM_PROCID; \
+            export WORLD_SIZE=\$SLURM_NTASKS; \
+            export LOCAL_RANK=\$SLURM_LOCALID; \
+            python ../pretrain_gpt_deepspeed.py \
+            ${megatron_options} \
+            ${data_options} \
+            ${deepspeed_options} \
+            --master-addr=$MASTER_ADDR \
+            --zero-stage 1 \
+            2>&1 | tee n${total_gpu}-Small-XMoE-${RUN_TYPE}.log"
+
+    # ============================ END OF CONFIGURATION ============================
+else
+    readarray -t arr < <(scontrol show hostnames $SLURM_NODELIST)
+    first=${arr[0]}
+    ips=$(ssh "$first" hostname -I)
+    read -ra ip_arr <<< "$ips"
+    export MASTER_ADDR=${ip_arr[0]}
+    echo "nodes==1: MASTER_ADDR=${MASTER_ADDR}"
+
+    srun -N $node -n $total_gpu -c 2 --gpu-bind=closest \
     bash -c "export RANK=\$SLURM_PROCID; \
              export WORLD_SIZE=\$SLURM_NTASKS; \
              export LOCAL_RANK=\$SLURM_LOCALID; \
+             export TRITON_CACHE_DIR=/tmp/triton_cache_${USER}_${SLURM_JOB_ID}/rank\${SLURM_PROCID}; \
              python ../pretrain_gpt_deepspeed.py \
              ${megatron_options} \
              ${data_options} \
              ${deepspeed_options} \
-             --master-addr=$MASTER_ADDR \
+             --master-addr=${MASTER_ADDR} \
              --zero-stage 1 \
              2>&1 | tee n${total_gpu}-Small-XMoE-${RUN_TYPE}.log"
-
+fi 
 
 # --- Analysis Script ---
-# gpus_per_node=$(( total_gpu / node ))
-# ANALYSIS_LOG_FILE="/work1/mzhang/henryj/xmoe-${RUN_TYPE}-$SLURM_JOB_ID.o"
-# python  /work1/mzhang/henryj/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe/scripts/analyze_log.py \
-#         ${ANALYSIS_LOG_FILE} \
-#         --iterations $TRAIN_ITERS \
-#         --nodes $node \
-#         --gpus_per_node $gpus_per_node \
-#         --megatron_pp $PP_SIZE \
-#         --ep $EP_PARALLEL_SIZE \
-#         --dp $(( total_gpu / PP_SIZE / MP_SIZE )) \
-#         --tp $MP_SIZE \
-#         --gbs $GLOBAL_BATCH_SIZE \
-#         --mbs $BATCH_SIZE \
-#         --slurm_job_id $SLURM_JOB_ID \
-#         --seqlen $SEQ_LEN \
-#         --num_layers $NUM_LAYERS \
-#         --num_experts $EP_SIZE \
-#         --expert_dim $FFN_HIDDEN_SIZE \
-#         --topk $topk \
-#         --hidden_dim $HIDDEN_SIZE \
-#         --moe_type $MOE_TYPE 
 
 gpus_per_node=$(( total_gpu / node ))
 ANALYSIS_LOG_FILE="/work1/mzhang/henryj/xmoe-${RUN_TYPE}-$SLURM_JOB_ID.o"
