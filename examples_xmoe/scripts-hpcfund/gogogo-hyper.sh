@@ -19,57 +19,76 @@ MP_SIZE=1
 # KEY: NODE:TOTAL_GPU
 # VALUE="PP_SIZE:EP_PARALLEL_SIZE"
 declare -A PP_STRATEGY_MAP
-PP_STRATEGY_MAP["1:4"]="2:2" 
-PP_STRATEGY_MAP["2:8"]="2:4" 
-PP_STRATEGY_MAP["4:16"]="4:4" 
-PP_STRATEGY_MAP["1:8"]="2:4 4:2" 
-PP_STRATEGY_MAP["2:16"]="2:8 4:4 8:2" 
-PP_STRATEGY_MAP["4:32"]="4:8 8:4" 
+PP_STRATEGY_MAP["1:8"]="1:8"
+# PP_STRATEGY_MAP["4:32"]="4:8"
+# PP_STRATEGY_MAP["2:8"]="2:4" 
+# PP_STRATEGY_MAP["4:32"]="4:8" 
+# PP_STRATEGY_MAP["2:16"]="2:8" 
+# PP_STRATEGY_MAP["1:8"]="2:4 4:2" 
+# PP_STRATEGY_MAP["1:8"]="1:8" 
+
+
+# KEY: NODE:TOTAL_GPU
+# VALUE="BS:GBS:TRAIN_ITERS:MOE_TYPE:MODEL_SIZE"
+declare -A PP_BATCH_MAP
+# PP_BATCH_MAP["1:8"]="1:32:50:X-MOE-GroupedGEMM-primus:10B 1:32:50:X-MOE-GroupedGEMM-triton:10B 1:32:50:X-MOE:10B "
+# PP_BATCH_MAP["1:8"]="1:32:50:X-MOE-GroupedGEMM-primus:55B 1:32:50:X-MOE-GroupedGEMM-triton:55B 1:32:50:X-MOE:55B "
+# PP_BATCH_MAP["1:8"]="1:32:50:X-MOE-GroupedGEMM-primus:63B 1:32:50:X-MOE-GroupedGEMM-triton:63B 1:32:50:X-MOE:63B "
+# PP_BATCH_MAP["1:8"]="1:32:50:X-MOE-GroupedGEMM-primus:173B 1:32:50:X-MOE-GroupedGEMM-triton:173B 1:32:50:X-MOE:173B "
+# PP_BATCH_MAP["1:8"]="1:32:50:X-MOE-GroupedGEMM-primus:200B 1:32:50:X-MOE-GroupedGEMM-triton:200B 1:32:50:X-MOE:200B "
+# PP_BATCH_MAP["1:8"]="1:32:50:X-MOE-GroupedGEMM-primus:500B 1:32:50:X-MOE-GroupedGEMM-triton:500B 1:32:50:X-MOE:500B "
+# PP_BATCH_MAP["1:8"]="1:32:50:X-MOE-GroupedGEMM-primus:537B 1:32:50:X-MOE-GroupedGEMM-triton:537B 1:32:50:X-MOE:537B "
+# PP_BATCH_MAP["4:32"]="1:32:50:X-MOE-GroupedGEMM-primus:200B 1:32:50:X-MOE:200B "
+# PP_BATCH_MAP["4:32"]="1:32:50:X-MOE-GroupedGEMM-primus:55B 1:32:50:X-MOE:55B "
+# PP_BATCH_MAP["2:16"]="1:32:50:X-MOE-GroupedGEMM-primus:10B 1:32:50:X-MOE:10B "
+# PP_BATCH_MAP["2:16"]="1:32:50:X-MOE-GroupedGEMM-primus:10B 1:32:50:X-MOE:10B "
+# PP_BATCH_MAP["2:16"]="1:32:50:X-MOE-GroupedGEMM-primus:173B 1:32:50:X-MOE:173B "
+# PP_BATCH_MAP["1:8"]="1:32:50:DS-MOE:10B 1:32:50:X-MOE:10B "
+# PP_BATCH_MAP["1:8"]="1:32:50:DS-MOE:63B 1:32:50:X-MOE:63B "
+PP_BATCH_MAP["1:8"]="1:32:50:X-MOE-GroupedGEMM-primus:173B 1:32:50:DS-MOE:173B 1:32:50:X-MOE:173B "
+# PP_BATCH_MAP["1:8"]="1:32:50:DS-MOE:537B 1:32:50:X-MOE:537B "
+# PP_BATCH_MAP["2:16"]="1:32:50:X-MOE-GroupedGEMM-primus:50B 1:32:50:X-MOE:50B "
+# PP_BATCH_MAP["1:8"]="1:96:1:X-MOE-GroupedGEMM:190B_1L 2:96:1:X-MOE-GroupedGEMM:190B_1L 3:96:1:X-MOE-GroupedGEMM:190B_1L 4:96:1:X-MOE-GroupedGEMM:190B_1L 5:96:1:X-MOE-GroupedGEMM:190B_1L 6:96:1:X-MOE-GroupedGEMM:190B_1L 7:96:1:X-MOE-GroupedGEMM:190B_1L 8:96:1:X-MOE-GroupedGEMM:190B_1L"
+# PP_BATCH_MAP["1:8"]="1:32:50:X-MOE-GroupedGEMM-primus:55B 1:32:50:X-MOE-GroupedGEMM-triton:55B 1:32:50:X-MOE:55B "
+# PP_BATCH_MAP["1:4"]="1:96:30:X-MOE:16B 1:96:30:X-MOE-GroupedGEMM:16B "
+# PP_BATCH_MAP["1:8"]="1:96:100:X-MOE:10B 2:96:100:X-MOE:10B 2:192:100:X-MOE:10B"
+# PP_BATCH_MAP["2:8"]="1:96:10:X-MOE:16B"
+# PP_BATCH_MAP["2:8"]="2:96:20:X-MOE   2:96:20:DS-MOE"
+# PP_BATCH_MAP["2:8"]="1:96:20:X-MOE:16B   1:96:20:DS-MOE:16B"
+# PP_BATCH_MAP["2:8"]="1:96:100:X-MOE:16B 1:96:100:DS-MOE:16B 2:96:100:X-MOE:16B 2:96:100:DS-MOE:16B"
+# PP_BATCH_MAP["1:4"]="1:96:100:X-MOE:16B  1:96:100:X-MOE:16B  1:96:100:DS-MOE:16B 1:96:100:DS-MOE:16B  2:96:100:X-MOE:16B  2:96:100:X-MOE:16B"
+# PP_BATCH_MAP["2:8"]="1:96:100:X-MOE:16B  1:96:100:X-MOE:16B  1:96:100:DS-MOE:16B 1:96:100:DS-MOE:16B   2:96:100:X-MOE:16B  2:96:100:X-MOE:16B  3:96:100:X-MOE:16B  3:96:100:X-MOE:16B "
+# PP_BATCH_MAP["4:16"]="1:96:100:X-MOE:16B  1:96:100:X-MOE:16B  1:96:100:DS-MOE:16B 1:96:100:DS-MOE:16B   2:96:100:X-MOE:16B  2:96:100:X-MOE:16B  3:96:100:X-MOE:16B  3:96:100:X-MOE:16B  4:96:100:X-MOE:16B  4:96:100:X-MOE:16B "
+# PP_BATCH_MAP["4:16"]="1:96:100:X-MOE:16B 1:96:100:DS-MOE:16B 2:96:100:X-MOE:16B 2:96:100:DS-MOE:16B  3:96:100:X-MOE:16B "
+# PP_BATCH_MAP["4:16"]="4:96:100:X-MOE:16B "
+
+
+# --- B) EXPERT PARALLEL (EP) CONFIGURATIONS ---
 
 
 # KEY: NODE:TOTAL_GPU
 # VALUE="BS:GBS:TRAIN_ITERS:MOE_TYPE"
-declare -A PP_BATCH_MAP
-
-# PP_BATCH_MAP["2:8"]="2:96:20:X-MOE   2:96:20:DS-MOE"
-# PP_BATCH_MAP["2:8"]="1:96:20:X-MOE:10B   1:96:20:DS-MOE:10B"
-# PP_BATCH_MAP["2:8"]="1:96:100:X-MOE:10B 1:96:100:DS-MOE:10B 2:96:100:X-MOE:10B 2:96:100:DS-MOE:10B"
-# PP_BATCH_MAP["1:4"]="1:96:100:X-MOE:10B  1:96:100:X-MOE:10B  1:96:100:DS-MOE:10B 1:96:100:DS-MOE:10B  2:96:100:X-MOE:10B  2:96:100:X-MOE:10B"
-# PP_BATCH_MAP["2:8"]="1:96:100:X-MOE:10B  1:96:100:X-MOE:10B  1:96:100:DS-MOE:10B 1:96:100:DS-MOE:10B   2:96:100:X-MOE:10B  2:96:100:X-MOE:10B  3:96:100:X-MOE:10B  3:96:100:X-MOE:10B "
-# PP_BATCH_MAP["4:16"]="1:96:100:X-MOE:10B  1:96:100:X-MOE:10B  1:96:100:DS-MOE:10B 1:96:100:DS-MOE:10B   2:96:100:X-MOE:10B  2:96:100:X-MOE:10B  3:96:100:X-MOE:10B  3:96:100:X-MOE:10B  4:96:100:X-MOE:10B  4:96:100:X-MOE:10B "
-# PP_BATCH_MAP["4:16"]="1:96:100:X-MOE:10B 1:96:100:DS-MOE:10B 2:96:100:X-MOE:10B 2:96:100:DS-MOE:10B  3:96:100:X-MOE:10B "
-# PP_BATCH_MAP["4:16"]="4:96:100:X-MOE:10B "
-
-
-MOE_TYPES=("X-MOE")
-# Static values that will be appended to each configuration
-TRAIN_ITERS="100"
-MODEL_SIZE="10B"
-generated_configs=""
-# Loop through each BS:GBS pair
-for bs_gbs in "${BS_GBS_CONFIGS[@]}"; do
-  # Loop through each MOE type for the current BS:GBS pair
-  for moe_type in "${MOE_TYPES[@]}"; do
-    batch_config="${bs_gbs}:${TRAIN_ITERS}:${moe_type}:${MODEL_SIZE}"
-    # Use a for loop to repeat the item 3 times
-    for i in {1..1}; do
-      generated_configs+="${batch_config} "
-    done
-  done
-done
-generated_configs=$(echo "${generated_configs}" | sed 's/ *$//')
-
-# PP_BATCH_MAP["1:8"]="${generated_configs}"
-# PP_BATCH_MAP["2:16"]="${generated_configs}"
-# PP_BATCH_MAP["4:32"]="${generated_configs}"
-
-# PP_BATCH_MAP["2:8"]="1:128:30:X-MOE:10B 2:128:30:X-MOE:10B"
-
-
 declare -A EP_BATCH_MAP
+# EP_BATCH_MAP["1:8"]="1:32:40:X-MOE-GroupedGEMM:10B 1:32:40:X-MOE:10B "
+# EP_BATCH_MAP["1:8"]="1:32:10:X-MOE-GroupedGEMM:55B 1:32:10:X-MOE:55B "
+# EP_BATCH_MAP["1:8"]="1:32:10:X-MOE-GroupedGEMM:55B "
+# EP_BATCH_MAP["1:8"]="1:32:10:X-MOE:55B "
+# EP_BATCH_MAP["1:8"]="1:32:50:X-MOE-GroupedGEMM:10B "
+# EP_BATCH_MAP["1:4"]="1:32:50:X-MOE:16B "
+# EP_BATCH_MAP["1:4"]="1:32:50:X-MOE:16B 1:32:50:X-MOE-GroupedGEMM:16B "
+# EP_BATCH_MAP["1:4"]="1:32:20:X-MOE:16B 1:32:20:X-MOE-GroupedGEMM:16B 1:32:20:X-MOE:30B 1:32:20:X-MOE-GroupedGEMM:30B "
+# EP_BATCH_MAP["1:8"]="1:32:30:X-MOE-GroupedGEMM:190B_1L 2:64:30:X-MOE-GroupedGEMM:190B_1L 3:96:30:X-MOE-GroupedGEMM:190B_1L 4:128:30:X-MOE-GroupedGEMM:190B_1L 5:160:30:X-MOE-GroupedGEMM:190B_1L 6:192:30:X-MOE-GroupedGEMM:190B_1L 7:224:30:X-MOE-GroupedGEMM:190B_1L 8:256:30:X-MOE-GroupedGEMM:190B_1L "
+# EP_BATCH_MAP["1:8"]="1:32:1:X-MOE-GroupedGEMM:190B_1L "
+# EP_BATCH_MAP["1:8"]="1:32:30:X-MOE:190B_1L 2:32:30:X-MOE:190B_1L 1:32:30:X-MOE-GroupedGEMM:190B_1L 2:32:30:X-MOE-GroupedGEMM:190B_1L "
+# EP_BATCH_MAP["2:8"]="2:96:100:X-MOE   1:96:100:DS-MOE"
+# EP_BATCH_MAP["1:4"]="1:96:100:X-MOE:16B   1:96:100:DS-MOE:16B "
+# EP_BATCH_MAP["2:8"]="1:96:100:X-MOE:16B   1:96:100:DS-MOE:16B 2:96:100:X-MOE:16B  "
+# EP_BATCH_MAP["4:16"]="1:96:100:X-MOE:16B   1:96:100:DS-MOE:16B 2:96:100:X-MOE:16B  2:96:100:DS-MOE:16B 3:96:100:X-MOE:16B "
+# EP_BATCH_MAP["4:16"]=" 4:96:100:X-MOE:16B "
+# EP_BATCH_MAP["1:4"]="1:96:100:X-MOE:16B  1:96:100:X-MOE:16B  1:96:100:DS-MOE:16B 1:96:100:DS-MOE:16B  2:96:100:X-MOE:16B  2:96:100:X-MOE:16B"
+# EP_BATCH_MAP["2:8"]="1:96:100:X-MOE:16B  1:96:100:X-MOE:16B  1:96:100:DS-MOE:16B 1:96:100:DS-MOE:16B   2:96:100:X-MOE:16B  2:96:100:X-MOE:16B  3:96:100:X-MOE:16B  3:96:100:X-MOE:16B "
+# EP_BATCH_MAP["4:16"]="1:96:100:X-MOE:16B  1:96:100:X-MOE:16B  1:96:100:DS-MOE:16B 1:96:100:DS-MOE:16B   2:96:100:X-MOE:16B  2:96:100:X-MOE:16B  3:96:100:X-MOE:16B  3:96:100:X-MOE:16B  4:96:100:X-MOE:16B  4:96:100:X-MOE:16B "
 
-EP_BATCH_MAP["2:8"]="1:64:30:X-MOE:10B_div2 2:64:30:X-MOE:10B_div2 3:96:30:X-MOE:10B_div2 4:128:30:X-MOE:10B_div2 5:320:30:X-MOE:10B_div2 6:384:30:X-MOE:10B_div2 "
-EP_BATCH_MAP["2:16"]="1:64:30:X-MOE:10B_div2 2:128:30:X-MOE:10B_div2 3:192:30:X-MOE:10B_div2 4:256:30:X-MOE:10B_div2 5:320:30:X-MOE:10B_div2 6:384:30:X-MOE:10B_div2 "
 
 
 
@@ -110,17 +129,16 @@ for node_key in "${!PP_STRATEGY_MAP[@]}"; do
     else
         PARTITION="mi2104x"
     fi
-
     echo "Found PP configurations for ${NODES} nodes, ${TOTAL_GPUS} GPUs..."
 
     for pp_strategy in $pp_strategies_string; do
         IFS=':' read -r PP_SIZE EP_PARALLEL_SIZE <<< "$pp_strategy"
 
         # Sanity Check
-        if (( PP_SIZE * EP_PARALLEL_SIZE * MP_SIZE != TOTAL_GPUS )); then
-            echo "  - Invalid strategy: PP=${PP_SIZE}, EP=${EP_PARALLEL_SIZE} for ${TOTAL_GPUS} GPUs. Skipping."
-            continue
-        fi
+        # if (( PP_SIZE * EP_PARALLEL_SIZE * MP_SIZE != TOTAL_GPUS )); then
+        #     echo "  - Invalid strategy: PP=${PP_SIZE}, EP=${EP_PARALLEL_SIZE} for ${TOTAL_GPUS} GPUs. Skipping."
+        #     continue
+        # fi
 
         for batch_config in $batch_configs_string; do
             IFS=':' read -r BS GBS TRAIN_ITERS MOE_TYPE MODEL_SIZE <<< "$batch_config"
@@ -146,7 +164,7 @@ for node_key in "${!PP_STRATEGY_MAP[@]}"; do
                 ${TEMPLATE_FILE} > ${TEMP_SLURM_SCRIPT}
 
             sbatch ${TEMP_SLURM_SCRIPT}
-            # rm ${TEMP_SLURM_SCRIPT}
+            rm ${TEMP_SLURM_SCRIPT}
         done
     done
 done
@@ -172,7 +190,7 @@ for node_key in "${!EP_BATCH_MAP[@]}"; do
     else
         PARTITION="mi2104x"
     fi
-    
+    # PARTITION="mi2508x"
     echo "Found EP configurations for ${NODES} nodes, ${TOTAL_GPUS} GPUs..."
 
     # For EP runs, PP=1 and EP=Total GPUs
@@ -203,7 +221,7 @@ for node_key in "${!EP_BATCH_MAP[@]}"; do
             ${TEMPLATE_FILE} > ${TEMP_SLURM_SCRIPT}
 
         sbatch ${TEMP_SLURM_SCRIPT}
-        # rm ${TEMP_SLURM_SCRIPT}
+        rm ${TEMP_SLURM_SCRIPT}
     done
 done
 

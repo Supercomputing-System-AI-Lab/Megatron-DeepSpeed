@@ -121,7 +121,7 @@ class ParallelMLP(MegatronModule):
         args = get_args()
 
         self.add_bias = config.add_bias_linear
-
+        self.add_bias = False
         ffn_hidden_size = config.ffn_hidden_size
         if config.gated_linear_unit:
             ffn_hidden_size *= 2
@@ -158,6 +158,7 @@ class ParallelMLP(MegatronModule):
             self.activation_func = squared_relu
         else:
             self.bias_gelu_fusion = args.bias_gelu_fusion
+#            self.bias_gelu_fusion = False
             self.activation_func = F.gelu
 
         # Project back to h.
@@ -1098,7 +1099,7 @@ class ParallelTransformerLayer(MegatronModule):
                                     enable_expert_tensor_parallelism=enable_expert_tensor_parallelism)
                 else:   
                     # print (f'[transformer.py] Using Fine-grained MoE \n'*10)
-                    self.mlp = MoE(args.hidden_size,
+#                    self.mlp = MoE(args.hidden_size, config, 
                                 ParallelMLP(config,
                                     moe=True,
                                     enable_expert_tensor_parallelism=enable_expert_tensor_parallelism),
@@ -1115,6 +1116,8 @@ class ParallelTransformerLayer(MegatronModule):
                                 use_uneven_all2all=args.use_uneven_all_to_all,
                                 use_pft=args.use_pft,
                                 use_rbd=args.use_rbd,
+                                use_groupedGEMM=args.use_groupedGEMM,
+                                use_triton=args.use_triton,
                                 rbd_mesh_size=args.rbd_mesh_size)
 
         # Set bias+dropout+add fusion grad_enable execution handler.
@@ -1480,6 +1483,9 @@ class ParallelTransformerLayer(MegatronModule):
         # print(f"[megatron/model/transformer.py - ParallelTransformerLayer - forward] {rank=}, {self.layer_number=}, before ATTENTION")
         # log_mem (file_name = 'megatron/model/transformer.py', rank=rank, message=f'layer-{self.layer_number} before ATTENTION')
         log_memory(event="before_attention", layer_num=self.layer_number)
+        
+#        print(f"[MEM-UTIL-CHECK] [megatron/model/transformer.py - ParallelTransformerLayer - forward] before ATTENTION {rank=}, {self.layer_number=}, ")
+#        # log_mem (file_name = 'megatron/model/transformer.py - ParallelTransformerLayer - forward', rank=rank, message=f'layer-{self.layer_number} before ATTENTION')
 
         # Layer norm at the beginning of the transformer layer.
 
@@ -1548,6 +1554,8 @@ class ParallelTransformerLayer(MegatronModule):
 
         # print (f'BEFORE MLP, {rank=}, {self.layer_number=} {layernorm_output.shape=}') 
         log_memory(event="before_moe", layer_num=self.layer_number)
+#        # print (f'BEFORE MLP, {rank=}, {self.layer_number=} {layernorm_output.shape=}, {layernorm_output=}') 
+#        log_mem (file_name = 'megatron/model/transformer.py - ParallelTransformerLayer - forward', rank=rank, message=f'layer-{self.layer_number} before MOE')
         if self.num_experts == 1:
             with record_function(f"MLP-{self.layer_number}"):
                 mlp_output, mlp_bias = self.mlp(layernorm_output)
@@ -1559,6 +1567,9 @@ class ParallelTransformerLayer(MegatronModule):
         log_memory(event="after_moe", layer_num=self.layer_number)
             
         # print (f'AFTER MLP, {rank=}, {self.layer_number=} {layernorm_output.shape=}') 
+        
+#        log_mem (file_name = 'megatron/model/transformer.py - ParallelTransformerLayer - forward', rank=rank, message=f'layer-{self.layer_number} after MOE')
+#        # print (f'AFTER MLP, {rank=}, {self.layer_number=} {layernorm_output.shape=}, {mlp_output=}') 
 
         # Second residual connection.
         if self.apply_residual_connection_post_layernorm:
@@ -1597,7 +1608,8 @@ class ParallelTransformerLayer(MegatronModule):
         # Zixian: 10/27/2025: Commenting out per layer's log, and migrated to per forward log in ParallelTransformer class
         # if TIMING:
         #     self.timers.log(names=['self_attention', 'mlp'], rank=None, normalizer=1.0, reset=True, barrier=True)
-        
+#        if TIMING:
+#            self.timers.log(names=['self_attention', 'mlp'], rank=None, normalizer=1.0, reset=True, barrier=True)
         if self.layer_type == LayerType.retro_decoder_with_retriever:
             return output, retriever_output, moe_loss
         else:
@@ -2171,14 +2183,6 @@ class ParallelTransformer(MegatronModule):
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:
             rng_context = nullcontext()
-            
-        # # Zixian: 10/27/2025: prep for timer 
-        # # >>> [START] MODIFICATION 1: Initialize storage for timing data <<<
-        # all_layer_times = []
-        # all_attention_kernel_times = []
-        # # Check timing condition once at the beginning
-        # should_time = TIMING and os.getenv("WALL_CLOCK_BREAKDOWN") == "true"
-        # # >>> [END] MODIFICATION 1
 
         # Forward layers.
         with rng_context:
@@ -2249,24 +2253,6 @@ class ParallelTransformer(MegatronModule):
                             hidden_states,
                             attention_mask,
                             **forward_kwargs)
-                        
-                        # # Zixian: 10/27/2025: To profile runtime for attention 
-                        # # >>> [START] MODIFICATION 2: Collect all timing data in the loop <<<
-                        # if should_time:
-                        #     # --- High-level layer timers ---
-                        #     timer_names = ['self_attention', 'mlp']
-                        #     all_ranks_times_for_layer = layer.timers._get_elapsed_time_all_ranks(
-                        #         names=timer_names, reset=True, barrier=True
-                        #     )
-                        #     all_layer_times.append(all_ranks_times_for_layer)
-                            
-                        #     # --- Granular attention kernel timers ---
-                        #     att_kernel_timer_names = ['qkv_gemm', 'attn_gemm', 'out_gemm']
-                        #     attention_kernel_times = layer.self_attention.timers._get_elapsed_time_all_ranks(
-                        #         names=att_kernel_timer_names, reset=True, barrier=True
-                        #     )
-                        #     all_attention_kernel_times.append(attention_kernel_times)
-                        # # >>> [END] MODIFICATION 2
 
                         # First Retro decoder layer returns both hidden_states
                         # and retriever_output. Make retriever_output available
@@ -2302,36 +2288,6 @@ class ParallelTransformer(MegatronModule):
             #     # Reverting data format change [s b h] --> [b s h].
             #     hidden_states = hidden_states.transpose(0, 1).contiguous()
             hidden_states = self.final_layernorm(hidden_states)
-            
-        # # Zixian: 10/27/2025: Print time 
-        # # >>> [START] MODIFICATION 3: Process and print final results after the loop <<<
-        # if should_time and all_layer_times: # Check if any data was collected
-        #     # Perform calculations and printing only on rank 0
-        #     if rank == "0":
-        #         # --- Process high-level timers ---
-        #         all_times_tensor = torch.stack(all_layer_times)
-        #         final_average_times = torch.mean(all_times_tensor, dim=(0, 1))
-        #         avg_attention_time_ms = final_average_times[0].item() * 1000
-        #         avg_mlp_time_ms = final_average_times[1].item() * 1000
-                
-        #         # --- Process attention kernel timers ---
-        #         all_attn_kernels_tensor = torch.stack(all_attention_kernel_times)
-        #         final_avg_attn_kernel_times = torch.mean(all_attn_kernels_tensor, dim=(0, 1))
-        #         avg_qkv_gemm_ms = final_avg_attn_kernel_times[0].item() * 1000
-        #         avg_attn_gemm_ms = final_avg_attn_kernel_times[1].item() * 1000
-        #         avg_out_gemm_ms = final_avg_attn_kernel_times[2].item() * 1000
-
-        #         # --- Print the single-line summary ---
-        #         print(
-        #             f"Average time across all layers and ranks -> "
-        #             f"Self-Attention: {avg_attention_time_ms:.2f} ms | "
-        #             f"MLP: {avg_mlp_time_ms:.2f} ms || "
-        #             f"Attention Kernels -> "
-        #             f"QKV GEMM: {avg_qkv_gemm_ms:.2f} ms | "
-        #             f"Attn GEMM: {avg_attn_gemm_ms:.2f} ms | "
-        #             f"Out GEMM: {avg_out_gemm_ms:.2f} ms"
-        #         )
-        #     # >>> [END] MODIFICATION 3
 
         # toy_pp = os.getenv ("TORCH_PP_TOY")
         # print (f'{toy_pp=}')

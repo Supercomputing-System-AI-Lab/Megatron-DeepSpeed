@@ -46,6 +46,22 @@ fi
 # --- Environment & Setup ---
 source /work1/mzhang/zixianw4/miniconda3/etc/profile.d/conda.sh
 conda activate xmoe
+echo "Activating conda environment..."
+# module load rocm/6.3.1
+# export ROCM_HOME=/opt/rocm-6.3.1
+# export HIP_PATH=/opt/rocm-6.3.1
+# export CUDA_HOME=/opt/rocm-6.3.1
+# export CC=/opt/rocm-6.3.1/bin/hipcc
+# export CXX=/opt/rocm-6.3.1/bin/hipcc
+
+# export PATH=$ROCM_HOME/bin:$PATH
+# export GPU_ARCHS="gfx90a"
+# export PYTORCH_ROCM_ARCH="gfx90a"
+# export PYTHONPATH=$PYTHONPATH:/work1/mzhang/henryj/X-MoE/Megatron-DeepSpeed-X-MoE
+# export TRITON_PRINT_AUTOTUNING=1
+# echo PYTORCH_ROCM_ARCH=$PYTORCH_ROCM_ARCH
+# export PYTORCH_ALLOC_CONF=expandable_segments:True
+# echo "Conda environment activated."
 
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
@@ -59,105 +75,227 @@ export MERGE_FILE=../data/gpt2-merges.txt
 export DATA_PATH=../data/my-gpt2_text_document
 
 DIR=`pwd`
+
+
 ###############################################################################
 ### Main configs (These are now common to all runs)
+### Main configs (These are now common to all runs)
 
+# if [[ "${MODEL_SIZE}" == "10B" ]]; then
+#     echo "Configuring fine-grained DeepSeek-V1 10B"
+#     SEQ_LEN=2048
+#     HIDDEN_SIZE=2048
+#     FFN_HIDDEN_SIZE=1408
+#     NUM_ATTN_HEADS=16
+#     EP_SIZE=64
+#     topk=8
+#     NUM_LAYERS=2
+#     # Re-assigning MODEL_SIZE for internal tracking if needed
+#     MODEL_SIZE="10B"
 if [[ "${MODEL_SIZE}" == "10B" ]]; then
-    echo "Configuring DeepSeek-V1 10B"
-    NUM_LAYERS=28
-    MODEL_SIZE=10
+    echo "Configuring coarse-grained DeepSeek-V1 10B"
+    SEQ_LEN=2048
     HIDDEN_SIZE=2048
-    FFN_HIDDEN_SIZE=1408
+    FFN_HIDDEN_SIZE=11264
     NUM_ATTN_HEADS=16
-    EP_SIZE=64
-    topk=6
-    SEQ_LEN=2048
-elif [[ "${MODEL_SIZE}" == "10B_div2" ]]; then
-    echo "Configuring ${MODEL_SIZE} Model"
-    NUM_LAYERS=14
-    MODEL_SIZE=5
-    HIDDEN_SIZE=2048
-    FFN_HIDDEN_SIZE=1408
-    NUM_ATTN_HEADS=16
-    EP_SIZE=64
-    topk=6
-    SEQ_LEN=2048
-elif [[ "${MODEL_SIZE}" == "10B-4" ]]; then
-    echo "Configuring ${MODEL_SIZE} Model"
-    NUM_LAYERS=24
-    MODEL_SIZE=9
-    HIDDEN_SIZE=2048
-    FFN_HIDDEN_SIZE=1408
-    NUM_ATTN_HEADS=16
-    EP_SIZE=64
-    topk=6
-    SEQ_LEN=2048
-elif [[ "${MODEL_SIZE}" == "10B-8" ]]; then
-    echo "Configuring ${MODEL_SIZE} Model"
-    NUM_LAYERS=20
-    MODEL_SIZE=8
-    HIDDEN_SIZE=2048
-    FFN_HIDDEN_SIZE=1408
-    NUM_ATTN_HEADS=16
-    EP_SIZE=64
-    topk=6
-    SEQ_LEN=2048
-elif [[ "${MODEL_SIZE}" == "10B-12" ]]; then
-    echo "Configuring ${MODEL_SIZE} Model"
-    NUM_LAYERS=16
-    MODEL_SIZE=6.5
-    HIDDEN_SIZE=2048
-    FFN_HIDDEN_SIZE=1408
-    NUM_ATTN_HEADS=16
-    EP_SIZE=64
-    topk=6
-    SEQ_LEN=2048
-elif [[ "${MODEL_SIZE}" == "15B" ]]; then
-    echo "Configuring 15B Model"
-    NUM_LAYERS=28
-    MODEL_SIZE=15
-    HIDDEN_SIZE=3072
-    FFN_HIDDEN_SIZE=1408
-    NUM_ATTN_HEADS=16
-    EP_SIZE=64
-    topk=6
-    SEQ_LEN=2048
-elif [[ "${MODEL_SIZE}" == "20B" ]]; then
-    echo "Configuring 20B Model"
-    NUM_LAYERS=28
-    MODEL_SIZE=20
-    HIDDEN_SIZE=4096
-    FFN_HIDDEN_SIZE=1408
-    NUM_ATTN_HEADS=16
-    EP_SIZE=64
-    topk=6
-    SEQ_LEN=2048
-elif [[ "${MODEL_SIZE}" == "31B" ]]; then
-    echo "Configuring 20B Model"
-    NUM_LAYERS=28
-    MODEL_SIZE=31
-    HIDDEN_SIZE=4096
-    FFN_HIDDEN_SIZE=1408
-    NUM_ATTN_HEADS=16
-    EP_SIZE=96
-    topk=6
-    SEQ_LEN=2048
-else 
-    echo "Configuring custom model size"
-    NUM_LAYERS=24
-    MODEL_SIZE=10.1
-    HIDDEN_SIZE=2048
-    FFN_HIDDEN_SIZE=1408
-    NUM_ATTN_HEADS=16
-    EP_SIZE=64
-    topk=6
-    SEQ_LEN=2048
-fi 
+    EP_SIZE=8
+    topk=1
+    NUM_LAYERS=2
+    # Re-assigning MODEL_SIZE for internal tracking if needed
+    MODEL_SIZE="10B"
+elif [[ "${MODEL_SIZE}" == "50B" ]]; then
+    echo "Configuring fine-grained DeepSeek-V1 50B"
+    SEQ_LEN=4096
+    HIDDEN_SIZE=5120
+    FFN_HIDDEN_SIZE=1536
+    NUM_ATTN_HEADS=40
+    EP_SIZE=128
+    topk=8
+    NUM_LAYERS=2
+    MODEL_SIZE="50B"
+# elif [[ "${MODEL_SIZE}" == "50B" ]]; then
+#     echo "Configuring coarse-grained DeepSeek-V1 50B"
+#     SEQ_LEN=4096
+#     HIDDEN_SIZE=5120
+#     FFN_HIDDEN_SIZE=12288
+#     NUM_ATTN_HEADS=40
+#     EP_SIZE=16
+#     topk=1
+#     NUM_LAYERS=4
+#     MODEL_SIZE="50B"
 
+# elif [[ "${MODEL_SIZE}" == "63B" ]]; then
+#     echo "Configuring fine-grained DeepSeek-V1 63B"
+#     SEQ_LEN=4096
+#     HIDDEN_SIZE=5120
+#     FFN_HIDDEN_SIZE=1536
+#     NUM_ATTN_HEADS=40
+#     EP_SIZE=128
+#     topk=8
+#     NUM_LAYERS=2
+#     MODEL_SIZE="63B"
+elif [[ "${MODEL_SIZE}" == "63B" ]]; then
+    echo "Configuring coarse-grained DeepSeek-V1 63B"
+    SEQ_LEN=4096
+    HIDDEN_SIZE=5120
+    FFN_HIDDEN_SIZE=12288
+    NUM_ATTN_HEADS=40
+    EP_SIZE=16
+    topk=1
+    NUM_LAYERS=2
+    MODEL_SIZE="63B"
+elif [[ "${MODEL_SIZE}" == "173B" ]]; then
+    echo "Configuring fine-grained DeepSeek-V1 173B"
+    SEQ_LEN=4096
+    HIDDEN_SIZE=7168
+    FFN_HIDDEN_SIZE=2048
+    NUM_ATTN_HEADS=56
+    EP_SIZE=256
+    topk=8
+    NUM_LAYERS=1
+    MODEL_SIZE="173B"
+# elif [[ "${MODEL_SIZE}" == "173B" ]]; then
+#     echo "Configuring fine-grained DeepSeek-V1 173B"
+#     SEQ_LEN=4096
+#     HIDDEN_SIZE=7168
+#     FFN_HIDDEN_SIZE=16384
+#     NUM_ATTN_HEADS=56
+#     EP_SIZE=32
+#     topk=1
+#     NUM_LAYERS=2
+#     MODEL_SIZE="173B"
+# elif [[ "${MODEL_SIZE}" == "537B" ]]; then
+#     echo "Configuring DeepSeek-V1 537B"
+#     SEQ_LEN=4096
+#     HIDDEN_SIZE=7168
+#     FFN_HIDDEN_SIZE=2560
+#     NUM_ATTN_HEADS=56
+#     EP_SIZE=256
+#     topk=8
+#     NUM_LAYERS=2
+#     MODEL_SIZE="537B"
+elif [[ "${MODEL_SIZE}" == "537B" ]]; then
+    echo "Configuring coarse-grained DeepSeek-V1 537B"
+    SEQ_LEN=4096
+    HIDDEN_SIZE=7168
+    FFN_HIDDEN_SIZE=20480
+    NUM_ATTN_HEADS=56
+    EP_SIZE=32
+    topk=1
+    NUM_LAYERS=2
+    MODEL_SIZE="537B"
+elif [[ "${MODEL_SIZE}" == "1T" ]]; then
+    echo "Configuring DeepSeek-V1 1T"
+    SEQ_LEN=4096
+    HIDDEN_SIZE=7168
+    FFN_HIDDEN_SIZE=2560
+    NUM_ATTN_HEADS=56
+    EP_SIZE=512
+    topk=8
+    NUM_LAYERS=60
+    MODEL_SIZE="1T"
+
+else
+    echo "Configuring custom/default model size (Defaulting to 10B specs)"
+    SEQ_LEN=2048
+    HIDDEN_SIZE=2048
+    FFN_HIDDEN_SIZE=1408
+    NUM_ATTN_HEADS=16
+    EP_SIZE=64
+    topk=6
+    NUM_LAYERS=24
+    MODEL_SIZE="10B"
+fi
+
+
+# if [[ "${MODEL_SIZE}" == "10B" ]]; then
+#     echo "Configuring Small DeepSeek-V1 10B"
+#     SEQ_LEN=2048
+#     HIDDEN_SIZE=2048
+#     FFN_HIDDEN_SIZE=1408
+#     EP_SIZE=64
+#     topk=6
+#     NUM_LAYERS=28
+#     MODEL_SIZE=10.1
+#     NUM_ATTN_HEADS=16
+    
+# elif [[ "${MODEL_SIZE}" == "55B" ]]; then
+#     echo "Configuring Medium DeepSeek-V1 55B"
+#     SEQ_LEN=4096
+#     HIDDEN_SIZE=5120
+#     FFN_HIDDEN_SIZE=1536
+#     EP_SIZE=128
+#     topk=6
+#     NUM_LAYERS=10
+#     MODEL_SIZE=55.2
+#     NUM_ATTN_HEADS=16
+    
+# elif [[ "${MODEL_SIZE}" == "200B" ]]; then
+#     echo "Configuring Large DeepSeek-V1 200B"
+#     SEQ_LEN=4096
+#     HIDDEN_SIZE=7168
+#     FFN_HIDDEN_SIZE=2048
+#     EP_SIZE=256
+#     topk=8
+#     NUM_LAYERS=8
+#     MODEL_SIZE=201.4
+#     NUM_ATTN_HEADS=16
+
+# elif [[ "${MODEL_SIZE}" == "500B" ]]; then
+#     echo "Configuring Super DeepSeek-V1 500B"
+#     SEQ_LEN=4096
+#     HIDDEN_SIZE=7168
+#     FFN_HIDDEN_SIZE=2560
+#     EP_SIZE=256
+#     topk=8
+#     NUM_LAYERS=1
+#     MODEL_SIZE=545.4
+#     NUM_ATTN_HEADS=16
+
+# elif [[ "${MODEL_SIZE}" == "16B" ]]; then
+#     echo "Configuring DeepSeek-V1 16B"
+#     NUM_LAYERS=4
+#     MODEL_SIZE=16
+#     HIDDEN_SIZE=2048
+#     FFN_HIDDEN_SIZE=1408
+#     NUM_ATTN_HEADS=16
+#     EP_SIZE=128
+#     topk=6
+# elif [[ "${MODEL_SIZE}" == "30B" ]]; then
+#     echo "Configuring DeepSeek-V1 16B"
+#     NUM_LAYERS=4
+#     MODEL_SIZE=16
+#     HIDDEN_SIZE=7168
+#     FFN_HIDDEN_SIZE=2048
+#     NUM_ATTN_HEADS=16
+#     EP_SIZE=64
+#     topk=6
+#     SEQ_LEN=4096
+# elif [[ "${MODEL_SIZE}" == "190B_1L" ]]; then
+#     echo "Configuring 190B Model But with only 1 layer"
+#     NUM_LAYERS=1
+#     MODEL_SIZE=190_div_28
+#     HIDDEN_SIZE=7168
+#     FFN_HIDDEN_SIZE=2048
+#     NUM_ATTN_HEADS=56
+#     EP_SIZE=256
+#     topk=8
+#     SEQ_LEN=4096
+# else 
+#     echo "Configuring custom model size"
+#     NUM_LAYERS=18
+#     MODEL_SIZE=10.1
+#     HIDDEN_SIZE=2048
+#     FFN_HIDDEN_SIZE=1408
+#     NUM_ATTN_HEADS=16
+#     EP_SIZE=64
+#     topk=6
+# fi 
+
+echo EP_SIZE=${EP_SIZE}
 node=${NODES}
 total_gpu=${TOTAL_GPUS}
 NUM_GPUS=$total_gpu
-
 
 LR=1.2e-4
 MIN_LR=1.0e-6
@@ -181,7 +319,8 @@ EVAL_ITERS=5
 EVAL_INTERVAL=100
 SAVE_INTERVAL=50
 INIT_STD=0.014
-ACTIVATION_CHECKPOINT="false"
+# ACTIVATION_CHECKPOINT="false"
+ACTIVATION_CHECKPOINT="true"
 ###############################################################################
 ### Output and data configs
 current_time=$(date "+%Y.%m.%d-%H.%M.%S")
@@ -254,18 +393,24 @@ megatron_options=" \
 	    --expert-interval 1 \
 	    --topk $topk \
         --using-torchrun \
-	--use-rotary-position-embeddings"
-
-        # --using-torchrun \
+        --use-flash-attn-v2 \
+    --use-rotary-position-embeddings"
 
 # Conditionally append flags based on the MoE type
 if [[ "${MOE_TYPE}" == "X-MOE" ]]; then
     megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft"
+elif [[ "${MOE_TYPE}" == "X-MOE-GroupedGEMM-triton" ]]; then
+    megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-groupedGEMM --use-triton"
+elif [[ "${MOE_TYPE}" == "X-MOE-GroupedGEMM-primus" ]]; then
+    megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-groupedGEMM"
 fi
+
 
 if [ "${ACTIVATION_CHECKPOINT}" = "true" ]; then
     megatron_options="${megatron_options} --checkpoint-activations"
+    megatron_options="${megatron_options} --checkpoint-num-layers 1"
 fi
+
 if [[ $EP_SIZE -gt 1 ]]; then
     megatron_options="${megatron_options} --create-moe-param-group"
 fi
@@ -284,12 +429,10 @@ sed "s/CONFIG_BATCH_SIZE/${GLOBAL_BATCH_SIZE}/" ${template_json} \
     | sed "s/CONFIG_CL_MAX/${SEQ_LEN}/" \
     | sed "s/CONFIG_CL_DURATION/${CL_STEP}/" \
     | sed "s/WALL_CLOCK_BREAKDOWN/${WALL_CLOCK_BREAKDOWN}/" \
-	  > ${config_json}
-
-# cat ${config_json}
+      > ${config_json}
 
 deepspeed_options=" \
-		    --deepspeed \
+            --deepspeed \
             --deepspeed_config ${config_json} \
             ${DEEPSPEED_PIPELINE_FLAG}"
 
@@ -305,7 +448,6 @@ export NCCL_NET_GDR_LEVEL=3
 export FI_MR_CACHE_MONITOR=userfaultfd
 
 
-
 # export NCCL_DEBUG=INFO
 # export NCCL_PROTO=Simple
 # export RCCL_DEBUG=INFO
@@ -317,9 +459,17 @@ export to_profile="False"
 export profile_memory="True"
 export profile_dir="../scripts/torch_profile/${current_time}/"
 
-
-
-
+# srun -N $node -n $total_gpu -c 2 --gpu-bind=closest \
+#     bash -c "export RANK=\$SLURM_PROCID; \
+#              export WORLD_SIZE=\$SLURM_NTASKS; \
+#              export LOCAL_RANK=\$SLURM_LOCALID; \
+#              python ../pretrain_gpt_deepspeed.py \
+#              ${megatron_options} \
+#              ${data_options} \
+#              ${deepspeed_options} \
+#              --master-addr=$MASTER_ADDR \
+#              --zero-stage 1 \
+#              2>&1 | tee n${total_gpu}-Small-XMoE-${RUN_TYPE}.log"
 
 if [[ $node -gt 1 ]]; then 
 
