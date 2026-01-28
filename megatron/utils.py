@@ -315,7 +315,7 @@ def throughput_calculator(model, args, iteration_time, total_iterations):
 
     flops_per_iteration = fwd_bwd_macs * macs_per_flops
     tflops = flops_per_iteration / (elapsed_time_per_iter * args.world_size * (10**12))
-    print (f'[megatron/utils] {flops_per_iteration=}, {elapsed_time_per_iter=}, {args.world_size=}')
+    # print (f'[megatron/utils] {flops_per_iteration=}, {elapsed_time_per_iter=}, {args.world_size=}')
     return samples_per_second, tflops, approx_parameters_in_billions
 
 
