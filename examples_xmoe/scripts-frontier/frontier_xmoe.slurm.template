@@ -2,18 +2,22 @@
 
 # --- 1. Templatized SLURM Header ---
 #SBATCH -A gen150
-#SBATCH -J {{MOE_TYPE}}-{{RUN_TYPE}}-gbs{{GLOBAL_BATCH_SIZE}}
+#SBATCH -J {{MOE_TYPE}}-{{RUN_TYPE}}-nbs{{NUM_BATCHES}}
 #SBATCH -o logs/xmoe-{{RUN_TYPE}}-%j.o
 #SBATCH -e logs/xmoe-{{RUN_TYPE}}-%j.e
-#SBATCH -t 00:05:00
+#SBATCH -t 01:00:00
 #SBATCH -p {{PARTITION}}
 #SBATCH -N {{NODES}}
 #SBATCH -d singleton
-#SBATCH --exclude=frontier00207,frontier02678
+# --nodelist=frontier00122,frontier00895,frontier01266,frontier01739,frontier02883,frontier03197,frontier03841,frontier04195,frontier04606,frontier04885,frontier05159,frontier05440,frontier05757,frontier06014,frontier06271,frontier06653,frontier06909,frontier07455,frontier07898,frontier08552,frontier08928,frontier09066,frontier09318,frontier10216
+#a SBATCH -p extended
+#a SBATCH -q debug
+#a --switches=1@00:15:00
+#a --contiguous
 
 # --- 2. Templatized Variable Definitions ---
 BATCH_SIZE={{BATCH_SIZE}}
-GLOBAL_BATCH_SIZE={{GLOBAL_BATCH_SIZE}}
+NUM_BATCHES={{NUM_BATCHES}}
 PP_SIZE={{PP_SIZE}}
 EP_PARALLEL_SIZE={{EP_PARALLEL_SIZE}}
 MP_SIZE={{MP_SIZE}}
@@ -27,14 +31,15 @@ PARTITION="{{PARTITION}}"
 ACTIVATION_CHECKPOINT="{{ACTIVATION_CHECKPOINT}}"
 CHECKPOINT_NUM_LAYERS="{{CHECKPOINT_NUM_LAYERS}}"
 DYNAMIC_CHECKPOINT="{{DYNAMIC_CHECKPOINT}}"
-UNEVEN_PP_PARTITION="{{UNEVEN_PP_PARTITION}}"
+UNEVEN_PP="{{UNEVEN_PP}}"
+RUN_PLANNER="{{RUN_PLANNER}}"
 
 
 # ACTIVATION_CHECKPOINT="false"
 # ACTIVATION_CHECKPOINT="true"
 
 echo "MICRO_BATCH_SIZE: $BATCH_SIZE"
-echo "GLOBAL_BATCH_SIZE: $GLOBAL_BATCH_SIZE"
+echo "NUM_BATCHES: $NUM_BATCHES"
 echo "PP_SIZE: $PP_SIZE"
 echo "EP_SIZE: $EP_PARALLEL_SIZE"
 echo "MP_SIZE: $MP_SIZE"
@@ -47,13 +52,25 @@ echo "PARTITION: $PARTITION"
 echo "ACTIVATION_CHECKPOINT: $ACTIVATION_CHECKPOINT"
 echo "CHECKPOINT_NUM_LAYERS: $CHECKPOINT_NUM_LAYERS"
 echo "DYNAMIC_CHECKPOINT: $DYNAMIC_CHECKPOINT"
-echo "UNEVEN_PP_PARTITION: $UNEVEN_PP_PARTITION"
+echo "UNEVEN_PP: $UNEVEN_PP"
+echo "RUN_PLANNER: $RUN_PLANNER"
 
 export DYNAMIC_CHECKPOINT=$DYNAMIC_CHECKPOINT
-export UNEVEN_PP_PARTITION=$UNEVEN_PP_PARTITION
+export UNEVEN_PP=$UNEVEN_PP
 
-# --- 3. Environment Setup ---
-source /lustre/orion/world-shared/gen150/zixianw4/TORCH-ROCM6.4.1_env/bin/activate
+# # --- 3. Environment Setup ---
+# # source /lustre/orion/world-shared/gen150/zixianw4/envs/TORCH-ROCM6.4.1_env/bin/activate
+# MY_ENV_PATH="/lustre/orion/world-shared/gen150/zixianw4/envs/TORCH-ROCM6.4.1_env_v2"
+
+# # 1. Prepend the environment's bin to PATH so 'python' runs from there
+# export PATH="$MY_ENV_PATH/bin:$PATH"
+
+# # 2. (Optional but recommended) Add library path to ensure system doesn't override libs
+# export LD_LIBRARY_PATH="$MY_ENV_PATH/lib:$LD_LIBRARY_PATH"
+
+# # Debug: verify which python we are using
+# which python
+# python --version
 
 # export ROCM_HOME=/opt/rocm-5.7.0
 export LD_PRELOAD="/usr/lib64/libcrypto.so /usr/lib64/libssh.so.4 /usr/lib64/libssl.so.1.1"
@@ -72,181 +89,166 @@ export DATA_PATH=../data/my-gpt2_text_document
 DIR=`pwd`
 mkdir -p logs
 
-# --- 4. Dynamic Model Configuration ---
-if [[ "${MODEL_SIZE}" == "10B" ]]; then
-    NUM_LAYERS=24
-    HIDDEN_SIZE=2048
-    FFN_HIDDEN_SIZE=1408
-    NUM_ATTN_HEADS=16
-    EP_SIZE=64
-    topk=6
-    SEQ_LEN=2048
-elif [[ "${MODEL_SIZE}" == "50B" ]]; then
-    echo "Configuring 50B Model"
-    NUM_LAYERS=24
-    # MODEL_SIZE=50B
-    HIDDEN_SIZE=5120
-    FFN_HIDDEN_SIZE=1536
-    NUM_ATTN_HEADS=40
-    EP_SIZE=128
-    topk=6
-    SEQ_LEN=4096
-elif [[ "${MODEL_SIZE}" == "63B" ]]; then
-    echo "Configuring 63B Model"
-    NUM_LAYERS=32
-    # MODEL_SIZE=63B
-    HIDDEN_SIZE=5120
-    FFN_HIDDEN_SIZE=1536
-    NUM_ATTN_HEADS=40
-    EP_SIZE=128
-    topk=6
-    SEQ_LEN=4096
-elif [[ "${MODEL_SIZE}" == "173B" ]]; then
-    echo "Configuring 173B Model"
-    NUM_LAYERS=24
-    # MODEL_SIZE=173B
-    HIDDEN_SIZE=7168
-    FFN_HIDDEN_SIZE=2048
-    NUM_ATTN_HEADS=56
-    EP_SIZE=256
-    topk=8
-    SEQ_LEN=4096
-elif [[ "${MODEL_SIZE}" == "537B" ]]; then
-    echo "Configuring 537B Model"
-    NUM_LAYERS=60
-    # MODEL_SIZE=537B
-    HIDDEN_SIZE=7168
-    FFN_HIDDEN_SIZE=2560
-    NUM_ATTN_HEADS=56
-    EP_SIZE=256
-    topk=8
-    SEQ_LEN=4096
-elif [[ "${MODEL_SIZE}" == "50B_6L" ]]; then
-    echo "Configuring 50B Model"
-    NUM_LAYERS=6
-    # MODEL_SIZE=50B_6L
-    HIDDEN_SIZE=5120
-    FFN_HIDDEN_SIZE=1536
-    NUM_ATTN_HEADS=40
-    EP_SIZE=128
-    topk=6
-    SEQ_LEN=4096
-elif [[ "${MODEL_SIZE}" == "50B_12L" ]]; then
-    echo "Configuring 50B Model"
-    NUM_LAYERS=12
-    # MODEL_SIZE=50B_12L
-    HIDDEN_SIZE=5120
-    FFN_HIDDEN_SIZE=1536
-    NUM_ATTN_HEADS=40
-    EP_SIZE=128
-    topk=6
-    SEQ_LEN=4096
-elif [[ "${MODEL_SIZE}" == "50B_18L" ]]; then
-    echo "Configuring 50B Model"
-    NUM_LAYERS=18
-    # MODEL_SIZE=50B_18L
-    HIDDEN_SIZE=5120
-    FFN_HIDDEN_SIZE=1536
-    NUM_ATTN_HEADS=40
-    EP_SIZE=128
-    topk=6
-    SEQ_LEN=4096
-elif [[ "${MODEL_SIZE}" == "173B_8L" ]]; then
-    echo "Configuring 173B Model"
-    NUM_LAYERS=8
-    # MODEL_SIZE=173B_8L
-    HIDDEN_SIZE=7168
-    FFN_HIDDEN_SIZE=2048
-    NUM_ATTN_HEADS=56
-    EP_SIZE=256
-    topk=8
-    SEQ_LEN=4096
-elif [[ "${MODEL_SIZE}" == "173B_6L" ]]; then
-    echo "Configuring 173B Model"
-    NUM_LAYERS=6
-    # MODEL_SIZE=173B_6L
-    HIDDEN_SIZE=7168
-    FFN_HIDDEN_SIZE=2048
-    NUM_ATTN_HEADS=56
-    EP_SIZE=256
-    topk=8
-    SEQ_LEN=4096
-elif [[ "${MODEL_SIZE}" == "10B_div2" ]]; then
-    NUM_LAYERS=14
-    HIDDEN_SIZE=2048
-    FFN_HIDDEN_SIZE=1408
-    NUM_ATTN_HEADS=16
-    EP_SIZE=64
-    topk=6
-    SEQ_LEN=2048
-elif [[ "${MODEL_SIZE}" == "10B-4" ]]; then
-    NUM_LAYERS=24
-    HIDDEN_SIZE=2048
-    FFN_HIDDEN_SIZE=1408
-    NUM_ATTN_HEADS=16
-    EP_SIZE=64
-    topk=6
-    SEQ_LEN=2048
-elif [[ "${MODEL_SIZE}" == "10B-8" ]]; then
-    NUM_LAYERS=8
-    HIDDEN_SIZE=2048
-    FFN_HIDDEN_SIZE=1408
-    NUM_ATTN_HEADS=16
-    EP_SIZE=64
-    topk=6
-    SEQ_LEN=2048
-elif [[ "${MODEL_SIZE}" == "10B-12" ]]; then
-    NUM_LAYERS=16
-    HIDDEN_SIZE=2048
-    FFN_HIDDEN_SIZE=1408
-    NUM_ATTN_HEADS=16
-    EP_SIZE=64
-    topk=6
-    SEQ_LEN=2048
-elif [[ "${MODEL_SIZE}" == "15B" ]]; then
-    NUM_LAYERS=28
-    HIDDEN_SIZE=3072
-    FFN_HIDDEN_SIZE=1408
-    NUM_ATTN_HEADS=16
-    EP_SIZE=64
-    topk=6
-    SEQ_LEN=2048
-elif [[ "${MODEL_SIZE}" == "20B" ]]; then
-    NUM_LAYERS=28
-    HIDDEN_SIZE=4096
-    FFN_HIDDEN_SIZE=1408
-    NUM_ATTN_HEADS=16
-    EP_SIZE=64
-    topk=6
-    SEQ_LEN=2048
-elif [[ "${MODEL_SIZE}" == "31B" ]]; then
-    NUM_LAYERS=28
-    HIDDEN_SIZE=4096
-    FFN_HIDDEN_SIZE=1408
-    NUM_ATTN_HEADS=16
-    EP_SIZE=96
-    topk=6
-    SEQ_LEN=2048
-elif [[ "${MODEL_SIZE}" == "173B_1L" ]]; then
-    echo "Configuring 173B Model But with only 1 layer"
-    NUM_LAYERS=1
-    # MODEL_SIZE=190_div_28
-    HIDDEN_SIZE=7168
-    FFN_HIDDEN_SIZE=2048
-    NUM_ATTN_HEADS=56
-    EP_SIZE=256
-    topk=8
-    SEQ_LEN=4096
-else # Default / 10.1B
-    echo "Configuring default 10B model"
-    NUM_LAYERS=28
-    HIDDEN_SIZE=2048
-    FFN_HIDDEN_SIZE=1408
-    NUM_ATTN_HEADS=16
-    EP_SIZE=64
-    topk=6
-    SEQ_LEN=2048
+# -------------------------------------------------------------------------------------------
+# Get model config
+CONFIG_VARS=$(python3 ../utils/model_registry.py get_vars --model_size "${MODEL_SIZE}")
+if [ $? -ne 0 ]; then
+    echo "Error: Model size '${MODEL_SIZE}' not found in registry."
+    exit 1
 fi
+
+# Evaluate the output to set the Bash variables
+eval "$CONFIG_VARS"
+
+echo "Model Config Loaded for ${MODEL_SIZE}:"
+echo "  HIDDEN_SIZE: $HIDDEN_SIZE"
+echo "  FFN_HIDDEN_SIZE:    $FFN_HIDDEN_SIZE"
+echo "  NUM_LAYERS: $NUM_LAYERS"
+echo "  NUM_ATTN_HEADS: $NUM_ATTN_HEADS"
+echo "  EP_SIZE: $EP_SIZE"
+echo "  topk: $topk"
+echo "  SEQ_LEN: $SEQ_LEN"
+# -------------------------------------------------------------------------------------------
+
+# # --- 4. Dynamic Model Configuration ---
+# if [[ "${MODEL_SIZE}" == "10B" ]]; then
+#     NUM_LAYERS=24
+#     HIDDEN_SIZE=2048
+#     FFN_HIDDEN_SIZE=1408
+#     NUM_ATTN_HEADS=16
+#     EP_SIZE=64
+#     topk=6
+#     SEQ_LEN=2048
+# elif [[ "${MODEL_SIZE}" == "50B" ]]; then
+#     echo "Configuring 50B Model"
+#     NUM_LAYERS=24
+#     # MODEL_SIZE=50B
+#     HIDDEN_SIZE=5120
+#     FFN_HIDDEN_SIZE=1536
+#     NUM_ATTN_HEADS=40
+#     EP_SIZE=128
+#     topk=6
+#     SEQ_LEN=4096
+# elif [[ "${MODEL_SIZE}" == "63B" ]]; then
+#     echo "Configuring 63B Model"
+#     NUM_LAYERS=32
+#     # MODEL_SIZE=63B
+#     HIDDEN_SIZE=5120
+#     FFN_HIDDEN_SIZE=1536
+#     NUM_ATTN_HEADS=40
+#     EP_SIZE=128
+#     topk=6
+#     SEQ_LEN=4096
+# elif [[ "${MODEL_SIZE}" == "173B" ]]; then
+#     echo "Configuring 173B Model"
+#     NUM_LAYERS=24
+#     # MODEL_SIZE=173B
+#     HIDDEN_SIZE=7168
+#     FFN_HIDDEN_SIZE=2048
+#     NUM_ATTN_HEADS=56
+#     EP_SIZE=256
+#     topk=8
+#     SEQ_LEN=4096
+# elif [[ "${MODEL_SIZE}" == "537B" ]]; then
+#     echo "Configuring 537B Model"
+#     NUM_LAYERS=60
+#     # MODEL_SIZE=537B
+#     HIDDEN_SIZE=7168
+#     FFN_HIDDEN_SIZE=2560
+#     NUM_ATTN_HEADS=56
+#     EP_SIZE=256
+#     topk=8
+#     SEQ_LEN=4096
+# elif [[ "${MODEL_SIZE}" == "10B-1L" ]]; then
+#     echo "Configuring ${MODEL_SIZE} Model"
+#     NUM_LAYERS=1
+#     HIDDEN_SIZE=2048
+#     FFN_HIDDEN_SIZE=1408
+#     NUM_ATTN_HEADS=16
+#     EP_SIZE=64
+#     topk=6
+#     SEQ_LEN=2048
+# elif [[ "${MODEL_SIZE}" == "50B_1L" ]]; then
+#     echo "Configuring ${MODEL_SIZE} Model"
+#     NUM_LAYERS=6
+#     HIDDEN_SIZE=5120
+#     FFN_HIDDEN_SIZE=1536
+#     NUM_ATTN_HEADS=40
+#     EP_SIZE=128
+#     topk=6
+#     SEQ_LEN=4096
+# elif [[ "${MODEL_SIZE}" == "173B_1L" ]]; then
+#     echo "Configuring 173B Model But with only 1 layer"
+#     NUM_LAYERS=1
+#     # MODEL_SIZE=190_div_28
+#     HIDDEN_SIZE=7168
+#     FFN_HIDDEN_SIZE=2048
+#     NUM_ATTN_HEADS=56
+#     EP_SIZE=256
+#     topk=8
+#     SEQ_LEN=4096
+# else # Default / 10.1B
+#     echo "Configuring default 10B model"
+#     NUM_LAYERS=28
+#     HIDDEN_SIZE=2048
+#     FFN_HIDDEN_SIZE=1408
+#     NUM_ATTN_HEADS=16
+#     EP_SIZE=64
+#     topk=6
+#     SEQ_LEN=2048
+# fi
+
+if [[ "${RUN_PLANNER}" == "true" ]]; then
+
+    # PLANNER_CACHE_FILE='N1_n8_d2048_e64_f1406_k6_s4096 '
+
+    FULL_OUTPUT=$(python ../utils/planner.py \
+    --d_model ${HIDDEN_SIZE} --seqlen ${SEQ_LEN} --num_layers ${NUM_LAYERS} \
+    --pp_stages ${PP_SIZE} --dp ${EP_PARALLEL_SIZE} --ep ${EP_PARALLEL_SIZE} \
+    --num_experts ${EP_SIZE} --expert_dim ${FFN_HIDDEN_SIZE} --topk ${topk} \
+    --activation_checkpointing none --mbs 1 \
+    --fixed_num_batches ${NUM_BATCHES} \
+    --profile_dir "./planner_profiling_cache")
+
+    # 2. Print the logs to the screen immediately so you can read them
+    echo "$FULL_OUTPUT"
+
+    # 3. Extract the variables we need
+    #    We grep for lines starting with OPTIMAL_ inside the variable we already captured.
+    eval "$(echo "$FULL_OUTPUT" | grep "^OPTIMAL_")"
+
+    # 4. Check if optimization succeeded
+    if [ "$OPTIMAL_MBS" == "FAILED" ] || [ -z "$OPTIMAL_MBS" ]; then
+        echo "Error: Planner failed to find a valid configuration."
+        exit 1
+    fi
+
+    # 5. Now you can use the variables!
+    echo "---------------------------------------------------"
+    echo "Planner produced:"
+    echo "Micro-Batch Size: |$OPTIMAL_MBS|"
+    echo "Layer Partition:  |$OPTIMAL_PARTITION|"
+    echo "Checkpoints:      |$OPTIMAL_CKPT|"
+    
+
+    export UNEVEN_PP_PARTITION=$OPTIMAL_PARTITION
+    export DYNAMIC_CHECKPOINT_PARTITION=$OPTIMAL_CKPT
+    
+
+    BATCH_SIZE=$OPTIMAL_MBS
+
+    echo "UPDATED BATCH_SIZE=${OPTIMAL_MBS}"
+    echo "---------------------------------------------------"
+
+fi 
+
+# export UNEVEN_PP_PARTITION="7 6 6 5"
+# export DYNAMIC_CHECKPOINT="True"
+# export DYNAMIC_CHECKPOINT_PARTITION="1 0 0 0"
+
+
+GLOBAL_BATCH_SIZE=$(( NUM_BATCHES * BATCH_SIZE * (TOTAL_GPUS / PP_SIZE / MP_SIZE) ))
+echo "GLOBAL_BATCH_SIZE=$GLOBAL_BATCH_SIZE"
 
 # --- Static Training Parameters ---
 LR=1.2e-4
@@ -355,15 +357,28 @@ if [[ ${PP_SIZE} -gt 1 ]]; then
     export WALL_CLOCK_BREAKDOWN="false"
 else
     DEEPSPEED_PIPELINE_FLAG="--no-pipeline-parallel"
-    WALL_CLOCK_BREAKDOWN="true"
-    export WALL_CLOCK_BREAKDOWN="true"
-    # WALL_CLOCK_BREAKDOWN="false"
-    # export WALL_CLOCK_BREAKDOWN="false"
+    # WALL_CLOCK_BREAKDOWN="true"
+    # export WALL_CLOCK_BREAKDOWN="true"
+    WALL_CLOCK_BREAKDOWN="false"
+    export WALL_CLOCK_BREAKDOWN="false"
 fi
 
 if [[ "${MOE_TYPE}" == "X-MOE" ]]; then
+    # megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-rbd"
     megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft"
 fi
+if [[ "${MOE_TYPE}" == "TED-MOE" ]]; then
+    # megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-rbd"
+    megatron_options="${megatron_options} --enable-expert-tensor-parallelism"
+fi
+if [[ "${MOE_TYPE}" == "TUTEL-MOE" ]]; then
+    # megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-rbd"
+    megatron_options="${megatron_options} --use-tutel"
+fi
+
+# if [[ $EP_SIZE -gt 32 ]]; then
+#     megatron_options="${megatron_options} --use-rbd"
+# fi 
 
 if [ "${ACTIVATION_CHECKPOINT}" = "true" ]; then
     megatron_options="${megatron_options} --checkpoint-activations"
@@ -378,7 +393,12 @@ fi
 
 # WALL_CLOCK_BREAKDOWN="false"
 template_json="../ds_config_gpt_TEMPLATE.json"
-config_json="ds_config_gpt_Zero0_${NAME}.json"
+# config_json="ds_config_gpt_Zero0_${NAME}.json"
+config_dir="temp_ds_json"
+config_json="${config_dir}/ds_config_gpt_Zero0_${NAME}.json"
+# Create temp_ds_json directory if it doesn't exist
+mkdir -p "${config_dir}"
+
 sed "s/CONFIG_BATCH_SIZE/${GLOBAL_BATCH_SIZE}/" ${template_json} \
     | sed "s/CONFIG_MBSIZE/${BATCH_SIZE}/" \
     | sed "s/LOG_INTERVAL/${LOG_INTERVAL}/" \
@@ -474,7 +494,7 @@ current_time=$(date +%Y-%m-%d_%H-%M-%S)
 export profile_dir="torch_profile/${current_time}/"
 export OMP_NUM_THREADS=2
 
-export NCCL_P2P_DISABLE=1
+# export NCCL_P2P_DISABLE=1
 
 # --- Final srun Launch Command ---
 gpus_per_node=$(( TOTAL_GPUS / NODES ))
@@ -490,12 +510,160 @@ srun -N ${NODES} -n ${TOTAL_GPUS} -c2 --ntasks-per-node=${gpus_per_node} --gpus-
         fi \
     '
 
-# Use --export=ALL to propagate the whole environment, then explicitly list the
-# critical variables to ensure they are set correctly on all remote nodes.
 srun -N ${NODES} -n ${TOTAL_GPUS} -c2 \
      --ntasks-per-node=${gpus_per_node} \
      --gpus-per-node=${gpus_per_node} \
-     --export=ALL,FI_MR_CACHE_MONITOR,FI_CXI_DEFAULT_CQ_SIZE,FI_CXI_RX_MATCH_MODE,NCCL_DEBUG,UNEVEN_PP_PARTITION \
+     --export=ALL,FI_MR_CACHE_MONITOR,FI_CXI_DEFAULT_CQ_SIZE,FI_CXI_RX_MATCH_MODE,NCCL_DEBUG,UNEVEN_PP \
+     python ../utils/test_switch_topo.py 
+
+# --- INSERT THIS HERE ---
+echo "\n--- SLURM JOB CONFIGURATION ---\n"
+# This will print the full job details to your stdout log
+scontrol show job $SLURM_JOB_ID
+echo "\n--- END SLURM JOB CONFIGURATION ---\n"
+# ------------------------
+
+
+
+# =======================================================================================
+# --- SMART TOPOLOGY SORTING, HOSTFILE GENERATION & VERIFICATION ---
+# =======================================================================================
+
+echo "---------------------------------------------------"
+echo "--- TOPOLOGY OPTIMIZATION STEP ---"
+
+# 1. Capture the Default Order from SLURM
+DEFAULT_NODELIST=$(scontrol show hostnames $SLURM_JOB_NODELIST | tr '\n' ',' | sed 's/,$//')
+echo "DEFAULT NODELIST (SLURM Order):"
+echo "$DEFAULT_NODELIST"
+
+# 2. Run the topology script on every node to gather hardware locations
+echo "Gathering hardware location data..."
+RAW_TOPO_DATA=$(srun -N $NODES -n $NODES --ntasks-per-node=1 \
+    --export=ALL \
+    python ../utils/test_switch_topo.py)
+
+# 3. Sort nodes by Switch ID using Python
+OPTIMIZED_NODELIST=$(python3 -c "
+import sys
+
+# The raw output from the srun command above
+raw_data = \"\"\"$RAW_TOPO_DATA\"\"\"
+
+node_switch_map = {}
+
+for line in raw_data.strip().split('\n'):
+    parts = line.split()
+    # Expecting: frontier1528 NIC 0 ... location 017.31.08
+    if 'location' in parts and 'NIC' in parts:
+        hostname = parts[0]
+        location = parts[-1] 
+        try:
+            # Parse: Group.Switch.Port
+            grp, sw, port = location.split('.')
+            if hostname not in node_switch_map:
+                node_switch_map[hostname] = int(sw)
+        except:
+            continue
+
+# Sort the nodes: Primary Key = Switch ID, Secondary Key = Hostname
+sorted_nodes = sorted(node_switch_map.keys(), key=lambda x: (node_switch_map[x], x))
+
+# Output comma-separated list
+print(','.join(sorted_nodes))
+")
+
+echo "---------------------------------------------------"
+echo "OPTIMIZED NODELIST (Switch-Aware Order):"
+echo "$OPTIMIZED_NODELIST"
+echo "Comparison:"
+echo "  [Before] $DEFAULT_NODELIST"
+echo "  [After ] $OPTIMIZED_NODELIST"
+
+# # =======================================================================================
+# # --- CRITICAL FIX: GENERATE RANK MAP FOR --distribution=arbitrary ---
+# # =======================================================================================
+
+# echo "---------------------------------------------------"
+# echo "--- GENERATING ARBITRARY RANK MAPPING ---"
+
+# RANK_MAP_FILE="${PWD}/rank_map_${SLURM_JOB_ID}.txt"
+# rm -f $RANK_MAP_FILE
+
+# # Convert comma-separated string to array
+# IFS=',' read -ra NODE_ARRAY <<< "$OPTIMIZED_NODELIST"
+
+# # Write hostname N times (where N = gpus_per_node)
+# for node in "${NODE_ARRAY[@]}"; do
+#     for ((i=0; i<${gpus_per_node}; i++)); do
+#         echo "$node" >> $RANK_MAP_FILE
+#     done
+# done
+
+# # Export this so srun sees it (Use absolute path)
+# export SLURM_HOSTFILE=$RANK_MAP_FILE
+
+# echo "Rank Map Generated: $SLURM_HOSTFILE"
+# echo "First $((gpus_per_node * 2)) lines (Should show all ranks for Node 1, then Node 2):"
+# head -n $((gpus_per_node * 2)) $SLURM_HOSTFILE
+# echo "..."
+
+# # =======================================================================================
+# # --- ENHANCED VERIFICATION (ROBUST MODE) ---
+# # =======================================================================================
+
+# echo "---------------------------------------------------"
+# echo "--- VERIFYING LIVE TOPOLOGY (Buffered via File) ---"
+
+# echo "Distribution Mode: arbitrary"
+# echo "SLURM_HOSTFILE: $SLURM_HOSTFILE"
+# echo ""
+# echo "Running srun verification..."
+
+# # 2. RUN SRUN -> FILE
+# #    FIX: Added resource flags (-c2, --ntasks-per-node, --gpus-per-node) 
+# #    so Frontier accepts the request.
+# #    We capture stdout to file, and let stderr print to the log.
+# srun -n ${TOTAL_GPUS} \
+#      --distribution=arbitrary \
+#      --ntasks-per-node=${gpus_per_node} \
+#      --gpus-per-node=${gpus_per_node} \
+#      -c2 \
+#      bash -c 'echo "Rank $SLURM_PROCID is on $(hostname)"' > debug_layout.txt
+
+# # 3. VERIFY THE FILE CONTENT
+# if [ ! -s debug_layout.txt ]; then
+#     echo "ERROR: srun produced no output! See stderr above for launch errors."
+# else
+#     echo "Output captured. Sorting and displaying first 16 lines:"
+#     echo "---------------------------------------------------"
+    
+#     # Sort by Rank ID (Column 2) and show the top
+#     sort -n -k2 debug_layout.txt | head -n 32
+    
+#     echo "---------------------------------------------------"
+#     echo "Checking Boundary Transition (Rank $((gpus_per_node-1)) -> Rank $gpus_per_node):"
+#     sort -n -k2 debug_layout.txt | grep -E "Rank $((gpus_per_node-1)) |Rank $gpus_per_node "
+# fi
+
+# echo "---------------------------------------------------"
+# echo "TOPOLOGY SETUP COMPLETE"
+# echo "---------------------------------------------------"
+# # =======================================================================================
+# # --- END OF VERIFICATION (ROBUST MODE) ---
+# # =======================================================================================
+
+
+
+
+# Normal nodes assignment: 
+# Use --export=ALL to propagate the whole environment, then explicitly list the
+# critical variables to ensure they are set correctly on all remote nodes.
+# unset SLURM_HOSTFILE
+srun -N ${NODES} -n ${TOTAL_GPUS} -c2 \
+     --ntasks-per-node=${gpus_per_node} \
+     --gpus-per-node=${gpus_per_node} \
+     --export=ALL,FI_MR_CACHE_MONITOR,FI_CXI_DEFAULT_CQ_SIZE,FI_CXI_RX_MATCH_MODE,NCCL_DEBUG,UNEVEN_PP \
      python ../pretrain_gpt_deepspeed.py \
         ${megatron_options} \
         ${data_options} \
@@ -504,19 +672,51 @@ srun -N ${NODES} -n ${TOTAL_GPUS} -c2 \
         --zero-stage 1 \
         2>&1 | tee ${LOG_FILE}
 # # # ---------------------------------------------------------------------------------------------------------------------
+# EP Alignment assignment: 
+# Use --export=ALL to propagate the whole environment, then explicitly list the
+# critical variables to ensure they are set correctly on all remote nodes.
+# srun -n ${TOTAL_GPUS} -c2 \
+#     --distribution=arbitrary \
+#      --ntasks-per-node=${gpus_per_node} \
+#      --gpus-per-node=${gpus_per_node} \
+#      --export=ALL,FI_MR_CACHE_MONITOR,FI_CXI_DEFAULT_CQ_SIZE,FI_CXI_RX_MATCH_MODE,NCCL_DEBUG,UNEVEN_PP \
+#      python ../pretrain_gpt_deepspeed.py \
+#         ${megatron_options} \
+#         ${data_options} \
+#         ${deepspeed_options} \
+#         --master-addr=$MASTER_ADDR \
+#         --zero-stage 1 \
+#         2>&1 | tee ${LOG_FILE}
+# srun -n ${TOTAL_GPUS} -c2 \
+#     --distribution=arbitrary \
+#      --ntasks-per-node=${gpus_per_node} \
+#      --gpus-per-node=${gpus_per_node} \
+#      --export=ALL,FI_MR_CACHE_MONITOR,FI_CXI_DEFAULT_CQ_SIZE,FI_CXI_RX_MATCH_MODE,NCCL_DEBUG,UNEVEN_PP \
+#      bash -c 'export TRITON_CACHE_DIR=/tmp/triton_cache_${USER}_${SLURM_JOB_ID}/rank${SLURM_PROCID}; \
+#               mkdir -p $TRITON_CACHE_DIR; \
+#               exec "$@"' \
+#      -- \
+#      python ../pretrain_gpt_deepspeed.py \
+#         ${megatron_options} \
+#         ${data_options} \
+#         ${deepspeed_options} \
+#         --master-addr=$MASTER_ADDR \
+#         --zero-stage 1 \
+#         2>&1 | tee ${LOG_FILE}
+# # # ---------------------------------------------------------------------------------------------------------------------
 
 
 # --- Analysis Script ---
 ANALYSIS_LOG_FILE="/lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe/scripts-frontier/logs/xmoe-${RUN_TYPE}-$SLURM_JOB_ID.o"
 echo "ANALYSIS_LOG_FILE: ${ANALYSIS_LOG_FILE}"
-python  /lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe/scripts/analyze_log.py \
+python  /lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe/utils/analyze_log.py \
         ${ANALYSIS_LOG_FILE} \
         --iterations $TRAIN_ITERS \
         --nodes $NODES \
         --gpus_per_node $gpus_per_node \
         --pp $PP_SIZE \
         --ep $EP_PARALLEL_SIZE \
-        --dp $(( total_gpu / PP_SIZE / MP_SIZE )) \
+        --dp $(( TOTAL_GPUS / PP_SIZE / MP_SIZE )) \
         --tp $MP_SIZE \
         --gbs $GLOBAL_BATCH_SIZE \
         --mbs $BATCH_SIZE \
@@ -532,6 +732,6 @@ python  /lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/exa
         --activation_checkpointing $ACTIVATION_CHECKPOINT \
         --checkpoint_interval $CHECKPOINT_NUM_LAYERS \
         --dynamic_checkpoint $DYNAMIC_CHECKPOINT \
-        --uneven_pp_partition $UNEVEN_PP_PARTITION
+        --uneven_pp $UNEVEN_PP
 
 echo "After python analyze log"
