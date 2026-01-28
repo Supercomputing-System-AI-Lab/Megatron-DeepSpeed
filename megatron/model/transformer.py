@@ -1099,7 +1099,7 @@ class ParallelTransformerLayer(MegatronModule):
                                     enable_expert_tensor_parallelism=enable_expert_tensor_parallelism)
                 else:   
                     # print (f'[transformer.py] Using Fine-grained MoE \n'*10)
-#                    self.mlp = MoE(args.hidden_size, config, 
+                   self.mlp = MoE(args.hidden_size, 
                                 ParallelMLP(config,
                                     moe=True,
                                     enable_expert_tensor_parallelism=enable_expert_tensor_parallelism),

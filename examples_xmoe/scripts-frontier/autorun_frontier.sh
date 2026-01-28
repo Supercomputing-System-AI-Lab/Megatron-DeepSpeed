@@ -44,9 +44,10 @@ declare -A PP_BATCH_MAP
 
 # PP_BATCH_MAP["1:8"]="8:200:20:X-MOE:10B:no-ckpt:1:even:no-planner 7:200:20:X-MOE:10B:no-ckpt:1:even:no-planner 6:200:20:X-MOE:10B:no-ckpt:1:even:no-planner 5:200:20:X-MOE:10B:no-ckpt:1:even:no-planner  4:200:20:X-MOE:10B:no-ckpt:1:even:no-planner "
 # PP_BATCH_MAP["2:16"]="2:100:20:X-MOE:10B:no-ckpt:1:even:no-planner 4:100:20:X-MOE:10B:no-ckpt:1:even:no-planner "
+PP_BATCH_MAP["1:8"]=" 4:20:20:X-MOE:10B:no-ckpt:1:even:no-planner "
 
 # PP_BATCH_MAP["1:4"]="1:100:20:X-MOE:10B:no-ckpt:1:even:no-planner 2:100:20:X-MOE:10B:no-ckpt:1:even:no-planner 4:100:20:X-MOE:10B:no-ckpt:1:even:no-planner 6:100:20:X-MOE:10B:no-ckpt:1:even:no-planner 8:100:20:X-MOE:10B:no-ckpt:1:even:no-planner 10:100:20:X-MOE:10B:no-ckpt:1:even:no-planner"
-# PP_BATCH_MAP["1:8"]="1:100:20:X-MOE:10B:ckpt:1:even:no-planner"
+# PP_BATCH_MAP["1:8"]="1:10:10:X-MOE:10B:dynamic-ckpt:1:uneven:yes-planner"
 # PP_BATCH_MAP["1:4"]="1:100:20:X-MOE:10B:ckpt:1:even:no-planner"
 # PP_BATCH_MAP["1:2"]="1:100:20:X-MOE:10B:ckpt:1:even:no-planner"
 
@@ -99,7 +100,7 @@ declare -A PP_BATCH_MAP
 # PP_BATCH_MAP["8:64"]=" 2:50:12:X-MOE:63B:ckpt:1:even:no-planner " 
 # PP_BATCH_MAP["8:64"]=" 4:50:12:X-MOE:63B:ckpt:1:even:no-planner " 
 
-
+# PP_BATCH_MAP["4:32"]=" 1:200:15:X-MOE:63B:dynamic-ckpt:1:uneven:yes-planner " 
 # #8 dynamic checkpointing
 # PP_BATCH_MAP["4:32"]=" 1:100:15:X-MOE:63B:ckpt:1:even:no-planner " 
 # PP_BATCH_MAP["4:32"]=" 4:100:12:X-MOE:63B:ckpt:1:even:no-planner " 
@@ -205,8 +206,8 @@ declare -A EP_BATCH_MAP
 # EP_BATCH_MAP["32:128:2"]=" 1:20:13:TED-MOE:173B:no-ckpt:0  1:20:13:TED-MOE:173B:ckpt:1   1:20:13:TUTEL-MOE:173B:no-ckpt:0  1:20:13:TUTEL-MOE:173B:ckpt:1 " # 01/23/2026 63B DS-MoE rerun
 # EP_BATCH_MAP["32:128:2"]=" 1:20:13:TED-MOE:173B:no-ckpt:0  1:20:13:TED-MOE:173B:ckpt:1 "
 
-EP_BATCH_MAP["64:256:1"]=" 1:5:2:DS-MOE:537B:ckpt:1 " # 01/22/2026 63B DS-MoE rerun
-EP_BATCH_MAP["64:256:2"]="  1:5:2:TED-MOE:537B:ckpt:1   1:5:2:TUTEL-MOE:537B:ckpt:1 " # 01/23/2026 63B DS-MoE rerun
+# EP_BATCH_MAP["64:256:1"]=" 1:5:2:DS-MOE:537B:ckpt:1 " # 01/22/2026 63B DS-MoE rerun
+# EP_BATCH_MAP["64:256:2"]="  1:5:2:TED-MOE:537B:ckpt:1   1:5:2:TUTEL-MOE:537B:ckpt:1 " # 01/23/2026 63B DS-MoE rerun
 
 
 # EP_BATCH_MAP["4:32:1"]="2:20:25:X-MOE:10B:no-ckpt:0 4:20:25:X-MOE:10B:no-ckpt:0 6:20:25:X-MOE:10B:no-ckpt:0 8:20:25:X-MOE:10B:no-ckpt:0 10:20:25:X-MOE:10B:no-ckpt:0 "
@@ -427,7 +428,9 @@ for node_key in "${!PP_STRATEGY_MAP[@]}"; do
 
             RUN_TYPE="pp"
             JOB_NAME="${RUN_TYPE}_n${NODES}g${TOTAL_GPUS}_ep${EP_PARALLEL_SIZE}_nbs${NBS}_i${TRAIN_ITERS}_${MOE_TYPE}"
-            TEMP_SLURM_SCRIPT="temp_slurm_${JOB_NAME}.slurm"
+            # TEMP_SLURM_SCRIPT="temp_slurm_${JOB_NAME}.slurm"
+            TEMP_DIR="temp_slurm"
+            TEMP_SLURM_SCRIPT="${TEMP_DIR}/temp_slurm_${JOB_NAME}.slurm"
 
             echo "  - Generating job: ${JOB_NAME}"
 
@@ -494,7 +497,9 @@ for node_key in "${!EP_BATCH_MAP[@]}"; do
 
         RUN_TYPE="ep"
         JOB_NAME="${RUN_TYPE}_n${NODES}g${TOTAL_GPUS}_ep${EP_PARALLEL_SIZE}_nbs${NBS}_i${TRAIN_ITERS}_${MOE_TYPE}"
-        TEMP_SLURM_SCRIPT="temp_slurm_${JOB_NAME}.slurm"
+        # TEMP_SLURM_SCRIPT="temp_slurm_${JOB_NAME}.slurm"
+        TEMP_DIR="temp_slurm"
+        TEMP_SLURM_SCRIPT="${TEMP_DIR}/temp_slurm_${JOB_NAME}.slurm"
 
         echo "  - Generating job: ${JOB_NAME}"
 

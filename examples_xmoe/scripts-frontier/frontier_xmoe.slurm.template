@@ -5,7 +5,7 @@
 #SBATCH -J {{MOE_TYPE}}-{{RUN_TYPE}}-nbs{{NUM_BATCHES}}
 #SBATCH -o logs/xmoe-{{RUN_TYPE}}-%j.o
 #SBATCH -e logs/xmoe-{{RUN_TYPE}}-%j.e
-#SBATCH -t 01:00:00
+#SBATCH -t 00:30:00
 #SBATCH -p {{PARTITION}}
 #SBATCH -N {{NODES}}
 #SBATCH -d singleton
