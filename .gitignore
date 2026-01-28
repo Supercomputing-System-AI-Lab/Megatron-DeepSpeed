@@ -29,3 +29,11 @@ examples_xmoe/data/*.bin
 examples_xmoe/data/*.idx
 examples_xmoe/data/*.jsonl
 examples_xmoe/data/index-cache/
+
+examples_xmoe/scripts-frontier/logs/*
+examples_xmoe/scripts-frontier/logs_old/*
+examples_xmoe/scripts-frontier/output/*
+examples_xmoe/scripts-frontier/planner_profiling_cache_disable_P2P_dec_13/*
+examples_xmoe/scripts-frontier/temp_ds_json/*
+examples_xmoe/scripts-frontier/temp_slurm/*
+examples_xmoe/scripts-frontier/results/*
