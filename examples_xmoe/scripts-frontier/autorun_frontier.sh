@@ -21,13 +21,14 @@ PP_STRATEGY_MAP["1:2"]="2:1"
 PP_STRATEGY_MAP["1:4"]="4:1" 
 PP_STRATEGY_MAP["1:8"]="2:4" 
 PP_STRATEGY_MAP["2:8"]="2:4" 
-PP_STRATEGY_MAP["2:16"]="2:8 4:4" 
+PP_STRATEGY_MAP["2:16"]="2:8" 
 PP_STRATEGY_MAP["4:16"]="4:4" 
 PP_STRATEGY_MAP["4:32"]="4:8" 
 PP_STRATEGY_MAP["5:40"]="5:8" 
 PP_STRATEGY_MAP["6:48"]="6:8" 
-PP_STRATEGY_MAP["8:64"]="8:8" #"4:8" 
-PP_STRATEGY_MAP["12:96"]="6:8" #"12:8" 
+PP_STRATEGY_MAP["8:64"]="4:8" #"4:8" 
+PP_STRATEGY_MAP["10:80"]="10:8" 
+PP_STRATEGY_MAP["12:96"]="12:8" 
 PP_STRATEGY_MAP["15:120"]="15:8" 
 PP_STRATEGY_MAP["16:128"]="4:8" #"16:8" 
 PP_STRATEGY_MAP["20:160"]="20:8" 
@@ -37,96 +38,268 @@ PP_STRATEGY_MAP["32:256"]="4:8" #"32:8"
 PP_STRATEGY_MAP["40:320"]="40:8" 
 PP_STRATEGY_MAP["60:480"]="60:8" 
 PP_STRATEGY_MAP["64:512"]="4:8" #"32:8" 
-PP_STRATEGY_MAP["128:1024"]="4:8" #"32:8" 
+PP_STRATEGY_MAP["128:1024"]="16:8" #"32:8" 
 
+PP_STRATEGY_MAP["36:288"]="12:8" 
+PP_STRATEGY_MAP["72:576"]="12:8" 
+PP_STRATEGY_MAP["144:1152"]="12:8" 
+PP_STRATEGY_MAP["288:2304"]="12:8" 
+
+# PP_BATCH_MAP["36:288"]=" 1:200:20:X-MOE-3D:173B:dynamic-ckpt:1:uneven:yes-planner" 
+# PP_BATCH_MAP["72:576"]=" 1:200:20:X-MOE-3D:173B:dynamic-ckpt:1:uneven:yes-planner" 
+# PP_BATCH_MAP["144:1152"]=" 1:200:20:X-MOE-3D:173B:dynamic-ckpt:1:uneven:yes-planner" 
+# PP_BATCH_MAP["288:2304"]=" 1:200:20:X-MOE-3D:173B:dynamic-ckpt:1:uneven:yes-planner" 
 
 declare -A PP_BATCH_MAP
 
-# PP_BATCH_MAP["1:8"]="8:200:20:X-MOE:10B:no-ckpt:1:even:no-planner 7:200:20:X-MOE:10B:no-ckpt:1:even:no-planner 6:200:20:X-MOE:10B:no-ckpt:1:even:no-planner 5:200:20:X-MOE:10B:no-ckpt:1:even:no-planner  4:200:20:X-MOE:10B:no-ckpt:1:even:no-planner "
-# PP_BATCH_MAP["2:16"]="2:100:20:X-MOE:10B:no-ckpt:1:even:no-planner 4:100:20:X-MOE:10B:no-ckpt:1:even:no-planner "
-PP_BATCH_MAP["1:8"]=" 4:20:20:X-MOE:10B:no-ckpt:1:even:no-planner "
+# 
+# PP_BATCH_MAP["30:240"]="  2:128:15:X-MOE-3D:537B:ckpt:1:even:no-planner 1:256:15:X-MOE-3D:537B:dynamic-ckpt:1:uneven:yes-planner  1:256:15:X-MOE-3D:537B:ckpt:1:even:no-planner "
 
-# PP_BATCH_MAP["1:4"]="1:100:20:X-MOE:10B:no-ckpt:1:even:no-planner 2:100:20:X-MOE:10B:no-ckpt:1:even:no-planner 4:100:20:X-MOE:10B:no-ckpt:1:even:no-planner 6:100:20:X-MOE:10B:no-ckpt:1:even:no-planner 8:100:20:X-MOE:10B:no-ckpt:1:even:no-planner 10:100:20:X-MOE:10B:no-ckpt:1:even:no-planner"
-# PP_BATCH_MAP["1:8"]="1:10:10:X-MOE:10B:dynamic-ckpt:1:uneven:yes-planner"
-# PP_BATCH_MAP["1:4"]="1:100:20:X-MOE:10B:ckpt:1:even:no-planner"
-# PP_BATCH_MAP["1:2"]="1:100:20:X-MOE:10B:ckpt:1:even:no-planner"
+# 03/20: 1024 run for 1T exp 
 
-# PP_BATCH_MAP["1:8"]="1:10:20:X-MOE:10B:no-ckpt:1:even:no-planner"
-# PP_BATCH_MAP["60:480"]="1:1920:14:X-MOE:537B:ckpt:1 1:1920:14:X-MOE:537B:dynamic-ckpt:1  "
-# PP_BATCH_MAP["4:32"]="1:96:3:X-MOE:50B:ckpt:1:even 1:96:3:X-MOE:50B:dynamic-ckpt:1:uneven 1:96:3:X-MOE:50B:dynamic-ckpt:1:even"
-# PP_BATCH_MAP["1:8"]="1:960:20:X-MOE:10B:ckpt:1:uneven 1:960:20:X-MOE:10B:dynamic-ckpt:1:even 1:960:20:X-MOE:10B:dynamic-ckpt:1:uneven 1:960:20:X-MOE:10B:ckpt:1:even 1:960:20:X-MOE:10B:no-ckpt:1:even "
-# PP_BATCH_MAP["4:32"]="1:960:20:X-MOE:50B:ckpt:1:uneven 1:960:20:X-MOE:50B:dynamic-ckpt:1:even 1:960:20:X-MOE:50B:dynamic-ckpt:1:uneven 1:960:20:X-MOE:50B:ckpt:1:even 1:960:20:X-MOE:50B:no-ckpt:1:even "
+# PP_BATCH_MAP["4:32"]="   1:256:15:X-MOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner "
+PP_BATCH_MAP["4:32"]=" 1:32:15:X-MOE-3D:63B:no-ckpt:0:uneven:yes-planner-membal "
 
-# PP_BATCH_MAP["30:240"]="1:200:16:X-MOE:537B:ckpt:1:even:no-planner 1:200:16:X-MOE:537B:dynamic-ckpt:1:uneven:yes-planner"
-# PP_BATCH_MAP["30:240"]="1:200:16:X-MOE:537B:dynamic-ckpt:1:uneven:yes-planner"
-# PP_BATCH_MAP["40:320"]="1:100:16:X-MOE:537B:dynamic-ckpt:1:uneven:yes-planner"
-# PP_BATCH_MAP["60:480"]="1:200:15:X-MOE:537B:ckpt:1:even:no-planner 1:230:16:X-MOE:1T:ckpt:1:even:no-planner"
-# PP_BATCH_MAP["60:480"]="1:230:16:X-MOE:1T:ckpt:1:even:no-planner 1:230:16:X-MOE:1T:dynamic-ckpt:1:uneven:yes-planner "
-# PP_BATCH_MAP["60:480"]="1:400:16:X-MOE:1T:dynamic-ckpt:1:uneven:yes-planner " # 01/16/2026 rerun for 2h with increase gbs
-# PP_BATCH_MAP["1:8"]="2:4:4:X-MOE:10B:dynamic-ckpt:1:uneven:yes-planner"
-# PP_BATCH_MAP["1:8"]="2:4:4:X-MOE:10B:dynamic-ckpt:1:uneven:no-planner"
-# PP_BATCH_MAP["4:32"]="4:20:20:X-MOE:10B:no-ckpt:1:even:no-planner"
+# # # # # # ELMoE PP (120 Nodes = 960 GPUs)
+# PP_STRATEGY_MAP["120:960"]="60:8"
+# # # # # Running both seqgemm (X-MOE-3D) and groupgemm (primus) to see which is faster
+# # # PP_BATCH_MAP["120:960"]=" 1:256:15:X-MOE-3D:1T:dynamic-ckpt:1:uneven:yes-planner "
+# # PP_BATCH_MAP["120:960"]="1:256:15:X-MOE-GroupedGEMM-primus:1T:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["120:960"]="1:128:15:X-MOE-GroupedGEMM-triton:1T:dynamic-ckpt:1:uneven:yes-planner "
+# ========================
+# PP_BATCH_MAP["120:960"]="1:128:15:X-MOE-GroupedGEMM-triton:1T:ckpt:1:even:no-planner "
+# =========================
+# PP_BATCH_MAP["60:480"]="1:128:15:X-MOE-GroupedGEMM-triton:1T:ckpt:1:even:no-planner "
+# ========================
+# PP_BATCH_MAP["120:960"]="1:128:15:X-MOE-3D:1T:ckpt:1:even:no-planner "
+# PP_BATCH_MAP["60:480"]="1:480:15:X-MOE-3D:1T:dynamic-ckpt:1:uneven:yes-planner  1:480:15:X-MOE-3D:1T:ckpt:1:even:no-planner "
+# PP_BATCH_MAP["60:480"]=" 1:480:15:X-MOE-3D:1T:ckpt:1:even:no-planner "
+# PP_BATCH_MAP["60:480"]=" 1:256:15:X-MOE-3D:1T:dynamic-ckpt:1:uneven:yes-planner  1:256:15:X-MOE-GroupedGEMM-primus:1T:dynamic-ckpt:1:uneven:yes-planner "
 
-# PP_BATCH_MAP["4:32"]="5:200:20:X-MOE:10B:no-ckpt:0:even:no-planner 6:200:20:X-MOE:10B:no-ckpt:0:even:no-planner 7:200:20:X-MOE:10B:no-ckpt:0:even:no-planner 8:200:20:X-MOE:10B:no-ckpt:0:even:no-planner 9:200:20:X-MOE:10B:no-ckpt:0:even:no-planner 10:200:20:X-MOE:10B:no-ckpt:0:even:no-planner  "
-# PP_BATCH_MAP["4:32"]="1:200:20:X-MOE:10B:yes-ckpt:1:uneven:yes-planner   "
-# PP_BATCH_MAP["4:32"]="1:200:30:X-MOE:63B:yes-ckpt:1:even:no-planner 1:200:30:X-MOE:63B:dynamic-ckpt:1:uneven:yes-planner " # 01/16/2026 rerun
-# PP_BATCH_MAP["4:32"]="1:200:22:X-MOE:63B:dynamic-ckpt:1:uneven:yes-planner " # 01/16/2026 rerun
-# PP_BATCH_MAP["16:128"]="1:200:20:X-MOE:173B:yes-ckpt:1:even:no-planner 1:200:20:X-MOE:173B:dynamic-ckpt:1:uneven:yes-planner "
-# PP_BATCH_MAP["12:96"]="1:200:20:X-MOE:173B:yes-ckpt:1:even:no-planner"
-# PP_BATCH_MAP["12:96"]="1:200:20:X-MOE:173B:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["60:480"]=" 1:224:15:X-MOE-3D:1T:dynamic-ckpt:1:uneven:yes-planner  1:224:15:X-MOE-3D:1T:dynamic-ckpt:1:uneven:yes-planner  1:224:15:X-MOE-3D:1T:dynamic-ckpt:1:uneven:yes-planner  1:224:15:X-MOE-3D:1T:dynamic-ckpt:1:uneven:yes-planner  1:224:15:X-MOE-3D:1T:dynamic-ckpt:1:uneven:yes-planner  1:224:15:X-MOE-3D:1T:ckpt:1:even:no-planner "
+# PP_BATCH_MAP["60:480"]=" 1:224:15:X-MOE-3D:1T:dynamic-ckpt:1:uneven:yes-planner  1:224:15:X-MOE-3D:1T:dynamic-ckpt:1:uneven:yes-planner "
+
+# # 1:256:3:X-MOE-GroupedGEMM-primus:1T:ckpt:1:even:no-planner # peak mem 45.10
+
+# PP_BATCH_MAP["4:32"]="  1:256:15:X-MOE-3D:63B_36L:ckpt:1:even:no-planner  2:128:15:X-MOE-3D:63B_36L:ckpt:1:even:no-planner  1:256:15:X-MOE-3D:63B_36L:no-ckpt:0:even:no-planner  1:256:15:X-MOE-3D:63B_36L:dynamic-ckpt:1:uneven:yes-planner   1:256:15:X-MOE-3D:63B_36L:ckpt:1:uneven:yes-planner-membal   1:256:15:X-MOE-3D:63B_36L:no-ckpt:0:uneven:yes-planner-membal  "
+
+# PP_BATCH_MAP["4:32"]="   1:256:15:X-MOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner     1:256:15:X-MOE-3D:63B:no-ckpt:0:uneven:yes-planner-membal  "
+# PP_STRATEGY_MAP["60:480"]="30:8"
+# # PP_BATCH_MAP["60:480"]="  1:256:15:X-MOE-3D:537B:ckpt:1:even:no-planner  2:128:15:X-MOE-3D:537B:ckpt:1:even:no-planner    1:256:15:X-MOE-3D:537B:dynamic-ckpt:1:uneven:yes-planner   1:256:15:X-MOE-3D:537B:ckpt:1:uneven:yes-planner-membal  "
+# PP_BATCH_MAP["60:480"]="  1:256:15:X-MOE-3D:537B:ckpt:1:even:no-planner  2:128:15:X-MOE-3D:537B:ckpt:1:even:no-planner   "
+# PP_BATCH_MAP["60:480"]="   4:64:15:X-MOE-3D:537B:ckpt:1:even:no-planner   "
+
+# PP_BATCH_MAP["12:96"]="  1:256:15:X-MOE-3D:173B:dynamic-ckpt:1:uneven:yes-planner   1:256:15:X-MOE-3D:173B:ckpt:1:uneven:yes-planner-membal   1:256:15:X-MOE-3D:173B:no-ckpt:0:uneven:yes-planner-membal  "
+# PP_BATCH_MAP["12:96"]="  1:256:15:X-MOE-3D:173B:ckpt:1:even:no-planner   2:128:15:X-MOE-3D:173B:ckpt:1:even:no-planner    3:85:15:X-MOE-3D:173B:ckpt:1:even:no-planner  "
+# PP_BATCH_MAP["12:96"]="  4:64:15:X-MOE-3D:173B:ckpt:1:even:no-planner  "
+
+# # # PP_BATCH_MAP["8:64"]="1:20:5:X-MOE-3D:63B_16L:no-ckpt:0:even:no-planner "
+# PP_BATCH_MAP["4:32"]="1:20:5:X-MOE-3D:63B_16L:no-ckpt:0:even:no-planner "
+
+# # === 537B MODEL ===
+
+# ELMoE PP (60 Nodes = 480 GPUs)
+# PP_STRATEGY_MAP["60:480"]="30:8"
+# PP_BATCH_MAP["60:480"]=" 1:256:15:X-MOE-GroupedGEMM-primus:537B:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["30:240"]=" 1:256:15:X-MOE-3D:537B:dynamic-ckpt:1:uneven:yes-planner  1:256:15:X-MOE-GroupedGEMM-primus:537B:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["30:240"]="  1:256:15:X-MOE-GroupedGEMM-triton:537B:dynamic-ckpt:1:uneven:yes-planner "
+
+# # ELMoE PP - Config A (32 Nodes = 256 GPUs)
+# PP_STRATEGY_MAP["32:256"]="8:8"
+# PP_BATCH_MAP["32:256"]=" 1:64:15:X-MOE-3D:173B:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["32:256"]=" 1:128:15:X-MOE-3D:173B:dynamic-ckpt:1:uneven:yes-planner  1:128:15:X-MOE-GroupedGEMM-primus:173B:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["12:96"]=" 1:256:15:X-MOE-3D:173B:dynamic-ckpt:1:uneven:yes-planner  1:256:15:X-MOE-GroupedGEMM-primus:173B:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["12:96"]="  1:256:15:X-MOE-GroupedGEMM-triton:173B:dynamic-ckpt:1:uneven:yes-planner "
+
+# # ELMoE PP (8 Nodes = 64 GPUs)
+# PP_STRATEGY_MAP["8:64"]="4:8"
+# # PP_BATCH_MAP["8:64"]=" 1:256:15:X-MOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["8:64"]=" 1:256:15:X-MOE-GroupedGEMM-primus:63B:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["8:64"]=" 1:64:3:X-MOE-GroupedGEMM-primus:63B:dynamic-ckpt:1:uneven:yes-planner "
+
+# PP_BATCH_MAP["4:32"]=" 1:256:15:X-MOE-GroupedGEMM-triton:63B:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["4:32"]=" 1:256:15:X-MOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner  1:256:15:X-MOE-GroupedGEMM-primus:63B:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["2:16"]=" 1:16:15:X-MOE-3D:63B_8L:no-ckpt:0:even:no-planner   1:16:15:X-MOE-3D:63B_8L:ckpt:1:even:no-planner  "
+# PP_BATCH_MAP["2:16"]=" 1:16:15:X-MOE-3D:173B_4L:no-ckpt:0:even:no-planner   1:16:15:X-MOE-3D:173B_4L:ckpt:1:even:no-planner  "
+# PP_BATCH_MAP["2:16"]=" 1:16:15:X-MOE-3D:1T_2L:no-ckpt:0:even:no-planner   1:16:15:X-MOE-3D:1T_2L:ckpt:1:even:no-planner  "
+# PP_BATCH_MAP["2:16"]=" 1:16:15:X-MOE-3D:63B_8L:ckpt:1:even:no-planner  "
+
+# 03/22: PP depth exp 
+# PP_BATCH_MAP["4:32"]=" 1:32:10:X-MOE-3D:63B_Sparse_16L:no-ckpt:0:even:no-planner  " 
+# PP_BATCH_MAP["6:48"]=" 1:32:10:X-MOE-3D:63B_Sparse_24L:no-ckpt:0:even:no-planner  " 
+# PP_BATCH_MAP["10:80"]=" 1:32:10:X-MOE-3D:63B_Sparse_40L:no-ckpt:0:even:no-planner  " 
+# PP_BATCH_MAP["8:64"]=" 1:32:10:X-MOE-3D:63B_Sparse:no-ckpt:0:even:no-planner   1:32:10:X-MOE-3D:63B_Coarse:no-ckpt:0:even:no-planner   1:32:10:X-MOE-3D:63B_Dense:no-ckpt:0:even:no-planner   " 
+
+# 02/02 Rerun large scale 1T multiple times
+# PP_BATCH_MAP["4:32"]="1:200:3:X-MOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["12:96"]="  1:200:3:X-MOE-3D:173B:dynamic-ckpt:1:uneven:yes-planner  "
+# PP_BATCH_MAP["12:96"]="  1:200:15:X-MOE-3D:173B:ckpt:1:uneven:no-planner  "
+# PP_BATCH_MAP["12:96"]=" 4:200:10:X-MOE-3D:173B:ckpt:1:even:no-planner  "
+# PP_BATCH_MAP["12:96"]=" 1:200:15:X-MOE-3D:173B:no-ckpt:0:uneven:no-planner  "
+# PP_BATCH_MAP["30:240"]="1:200:3:X-MOE-3D:537B:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["30:240"]="1:200:3:X-MOE-3D:537B:ckpt:1:uneven:no-planner "
+# PP_BATCH_MAP["30:240"]="2:140:12:X-MOE-3D:537B:ckpt:1:even:no-planner "
+# PP_BATCH_MAP["60:480"]="1:60:3:X-MOE-3D:1T:dynamic-ckpt:1:uneven:yes-planner"
+# PP_BATCH_MAP["60:480"]="1:200:3:X-MOE-3D:1T:ckpt:1:even:no-planner"
+
+# PP_BATCH_MAP["4:32"]="1:200:3:X-MOE-GroupedGEMM-primus:63B:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["12:96"]=" 1:200:3:X-MOE-GroupedGEMM-primus:173B:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["30:240"]=" 1:200:3:X-MOE-GroupedGEMM-primus:537B:dynamic-ckpt:1:uneven:yes-planner "
+
+# PP_BATCH_MAP["2:16"]=" 1:20:10:X-MOE-3D:10B:no-ckpt:0:even:no-planner " 
+# PP_BATCH_MAP["2:16"]=" 1:20:16:X-MOE-GroupedGEMM-primus:1T_2L:dynamic-ckpt:1:uneven:yes-planner " 
+# PP_BATCH_MAP["60:480"]=" 1:280:8:X-MOE-3D:1T:dynamic-ckpt:1:uneven:yes-planner " #    4089362  
+# PP_BATCH_MAP["60:480"]=" 1:120:3:X-MOE-3D:1T:ckpt:1:even:no-planner " #   
+
+
+# PP_BATCH_MAP["4:32"]="1:96:5:X-MOE-3D:63B:ckpt:1:even:yes-planner "
+# PP_BATCH_MAP["4:32"]="1:100:3:X-MOE-3D:63B_20L:no-ckpt:0:even:no-planner 1:100:3:X-MOE-3D:63B_20L:ckpt:1:even:no-planner "
+# PP_BATCH_MAP["6:48"]="1:100:3:X-MOE-3D:63B_24L:no-ckpt:0:even:no-planner 1:100:3:X-MOE-3D:63B_24L:ckpt:1:even:no-planner "
+# PP_BATCH_MAP["8:64"]="1:100:3:X-MOE-3D:63B:ckpt:1:even:no-planner " #1:100:3:X-MOE-3D:63B:ckpt:1:even:no-planner 
+# PP_BATCH_MAP["10:80"]="1:100:3:X-MOE-3D:63B_30L:no-ckpt:0:even:no-planner 1:100:3:X-MOE-3D:63B_30L:ckpt:1:even:no-planner "
+
+# PP_BATCH_MAP["1:8"]=" 1:24:15:X-MOE-3D:63B_1L:no-ckpt:0:even:no-planner  1:24:15:X-MOE-3D:63B_2L:no-ckpt:0:even:no-planner  1:24:15:X-MOE-3D:63B_4L:no-ckpt:0:even:no-planner " #    
+# PP_BATCH_MAP["1:8"]=" 1:50:15:X-MOE-3D:63B_1L:no-ckpt:0:even:no-planner  1:50:15:X-MOE-3D:63B_2L:no-ckpt:0:even:no-planner  1:50:15:X-MOE-3D:63B_4L:no-ckpt:0:even:no-planner " #    
+
+# PP_BATCH_MAP["1:8"]=" 1:10:50:X-MOE-GroupedGEMM-triton:10B:no-ckpt:0:even:no-planner " #    
+# PP_BATCH_MAP["1:8"]=" 1:10:5:X-MOE-3D:10B:no-ckpt:0:even:no-planner " #    
+
+# PP_BATCH_MAP["8:64"]=" 1:32:10:X-MOE-3D:63B_Sparse:no-ckpt:0:even:no-planner   1:32:10:X-MOE-3D:63B_Coarse:no-ckpt:0:even:no-planner   1:32:10:X-MOE-3D:63B_Dense:no-ckpt:0:even:no-planner   " 
+# PP_BATCH_MAP["8:64"]=" 1:100:25:X-MOE-3D:63B:no-ckpt:0:even:no-planner  1:100:25:X-MOE-GroupedGEMM-triton:63B:no-ckpt:0:even:no-planner  1:100:25:X-MOE-GroupedGEMM-primus:63B:no-ckpt:0:even:no-planner " 
+
+# PP_BATCH_MAP["8:64"]=" 1:24:3:X-MOE-3D:63B:no-ckpt:0:even:no-planner  1:24:3:X-MOE-GroupedGEMM-triton:63B:no-ckpt:0:even:no-planner  1:24:3:X-MOE-GroupedGEMM-primus:63B:no-ckpt:0:even:no-planner " 
+# PP_BATCH_MAP["8:64"]=" 1:24:3:X-MOE-3D:63B:no-ckpt:0:even:no-planner " # " 1:100:5:DS-MOE-3D:63B:ckpt:1:even:no-planner " #    
+# PP_BATCH_MAP["1:8"]="   1:50:25:X-MOE-3D:63B_4L:no-ckpt:0:even:no-planner "
+# PP_BATCH_MAP["1:8"]="  1:50:25:X-MOE-GroupedGEMM-triton:63B_4L:no-ckpt:0:even:no-planner " #    # 
+# PP_BATCH_MAP["8:64"]="  1:24:3:X-MOE-GroupedGEMM-triton:63B:no-ckpt:0:even:no-planner " #    
+# PP_BATCH_MAP["8:64"]=" 1:24:3:X-MOE-GroupedGEMM-primus:63B:no-ckpt:0:even:no-planner " #    
+
+# PP_BATCH_MAP["8:64"]=" 1:10:5:X-MOE-GroupedGEMM-primus:63B:no-ckpt:0:even:no-planner " #    
+# PP_BATCH_MAP["1:8"]=" 1:10:7:X-MOE-GroupedGEMM-primus:10B:no-ckpt:0:even:no-planner " #    
+# PP_BATCH_MAP["2:16"]=" 2:10:5:X-MOE-3D:10B:no-ckpt:0:even:no-planner " #    
+
+# PP_BATCH_MAP["2:16"]="1:20:15:X-MOE-GroupedGEMM-primus:173B_2L:no-ckpt:0 "
+# PP_BATCH_MAP["4:32"]="1:100:15:X-MOE-GroupedGEMM-primus:173B_4L:no-ckpt:0   1:100:15:X-MOE-GroupedGEMM-primus:537B_4L:no-ckpt:0  2:100:15:X-MOE-GroupedGEMM-primus:173B_4L:no-ckpt:0   2:100:15:X-MOE-GroupedGEMM-primus:537B_4L:no-ckpt:0  4:100:15:X-MOE-GroupedGEMM-primus:173B_4L:no-ckpt:0   4:100:15:X-MOE-GroupedGEMM-primus:537B_4L:no-ckpt:0  "
+# PP_BATCH_MAP["4:32"]="1:100:15:X-MOE:173B_4L:no-ckpt:0   1:100:15:X-MOE:537B_4L:no-ckpt:0  2:100:15:X-MOE:173B_4L:no-ckpt:0   2:100:15:X-MOE:537B_4L:no-ckpt:0  4:100:15:X-MOE:173B_4L:no-ckpt:0   4:100:15:X-MOE:537B_4L:no-ckpt:0  "
+
+# PP_BATCH_MAP["1:8"]="8:200:20:X-MOE-3D:10B:no-ckpt:1:even:no-planner 7:200:20:X-MOE-3D:10B:no-ckpt:1:even:no-planner 6:200:20:X-MOE-3D:10B:no-ckpt:1:even:no-planner 5:200:20:X-MOE-3D:10B:no-ckpt:1:even:no-planner  4:200:20:X-MOE-3D:10B:no-ckpt:1:even:no-planner "
+# PP_BATCH_MAP["2:16"]="2:100:20:X-MOE-3D:10B:no-ckpt:1:even:no-planner 4:100:20:X-MOE-3D:10B:no-ckpt:1:even:no-planner "
+# PP_BATCH_MAP["1:8"]=" 1:4:5:X-MOE-3D:10B_4L:no-ckpt:1:even:no-planner "
+# PP_BATCH_MAP["1:8"]=" 4:20:20:X-MOE-GroupedGEMM-primus:10B:no-ckpt:1:even:no-planner "
+# PP_BATCH_MAP["2:16"]=" 4:20:20:X-MOE-GroupedGEMM-primus:10B:no-ckpt:1:even:no-planner  4:20:20:X-MOE-3D:10B:no-ckpt:1:even:no-planner "
+
+# PP_BATCH_MAP["1:4"]="1:100:20:X-MOE-3D:10B:no-ckpt:1:even:no-planner 2:100:20:X-MOE-3D:10B:no-ckpt:1:even:no-planner 4:100:20:X-MOE-3D:10B:no-ckpt:1:even:no-planner 6:100:20:X-MOE-3D:10B:no-ckpt:1:even:no-planner 8:100:20:X-MOE-3D:10B:no-ckpt:1:even:no-planner 10:100:20:X-MOE-3D:10B:no-ckpt:1:even:no-planner"
+# PP_BATCH_MAP["1:8"]="1:10:10:X-MOE-3D:10B:dynamic-ckpt:1:uneven:yes-planner"
+# PP_BATCH_MAP["1:4"]="1:100:20:X-MOE-3D:10B:ckpt:1:even:no-planner"
+# PP_BATCH_MAP["1:2"]="1:100:20:X-MOE-3D:10B:ckpt:1:even:no-planner"
+
+# PP_BATCH_MAP["1:8"]="1:10:20:X-MOE-3D:10B:no-ckpt:1:even:no-planner"
+# PP_BATCH_MAP["60:480"]="1:1920:14:X-MOE-3D:537B:ckpt:1 1:1920:14:X-MOE-3D:537B:dynamic-ckpt:1  "
+# PP_BATCH_MAP["4:32"]="1:96:3:X-MOE-3D:50B:ckpt:1:even 1:96:3:X-MOE-3D:50B:dynamic-ckpt:1:uneven 1:96:3:X-MOE-3D:50B:dynamic-ckpt:1:even"
+# PP_BATCH_MAP["1:8"]="1:960:20:X-MOE-3D:10B:ckpt:1:uneven 1:960:20:X-MOE-3D:10B:dynamic-ckpt:1:even 1:960:20:X-MOE-3D:10B:dynamic-ckpt:1:uneven 1:960:20:X-MOE-3D:10B:ckpt:1:even 1:960:20:X-MOE-3D:10B:no-ckpt:1:even "
+# PP_BATCH_MAP["4:32"]="1:960:20:X-MOE-3D:50B:ckpt:1:uneven 1:960:20:X-MOE-3D:50B:dynamic-ckpt:1:even 1:960:20:X-MOE-3D:50B:dynamic-ckpt:1:uneven 1:960:20:X-MOE-3D:50B:ckpt:1:even 1:960:20:X-MOE-3D:50B:no-ckpt:1:even "
+
+# PP_BATCH_MAP["30:240"]="1:200:16:X-MOE-3D:537B:ckpt:1:even:no-planner 1:200:16:X-MOE-3D:537B:dynamic-ckpt:1:uneven:yes-planner"
+# PP_BATCH_MAP["30:240"]="1:200:14:X-MOE-3D:537B:dynamic-ckpt:1:uneven:yes-planner"
+# PP_BATCH_MAP["40:320"]="1:100:16:X-MOE-3D:537B:dynamic-ckpt:1:uneven:yes-planner"
+# PP_BATCH_MAP["60:480"]="1:200:15:X-MOE-3D:537B:ckpt:1:even:no-planner 1:230:16:X-MOE-3D:1T:ckpt:1:even:no-planner"
+# PP_BATCH_MAP["60:480"]="1:230:16:X-MOE-3D:1T:ckpt:1:even:no-planner 1:230:16:X-MOE-3D:1T:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["60:480"]="1:400:16:X-MOE-3D:1T:dynamic-ckpt:1:uneven:yes-planner " # 01/16/2026 rerun for 2h with increase gbs
+# PP_BATCH_MAP["1:8"]="2:4:4:X-MOE-3D:10B:dynamic-ckpt:1:uneven:yes-planner"
+# PP_BATCH_MAP["1:8"]="2:4:4:X-MOE-3D:10B:dynamic-ckpt:1:uneven:no-planner"
+# PP_BATCH_MAP["4:32"]="4:20:10:X-MOE-3D:10B:ckpt:1:even:no-planner"
+# PP_BATCH_MAP["4:32"]="4:20:10:X-MOE-GroupedGEMM-triton:63B:ckpt:1:even:no-planner"
+
+# PP_BATCH_MAP["4:32"]="5:200:20:X-MOE-3D:10B:no-ckpt:0:even:no-planner 6:200:20:X-MOE-3D:10B:no-ckpt:0:even:no-planner 7:200:20:X-MOE-3D:10B:no-ckpt:0:even:no-planner 8:200:20:X-MOE-3D:10B:no-ckpt:0:even:no-planner 9:200:20:X-MOE-3D:10B:no-ckpt:0:even:no-planner 10:200:20:X-MOE-3D:10B:no-ckpt:0:even:no-planner  "
+# PP_BATCH_MAP["4:32"]="1:200:20:X-MOE-3D:10B:yes-ckpt:1:uneven:yes-planner   "
+# PP_BATCH_MAP["4:32"]="1:200:30:X-MOE-3D:63B:yes-ckpt:1:even:no-planner 1:200:30:X-MOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner " # 01/16/2026 rerun
+# PP_BATCH_MAP["4:32"]="1:200:22:X-MOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner " # 01/16/2026 rerun
+# PP_BATCH_MAP["16:128"]="1:200:20:X-MOE-3D:173B:yes-ckpt:1:even:no-planner 1:200:20:X-MOE-3D:173B:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["12:96"]="1:200:20:X-MOE-3D:173B:yes-ckpt:1:even:no-planner"
+# PP_BATCH_MAP["12:96"]="1:200:20:X-MOE-3D:173B:dynamic-ckpt:1:uneven:yes-planner "
 
 # 01/17/2026 strong scaling (fix optimal mbs while varying nms to control fixed gbs)
-# PP_BATCH_MAP["4:32"]="1:800:10:X-MOE:63B:dynamic-ckpt:1:uneven:yes-planner  " 
-# PP_BATCH_MAP["8:64"]="1:400:10:X-MOE:63B:dynamic-ckpt:1:uneven:yes-planner " 
-# PP_BATCH_MAP["16:128"]="1:200:10:X-MOE:63B:dynamic-ckpt:1:uneven:yes-planner " 
-# PP_BATCH_MAP["24:192"]="1:133:10:X-MOE:63B:dynamic-ckpt:1:uneven:yes-planner " 
-# PP_BATCH_MAP["32:256"]="1:100:10:X-MOE:63B:dynamic-ckpt:1:uneven:yes-planner " 
+# PP_BATCH_MAP["4:32"]="1:800:10:X-MOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner  " 
+# PP_BATCH_MAP["8:64"]="1:400:10:X-MOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner " 
+# PP_BATCH_MAP["16:128"]="1:200:10:X-MOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner " 
+# PP_BATCH_MAP["24:192"]="1:133:10:X-MOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner " 
+# PP_BATCH_MAP["32:256"]="1:100:10:X-MOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner " 
+# 02/03/2026 rerun strong scaling to 2k gpus
+# PP_BATCH_MAP["36:288"]=" 1:800:8:X-MOE-3D:173B:dynamic-ckpt:1:uneven:yes-planner" 
+# PP_BATCH_MAP["72:576"]=" 1:400:10:X-MOE-3D:173B:dynamic-ckpt:1:uneven:yes-planner"  
+# PP_BATCH_MAP["144:1152"]=" 1:200:13:X-MOE-3D:173B:dynamic-ckpt:1:uneven:yes-planner" 
+# PP_BATCH_MAP["288:2304"]=" 1:100:20:X-MOE-3D:173B:dynamic-ckpt:1:uneven:yes-planner" 
 
-# PP_BATCH_MAP["16:128"]="1:1200:7:X-MOE:63B:dynamic-ckpt:1:uneven:yes-planner " 
-# PP_BATCH_MAP["32:256"]="1:600:7:X-MOE:63B:dynamic-ckpt:1:uneven:yes-planner " 
-# PP_BATCH_MAP["64:512"]="1:300:7:X-MOE:63B:dynamic-ckpt:1:uneven:yes-planner " 
-# PP_BATCH_MAP["128:1024"]="1:150:7:X-MOE:63B:dynamic-ckpt:1:uneven:yes-planner " 
+
+# PP_BATCH_MAP["16:128"]="1:1200:7:X-MOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner " 
+# PP_BATCH_MAP["32:256"]="1:600:7:X-MOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner " 
+# PP_BATCH_MAP["64:512"]="1:300:7:X-MOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner " 
+# PP_BATCH_MAP["128:1024"]="1:150:7:X-MOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner " 
 
 # # 01/17/2026 weak scaling (fix optimal mbs while scaling nms to scale gbs)
-# PP_BATCH_MAP["4:32"]="1:100:10:X-MOE:63B:dynamic-ckpt:1:uneven:yes-planner  " 
-# PP_BATCH_MAP["8:64"]="1:100:10:X-MOE:63B:dynamic-ckpt:1:uneven:yes-planner " 
-# PP_BATCH_MAP["16:128"]="1:100:10:X-MOE:63B:dynamic-ckpt:1:uneven:yes-planner " 
-# PP_BATCH_MAP["24:192"]="1:100:10:X-MOE:63B:dynamic-ckpt:1:uneven:yes-planner " 
-# PP_BATCH_MAP["32:256"]="1:100:10:X-MOE:63B:dynamic-ckpt:1:uneven:yes-planner " 
+# PP_BATCH_MAP["4:32"]="1:100:10:X-MOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner  " 
+# PP_BATCH_MAP["8:64"]="1:100:10:X-MOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner " 
+# PP_BATCH_MAP["16:128"]="1:100:10:X-MOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner " 
+# PP_BATCH_MAP["24:192"]="1:100:10:X-MOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner " 
+# PP_BATCH_MAP["32:256"]="1:100:10:X-MOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner " 
+
+# 02/03/2026 rerun weak scaling to 2k gpus
+# # PP_BATCH_MAP["12:96"]=" 1:200:20:X-MOE-3D:173B:dynamic-ckpt:1:uneven:yes-planner" # 4089365.o suceeds
+# PP_BATCH_MAP["36:288"]=" 1:200:20:X-MOE-3D:173B:dynamic-ckpt:1:uneven:yes-planner" 
+# PP_BATCH_MAP["72:576"]=" 1:200:20:X-MOE-3D:173B:dynamic-ckpt:1:uneven:yes-planner"  # 4089370.o error memory logger
+# PP_BATCH_MAP["144:1152"]=" 1:200:20:X-MOE-3D:173B:dynamic-ckpt:1:uneven:yes-planner" # 4089369.o half-way-through error memory logger out of quota
+# PP_BATCH_MAP["288:2304"]=" 1:200:20:X-MOE-3D:173B:dynamic-ckpt:1:uneven:yes-planner" 
 
 
 # #5 pp+act_ckpt on tflops, mem, mbs (#6 too)
-# PP_BATCH_MAP["8:64"]="1:50:10:X-MOE:63B:ckpt:1:even:no-planner 2:50:10:X-MOE:63B:ckpt:1:even:no-planner 4:50:10:X-MOE:63B:ckpt:1:even:no-planner 6:50:10:X-MOE:63B:ckpt:1:even:no-planner 8:50:10:X-MOE:63B:ckpt:1:even:no-planner        1:50:10:X-MOE:63B:no-ckpt:0:even:no-planner 2:50:10:X-MOE:63B:no-ckpt:0:even:no-planner 4:50:10:X-MOE:63B:no-ckpt:0:even:no-planner" 
-# PP_BATCH_MAP["8:64"]=" 2:50:12:X-MOE:63B:ckpt:1:even:no-planner " 
-# PP_BATCH_MAP["8:64"]=" 4:50:12:X-MOE:63B:ckpt:1:even:no-planner " 
+# PP_BATCH_MAP["8:64"]="1:50:10:X-MOE-3D:63B:ckpt:1:even:no-planner 2:50:10:X-MOE-3D:63B:ckpt:1:even:no-planner 4:50:10:X-MOE-3D:63B:ckpt:1:even:no-planner 6:50:10:X-MOE-3D:63B:ckpt:1:even:no-planner 8:50:10:X-MOE-3D:63B:ckpt:1:even:no-planner        1:50:10:X-MOE-3D:63B:no-ckpt:0:even:no-planner 2:50:10:X-MOE-3D:63B:no-ckpt:0:even:no-planner 4:50:10:X-MOE-3D:63B:no-ckpt:0:even:no-planner" 
+# PP_BATCH_MAP["8:64"]=" 2:50:12:X-MOE-3D:63B:ckpt:1:even:no-planner " 
+# PP_BATCH_MAP["8:64"]=" 4:50:12:X-MOE-3D:63B:ckpt:1:even:no-planner " 
+# 02/01: recompute fig-4 PP8-EP8 ckpt mbs6 8
+# PP_BATCH_MAP["8:64"]=" 6:50:12:X-MOE-3D:63B:ckpt:1:even:no-planner  8:50:12:X-MOE-3D:63B:ckpt:1:even:no-planner " 
 
-# PP_BATCH_MAP["4:32"]=" 1:200:15:X-MOE:63B:dynamic-ckpt:1:uneven:yes-planner " 
+# 01/29: groupgemm for 63B, 173B, 537, 1T
+# PP_BATCH_MAP["4:32"]="  1:230:18:X-MOE-GroupedGEMM-primus:63B:dynamic-ckpt:1:uneven:yes-planner  " 
+# PP_BATCH_MAP["12:96"]="  1:230:20:X-MOE-GroupedGEMM-primus:173B:dynamic-ckpt:1:uneven:yes-planner " 
+# PP_BATCH_MAP["30:240"]=" 1:230:16:X-MOE-GroupedGEMM-primus:537B:dynamic-ckpt:1:uneven:yes-planner " 
+
+# PP_BATCH_MAP["4:32"]=" 1:200:18:X-MOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner  1:200:18:X-MOE-GroupedGEMM-primus:63B:dynamic-ckpt:1:uneven:yes-planner  2:200:17:X-MOE-3D:63B:ckpt:1:even:no-planner  2:200:17:X-MOE-GroupedGEMM-primus:63B:ckpt:1:even:no-planner " 
+# PP_BATCH_MAP["12:96"]=" 1:200:20:X-MOE-3D:173B:dynamic-ckpt:1:uneven:yes-planner  1:200:20:X-MOE-GroupedGEMM-primus:173B:dynamic-ckpt:1:uneven:yes-planner " 
+# PP_BATCH_MAP["30:240"]=" 1:200:16:X-MOE-3D:537B:dynamic-ckpt:1:uneven:yes-planner  1:200:16:X-MOE-GroupedGEMM-primus:537B:dynamic-ckpt:1:uneven:yes-planner  1:200:16:X-MOE-GroupedGEMM-primus:537B:ckpt:1:even:no-planner " 
+# PP_BATCH_MAP["60:480"]=" 1:200:16:X-MOE-3D:1T:dynamic-ckpt:1:uneven:yes-planner  1:200:16:X-MOE-GroupedGEMM-primus:1T:dynamic-ckpt:1:uneven:yes-planner  1:200:16:X-MOE-GroupedGEMM-primus:1T:ckpt:1:even:no-planner " 
+
+# 01/30: groupgemm after dyna memory hard-coded for groupgemm
+# PP_BATCH_MAP["4:32"]=" 1:200:18:X-MOE-GroupedGEMM-primus:63B:dynamic-ckpt:1:uneven:yes-planner " 
+# PP_BATCH_MAP["60:480"]=" 1:200:16:X-MOE-GroupedGEMM-primus:1T:dynamic-ckpt:1:uneven:yes-planner  " 
+# PP_BATCH_MAP["60:480"]=" 1:120:2:X-MOE-GroupedGEMM-triton:1T:dynamic-ckpt:1:uneven:yes-planner   1:120:2:X-MOE-GroupedGEMM-triton:1T:ckpt:1:even:no-planner  1:120:2:X-MOE-3D:1T:ckpt:1:even:no-planner  " 
+
+
 # #8 dynamic checkpointing
-# PP_BATCH_MAP["4:32"]=" 1:100:15:X-MOE:63B:ckpt:1:even:no-planner " 
-# PP_BATCH_MAP["4:32"]=" 4:100:12:X-MOE:63B:ckpt:1:even:no-planner " 
-# PP_BATCH_MAP["4:32"]=" 2:100:15:X-MOE:63B:ckpt:1:even:no-planner " 
+# PP_BATCH_MAP["4:32"]=" 1:100:15:X-MOE-3D:63B:ckpt:1:even:no-planner " 
+# PP_BATCH_MAP["4:32"]=" 4:100:12:X-MOE-3D:63B:ckpt:1:even:no-planner " 
+# PP_BATCH_MAP["4:32"]=" 2:100:15:X-MOE-3D:63B:ckpt:1:even:no-planner " 
 
-# PP_BATCH_MAP["4:32"]="1:100:20:X-MOE:63B:dynamic-ckpt:1:uneven:yes-planner  " 
-# PP_BATCH_MAP["8:64"]="1:200:20:X-MOE:63B:dynamic-ckpt:1:uneven:yes-planner " 
-# PP_BATCH_MAP["16:128"]="1:400:20:X-MOE:63B:dynamic-ckpt:1:uneven:yes-planner " 
-# PP_BATCH_MAP["32:256"]="1:800:20:X-MOE:63B:dynamic-ckpt:1:uneven:yes-planner " 
+# PP_BATCH_MAP["4:32"]="1:100:20:X-MOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner  " 
+# PP_BATCH_MAP["8:64"]="1:200:20:X-MOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner " 
+# PP_BATCH_MAP["16:128"]="1:400:20:X-MOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner " 
+# PP_BATCH_MAP["32:256"]="1:800:20:X-MOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner " 
 
-# "1:96:5:X-MOE:50B:ckpt:1:even:no-planner"
-# "1:96:5:X-MOE:50B:ckpt:1:even:planner-small"
-# "1:96:5:X-MOE:50B:ckpt:1:even:planner-medium"
-# "1:96:5:X-MOE:50B:ckpt:1:even:planner-large"
+# "1:96:5:X-MOE-3D:50B:ckpt:1:even:no-planner"
+# "1:96:5:X-MOE-3D:50B:ckpt:1:even:planner-small"
+# "1:96:5:X-MOE-3D:50B:ckpt:1:even:planner-medium"
+# "1:96:5:X-MOE-3D:50B:ckpt:1:even:planner-large"
 
 # check planner throughput 
-# PP_BATCH_MAP["4:32"]="   4:1280:14:X-MOE:63B:ckpt:1:even   3:960:16:X-MOE:63B:ckpt:1:even     "
-# PP_BATCH_MAP["4:32"]="  1:720:20:X-MOE:63B:dynamic-ckpt:1:uneven   1:720:20:X-MOE:63B:ckpt:1:even  2:1440:13:X-MOE:63B:ckpt:1:even "
-# PP_BATCH_MAP["4:32"]="7:1120:20:X-MOE:50B:ckpt:1:uneven 8:1280:20:X-MOE:50B:ckpt:1:uneven 6:960:20:X-MOE:50B:ckpt:1:even"
-# PP_BATCH_MAP["4:32"]="1:100:15:X-MOE:63B:dynamic-ckpt:1:uneven:yes-planner "
-# PP_BATCH_MAP["4:32"]="1:100:15:X-MOE:63B:dynamic-ckpt:1:even:no-planner "
+# PP_BATCH_MAP["4:32"]="   4:1280:14:X-MOE-3D:63B:ckpt:1:even   3:960:16:X-MOE-3D:63B:ckpt:1:even     "
+# PP_BATCH_MAP["4:32"]="  1:720:20:X-MOE-3D:63B:dynamic-ckpt:1:uneven   1:720:20:X-MOE-3D:63B:ckpt:1:even  2:1440:13:X-MOE-3D:63B:ckpt:1:even "
+# PP_BATCH_MAP["4:32"]="7:1120:20:X-MOE-3D:50B:ckpt:1:uneven 8:1280:20:X-MOE-3D:50B:ckpt:1:uneven 6:960:20:X-MOE-3D:50B:ckpt:1:even"
+# PP_BATCH_MAP["4:32"]="1:100:15:X-MOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["4:32"]="1:100:15:X-MOE-3D:63B:dynamic-ckpt:1:even:no-planner "
 
-# PP_BATCH_MAP["1:8"]="1:96:3:X-MOE:10B:dynamic-ckpt:1:uneven"
-# PP_BATCH_MAP["1:4"]="1:8:2:X-MOE:10B:ckpt:1"
+# PP_BATCH_MAP["1:8"]="1:8:5:X-MOE-3D:10B:ckpt:1:even"
+# PP_BATCH_MAP["1:4"]="1:8:2:X-MOE-3D:10B:ckpt:1"
 
-# PP_BATCH_MAP["4:32"]="1:1152:20:X-MOE:50B:no-ckpt"
+# PP_BATCH_MAP["4:32"]="1:1152:20:X-MOE-3D:50B:no-ckpt"
 
 
 
@@ -135,7 +308,121 @@ PP_BATCH_MAP["1:8"]=" 4:20:20:X-MOE:10B:no-ckpt:1:even:no-planner "
 # KEY: NODE:TOTAL_GPU
 # VALUE="BS:NBS:TRAIN_ITERS:MOE_TYPE:MODEL_SIZE"
 declare -A EP_BATCH_MAP
-# EP_BATCH_MAP["1:8:1"]="4:30:20:X-MOE:10B:no-ckpt:0 5:30:20:X-MOE:10B:no-ckpt:0 "
+
+# EP_BATCH_MAP["1:8:1"]=" 1:6:15:X-MOE-GroupedGEMM-triton:1T_1L:no-ckpt:0:1  "
+# EP_BATCH_MAP["1:8:1"]=" 1:6:50:X-MOE-GroupedGEMM-triton:10B:no-ckpt:0:1   "
+# EP_BATCH_MAP["1:8:1"]=" 1:6:50:X-MOE:10B:no-ckpt:0:1  "
+
+
+# 1T variance test:
+# EP_BATCH_MAP["128:256:4"]=" 1:7:15:X-MOE:1T:ckpt:1:1 "
+# EP_BATCH_MAP["128:256:4"]=" 1:7:15:X-MOE:1T:ckpt:1:1 "
+
+
+# # 03/20 Large run 
+# # EP_BATCH_MAP["64:128:4"]=" 1:5:3:X-MOE:537B:ckpt:1:2  " #   4089363  
+# # EP_BATCH_MAP["64:128:4"]=" 1:13:15:X-MOE:537B:ckpt:1:2  " #   4089363  
+# # === 1T MODEL ===
+# Baseline EP (128 Nodes = 1024 GPUs). ZERO=1.
+# EP_BATCH_MAP["128:256:4"]=" 1:16:3:X-MOE:1T:no-ckpt:0:1 "
+# EP_BATCH_MAP["128:512:2"]=" 1:16:15:X-MOE:1T:ckpt:1:1  1:16:15:X-MOE:1T:ckpt:1:1 "
+# EP_BATCH_MAP["128:256:4"]=" 1:16:15:X-MOE:1T:ckpt:1:1  1:16:15:X-MOE:1T:ckpt:1:1 "
+# EP_BATCH_MAP["128:128:8"]=" 1:16:3:X-MOE:1T:no-ckpt:0:1  1:16:3:X-MOE:1T:ckpt:1:1 "
+
+
+# EP_BATCH_MAP["128:512:8"]=" 1:32:15:X-MOE:1T:ckpt:1:1  1:32:15:X-MOE:1T:ckpt:1:1  1:32:15:X-MOE:1T:ckpt:1:1  1:32:15:X-MOE:1T:ckpt:1:1 "
+# EP_BATCH_MAP["128:512:8"]=" 1:32:15:X-MOE:1T:ckpt:1:1  "
+# EP_BATCH_MAP["128:512:4"]=" 1:16:15:X-MOE:1T:ckpt:1:1  "
+# EP_BATCH_MAP["128:512:2"]=" 1:8:15:X-MOE:1T:ckpt:1:1  "
+
+# EP_BATCH_MAP["128:256:8"]=" 1:32:15:X-MOE:1T:ckpt:1:1  "
+# EP_BATCH_MAP["128:256:4"]=" 1:16:15:X-MOE:1T:ckpt:1:1  "
+# EP_BATCH_MAP["128:256:2"]=" 1:8:15:X-MOE:1T:ckpt:1:1  "
+
+# EP_BATCH_MAP["64:512:512"]=" 1:4:3:X-MOE:1T:ckpt:1:1 "
+# EP_BATCH_MAP["64:256:4"]=" 1:4:3:X-MOE:1T:ckpt:1:1 "
+
+# === 537B MODEL ===
+# Baseline EP (64 Nodes = 512 GPUs). ZERO=2, NO Checkpointing (per your notes)
+# EP_BATCH_MAP["64:128:4"]=" 1:32:15:X-MOE:537B:ckpt:1:1 "
+# EP_BATCH_MAP["64:128:4"]=" 1:3:13:X-MOE:537B:ckpt:1:1 "
+# EP_BATCH_MAP["64:128:4"]=" 2:16:13:X-MOE:537B:ckpt:1:2 "
+
+# === 173B MODEL ===
+# Baseline EP (32 Nodes = 256 GPUs). ZERO=1
+# EP_BATCH_MAP["32:128:2"]=" 1:32:15:X-MOE:173B:no-ckpt:0:1 " # 1:32:15:X-MOE:173B:no-ckpt:0:2 " # zero-2-no-ckpt hangs
+# EP_BATCH_MAP["32:128:2"]=" 1:32:13:DS-MOE:173B:ckpt:1:1  1:32:13:TUTEL-MOE:173B:ckpt:1:1  1:32:13:TED-MOE:173B:ckpt:1:1 "
+
+# === 63B MODEL ===
+# Baseline EP (8 Nodes = 64 GPUs). ZERO=1
+# EP_BATCH_MAP["8:64:4"]="  1:4:5:X-MOE:63B:no-ckpt:0:1 "
+# EP_BATCH_MAP["8:64:1"]=" 1:64:15:DS-MOE:63B:no-ckpt:0:1  1:64:15:TUTEL-MOE:63B:ckpt:1:1  1:64:15:TED-MOE:63B:ckpt:1:1 " # 1:64:15:X-MOE:63B:ckpt:1:1 "
+
+# EP_BATCH_MAP["8:64:1"]="  1:3:4:X-MOE:63B:ckpt:1:1 "
+# 01/23/2026: Baseline runs 
+# EP_BATCH_MAP["8:64:1"]="  1:3:4:DS-MOE:63B:ckpt:1:1 " # 01/22/2026 63B DS-MoE rerun
+# EP_BATCH_MAP["8:64:2"]="  1:3:4:TUTEL-MOE:63B:no-ckpt:0:1 " # 01/23/2026 63B DS-MoE rerun
+# EP_BATCH_MAP["8:32:2"]="  1:3:4:TED-MOE:63B:ckpt:1:1 "
+
+# EP_BATCH_MAP["32:128:1"]=" 1:20:13:DS-MOE:173B:ckpt:1:1 " # 01/22/2026 63B DS-MoE rerun
+# EP_BATCH_MAP["32:128:2"]="  1:20:13:TED-MOE:173B:ckpt:1:1    1:20:13:TUTEL-MOE:173B:ckpt:1:1 " # 01/23/2026 63B DS-MoE rerun
+# EP_BATCH_MAP["32:128:2"]="  1:20:13:TED-MOE:173B:ckpt:1 "
+
+# EP_BATCH_MAP["64:256:1"]=" 1:5:2:DS-MOE:537B:ckpt:1 " # 01/22/2026 63B DS-MoE rerun
+# EP_BATCH_MAP["64:256:2"]="  1:5:2:TED-MOE:537B:ckpt:1   1:5:2:TUTEL-MOE:537B:ckpt:1 " # 01/23/2026 63B DS-MoE rerun
+
+
+
+
+# EP_BATCH_MAP["1:4:1"]=" 1:3:5:X-MOE:10B:no-ckpt:0 " #   4089363  
+# EP_BATCH_MAP["1:4:1"]=" 1:5:5:X-MOE-GroupedGEMM-primus:10B:no-ckpt:0 " #   4089363  
+# EP_BATCH_MAP["1:8:1"]=" 1:3:5:X-MOE-GroupedGEMM-primus:537B_2L:no-ckpt:0 " 
+# EP_BATCH_MAP["1:8:1"]=" 1:3:5:X-MOE:537B_2L:no-ckpt:0 " #   4089363  
+# EP_BATCH_MAP["1:8:1"]="  1:20:30:X-MOE-GroupedGEMM-triton:173B_2L:no-ckpt:0 " #   4089363  
+# EP_BATCH_MAP["1:8:1"]=" 1:20:30:X-MOE:537B_2L:no-ckpt:0       1:20:30:X-MOE:1T_1L:no-ckpt:0      1:20:30:X-MOE:173B_2L:no-ckpt:0    1:20:30:X-MOE:63B_8L:no-ckpt:0  "
+# EP_BATCH_MAP["1:8:1"]=" 1:20:30:X-MOE:537B_2L:no-ckpt:0  1:20:30:X-MOE-GroupedGEMM-primus:537B_2L:no-ckpt:0       1:20:30:X-MOE:1T_1L:no-ckpt:0  1:20:30:X-MOE-GroupedGEMM-primus:1T_1L:no-ckpt:0     1:20:30:X-MOE:173B_2L:no-ckpt:0   1:20:30:X-MOE-GroupedGEMM-primus:173B_2L:no-ckpt:0  1:20:30:X-MOE:63B_8L:no-ckpt:0  1:20:30:X-MOE-GroupedGEMM-primus:63B_8L:no-ckpt:0  "
+# EP_BATCH_MAP["1:8:1"]="  1:20:30:X-MOE-GroupedGEMM-triton:537B_2L:no-ckpt:0   1:20:30:X-MOE-GroupedGEMM-triton:1T_1L:no-ckpt:0    1:20:30:X-MOE-GroupedGEMM-triton:173B_2L:no-ckpt:0   1:20:30:X-MOE-GroupedGEMM-triton:63B_8L:no-ckpt:0  "
+# EP_BATCH_MAP["1:8:1"]=" 1:20:30:X-MOE:63B_8L:no-ckpt:0  1:20:30:X-MOE-GroupedGEMM-primus:63B_8L:no-ckpt:0  1:20:30:X-MOE-GroupedGEMM-triton:63B_8L:no-ckpt:0    "
+
+
+# EP_BATCH_MAP["1:8:1"]=" 1:20:30:X-MOE:537B_2L:no-ckpt:0  1:20:30:X-MOE-GroupedGEMM-primus:537B_2L:no-ckpt:0        1:20:30:X-MOE:1T_1L:no-ckpt:0  1:20:30:X-MOE-GroupedGEMM-primus:1T_1L:no-ckpt:0      1:20:30:X-MOE:173B_2L:no-ckpt:0   1:20:30:X-MOE-GroupedGEMM-primus:173B_2L:no-ckpt:0    1:20:30:X-MOE:63B_8L:no-ckpt:0  1:20:30:X-MOE-GroupedGEMM-primus:63B_8L:no-ckpt:0 "
+
+
+# EP_BATCH_MAP["1:4:1"]=" 1:5:5:X-MOE-GroupedGEMM-primus:10B:no-ckpt:0 " #   4089363  
+
+# EP_BATCH_MAP["1:8:1"]=" 1:20:15:X-MOE-GroupedGEMM-primus:63B_4L:no-ckpt:0 "
+# EP_BATCH_MAP["1:8:1"]=" 1:20:15:X-MOE-GroupedGEMM-triton:63B_4L:no-ckpt:0 "
+# EP_BATCH_MAP["1:8:1"]=" 1:20:15:X-MOE:63B_4L:no-ckpt:0 "
+# EP_BATCH_MAP["1:8:1"]=" 1:50:25:X-MOE:63B_4L:no-ckpt:0  1:50:25:X-MOE-GroupedGEMM-triton:63B_4L:no-ckpt:0 1:50:25:X-MOE-GroupedGEMM-primus:63B_4L:no-ckpt:0 "
+# EP_BATCH_MAP["1:8:1"]=" 1:10:3:X-MOE:63B_4L:no-ckpt:0  1:10:3:X-MOE-GroupedGEMM-triton:63B_4L:no-ckpt:0 1:10:3:X-MOE-GroupedGEMM-primus:63B_4L:no-ckpt:0 "
+
+# EP_BATCH_MAP["1:8:1"]="1:50:10:X-MOE:63B_1L:no-ckpt:0 1:50:10:X-MOE:63B_2L:no-ckpt:0 1:16:10:X-MOE:63B_1L:no-ckpt:0 1:16:10:X-MOE:63B_2L:no-ckpt:0 "
+
+# Loss validation:
+# EP_BATCH_MAP["2:16:1"]=" 1:5:5:X-MOE:10B_4L:no-ckpt:0 " #   4089363  
+# EP_BATCH_MAP["1:8:1"]="1:3:50:X-MOE:1.5T_1L:no-ckpt:0 "
+
+# # EP_BATCH_MAP["1:8:1"]="1:384:60:X-MOE:1.5T_1L:no-ckpt:0 1:384:60:X-MOE:1.5T_1L:no-ckpt:0 1:384:60:X-MOE:1.5T_1L:no-ckpt:0 1:384:60:X-MOE:1.5T_1L:no-ckpt:0"
+# # EP_BATCH_MAP["8:64:1"]=" 1:3:60:X-MOE:1.5T_1L:no-ckpt:0 1:3:60:X-MOE:1.5T_1L:no-ckpt:0 1:3:60:X-MOE:1.5T_1L:no-ckpt:0 1:3:60:X-MOE:1.5T_1L:no-ckpt:0"
+
+# EP_BATCH_MAP["2:16:1"]=" 1:3:50:X-MOE:1.5T_1L:no-ckpt:0  1:3:50:X-MOE:1.5T_1L:no-ckpt:0  1:3:50:X-MOE:1.5T_1L:no-ckpt:0 "
+# EP_BATCH_MAP["4:32:1"]=" 1:3:50:X-MOE:1.5T_1L:no-ckpt:0  1:3:50:X-MOE:1.5T_1L:no-ckpt:0 1:3:50:X-MOE:1.5T_1L:no-ckpt:0 "
+# EP_BATCH_MAP["8:64:1"]="1:3:50:X-MOE:1.5T_1L:no-ckpt:0 1:3:50:X-MOE:1.5T_1L:no-ckpt:0 1:3:50:X-MOE:1.5T_1L:no-ckpt:0 "
+# EP_BATCH_MAP["16:128:1"]=" 1:3:50:X-MOE:1.5T_1L:no-ckpt:0  1:3:50:X-MOE:1.5T_1L:no-ckpt:0  1:3:50:X-MOE:1.5T_1L:no-ckpt:0 "
+# EP_BATCH_MAP["32:256:1"]=" 1:3:50:X-MOE:1.5T_1L:no-ckpt:0 1:3:50:X-MOE:1.5T_1L:no-ckpt:0 1:3:50:X-MOE:1.5T_1L:no-ckpt:0 "
+# EP_BATCH_MAP["64:512:1"]=" 1:3:50:X-MOE:1.5T_1L:no-ckpt:0  1:3:50:X-MOE:1.5T_1L:no-ckpt:0 1:3:50:X-MOE:1.5T_1L:no-ckpt:0  "
+# EP_BATCH_MAP["128:1024:1"]=" 1:3:50:X-MOE:1.5T_1L:no-ckpt:0  "
+# EP_BATCH_MAP["128:512:2"]=" 1:3:60:X-MOE:1.5T_1L:no-ckpt:0 "
+
+# 02/02 Large scale 1T rerun: 
+# EP_BATCH_MAP["128:256:4"]=" 1:7:15:X-MOE:1T:ckpt:1:1   1:7:15:X-MOE:1T:ckpt:1:1   1:7:15:X-MOE:1T:ckpt:1:1  " #   4089363  
+# EP_BATCH_MAP["128:256:4"]=" 1:7:14:X-MOE:537B:no-ckpt:0  " #   4089363
+
+# EP_BATCH_MAP["64:128:4"]=" 1:7:2:X-MOE:537B:ckpt:1  " #   4089363  
+# EP_BATCH_MAP["32:128:2"]=" 1:3:2:X-MOE:173B:no-ckpt:0" # 4089365.o suceeds
+# EP_BATCH_MAP["128:256:4"]=" 1:7:7:X-MOE:1T:ckpt:1 " #   4089363  
+
+# EP_BATCH_MAP["2:16:1"]="2:10:4:X-MOE:10B:no-ckpt:0"
 
 # #4 1 node ep tflops, mem, mbs, ckpt vs no-ckpt
 # EP_BATCH_MAP["1:8:1"]="1:10:20:X-MOE:10B:no-ckpt:0 2:10:20:X-MOE:10B:no-ckpt:0 4:10:20:X-MOE:10B:no-ckpt:0 6:10:20:X-MOE:10B:no-ckpt:0 8:10:20:X-MOE:10B:no-ckpt:0              1:10:20:X-MOE:10B:ckpt:1 2:10:20:X-MOE:10B:ckpt:1 4:10:20:X-MOE:10B:ckpt:1 6:10:20:X-MOE:10B:ckpt:1 8:10:20:X-MOE:10B:ckpt:1 "
@@ -143,19 +430,43 @@ declare -A EP_BATCH_MAP
 # EP_BATCH_MAP["2:16:1"]="2:10:20:X-MOE:10B:no-ckpt:0 4:10:20:X-MOE:10B:no-ckpt:0 6:10:20:X-MOE:10B:no-ckpt:0 8:10:20:X-MOE:10B:no-ckpt:0"
 
 
+# 03/19/zero-2 runs
+# EP_BATCH_MAP["4:32:1"]="1:10:5:X-MOE:63B:ckpt:1  1:10:5:X-MOE:63B:no-ckpt:0  " 
+# EP_BATCH_MAP["8:64:1"]="1:10:5:X-MOE:173B:ckpt:1  1:10:5:X-MOE:173B:no-ckpt:0  " 
+# EP_BATCH_MAP["64:128:4"]="1:5:5:X-MOE:537B:ckpt:1  " 
+# EP_BATCH_MAP["4:32:1"]="1:25:10:X-MOE:63B:ckpt:1  " 
+# EP_BATCH_MAP["4:32:1"]="1:25:10:X-MOE:63B:ckpt:1  " 
+
 # weak scaling 
 # EP_BATCH_MAP["4:32:1"]="1:25:10:X-MOE:63B:ckpt:1  " 
 # EP_BATCH_MAP["8:32:1"]="1:25:10:X-MOE:63B:ckpt:1  " 
 # EP_BATCH_MAP["16:32:1"]="1:25:10:X-MOE:63B:ckpt:1  " 
 # EP_BATCH_MAP["24:32:1"]="1:25:10:X-MOE:63B:ckpt:1  " 
 # EP_BATCH_MAP["32:32:1"]="1:25:10:X-MOE:63B:ckpt:1  " 
+# 02/03/2026 rerun weak scaling to 2k gpus
+# EP_BATCH_MAP["32:128:2"]=" 1:33:14:X-MOE:173B:no-ckpt:0" # 4089365.o suceeds
+# EP_BATCH_MAP["64:128:2"]=" 1:33:14:X-MOE:173B:no-ckpt:0"
+# EP_BATCH_MAP["128:128:2"]=" 1:33:12:X-MOE:173B:no-ckpt:0"
+# EP_BATCH_MAP["256:128:2"]=" 1:33:14:X-MOE:173B:no-ckpt:0"
+
 
 # # # strong scaling 
-# EP_BATCH_MAP["4:32:1"]="1:200:9:X-MOE:63B:ckpt:1  " 
+# EP_BATCH_MAP["4:32:1"]="1:100:10:X-MOE:63B:ckpt:1  " 
 # EP_BATCH_MAP["8:32:1"]="1:100:10:X-MOE:63B:ckpt:1  " 
 # EP_BATCH_MAP["16:32:1"]="1:50:10:X-MOE:63B:ckpt:1  " 
 # EP_BATCH_MAP["24:32:1"]="1:37:10:X-MOE:63B:ckpt:1  " 
 # EP_BATCH_MAP["32:32:1"]="1:25:10:X-MOE:63B:ckpt:1  " 
+
+# # # 02/03 rerun 2k strong scaling 
+# gbs 19200/ ep 128 = 150 nbs
+# EP_BATCH_MAP["32:128:2"]=" 1:150:8:X-MOE:173B:no-ckpt:0" # 
+# EP_BATCH_MAP["64:128:2"]=" 1:75:8:X-MOE:173B:no-ckpt:0"
+# EP_BATCH_MAP["128:128:2"]=" 1:38:10:X-MOE:173B:no-ckpt:0"
+# EP_BATCH_MAP["256:128:2"]=" 1:19:12:X-MOE:173B:no-ckpt:0"
+
+# EP_BATCH_MAP["64:128:1"]=" 1:10:4:X-MOE:63B:no-ckpt:0"
+# EP_BATCH_MAP["128:128:2"]=" 1:10:10:X-MOE:63B:no-ckpt:0"
+
 
 
 # EP_BATCH_MAP["4:32"]="1:64:20:X-MOE:50B "
@@ -163,7 +474,13 @@ declare -A EP_BATCH_MAP
 # EP_BATCH_MAP["8:64"]="1:64:15:DS-MOE:10B 2:128:15:DS-MOE:10B 3:192:15:DS-MOE:10B"
 # EP_BATCH_MAP["16:128:2"]="1:2048:30:X-MOE:190B"
 
-# EP_BATCH_MAP["1:8:1"]="  1:4:20:X-MOE:173B_2L:no-ckpt:0 "
+# EP_BATCH_MAP["1:8:1"]="  1:4:5:X-MOE:173B_2L:no-ckpt:0:2 "
+
+# 01/30 Run groupgemm mem test across models
+# EP_BATCH_MAP["1:8:1"]=" 1:6:15:X-MOE-GroupedGEMM-primus:63B_2L:no-ckpt:0   1:6:15:X-MOE-GroupedGEMM-primus:173B_2L:no-ckpt:0"
+# EP_BATCH_MAP["1:8:1"]=" 1:6:15:X-MOE-GroupedGEMM-primus:63B_2L:no-ckpt:0   1:6:15:X-MOE-GroupedGEMM-primus:173B_2L:no-ckpt:0   1:6:15:X-MOE-GroupedGEMM-primus:537B_2L:no-ckpt:0   1:6:15:X-MOE-GroupedGEMM-primus:1T_2L:no-ckpt:0   2:6:15:X-MOE-GroupedGEMM-primus:63B_2L:no-ckpt:0   2:6:15:X-MOE-GroupedGEMM-primus:173B_2L:no-ckpt:0  4:6:15:X-MOE-GroupedGEMM-primus:63B_2L:no-ckpt:0   4:6:15:X-MOE-GroupedGEMM-primus:173B_2L:no-ckpt:0 "
+
+# EP_BATCH_MAP["1:8:1"]=" 1:6:15:X-MOE:63B_2L:no-ckpt:0   1:6:15:X-MOE:173B_2L:no-ckpt:0   1:6:15:X-MOE:537B_2L:no-ckpt:0   1:6:15:X-MOE:1T_2L:no-ckpt:0   2:6:15:X-MOE:63B_2L:no-ckpt:0   2:6:15:X-MOE:173B_2L:no-ckpt:0  4:6:15:X-MOE:63B_2L:no-ckpt:0   4:6:15:X-MOE:173B_2L:no-ckpt:0 "
 
 # # #7, profiling A2A time across 1,2,4,8 nodes
 # EP_BATCH_MAP["1:8:1"]=" 1:4:15:X-MOE:63B_4L:no-ckpt:0  2:4:15:X-MOE:63B_4L:no-ckpt:0  4:4:15:X-MOE:63B_4L:no-ckpt:0  8:4:15:X-MOE:63B_4L:no-ckpt:0  16:4:15:X-MOE:63B_4L:no-ckpt:0  "
@@ -238,10 +555,10 @@ declare -A PROFILE_MAP
 # PROFILE_MAP["1:8:1"]=" 1:3:15:X-MOE:50B_1L:no-ckpt:0  "
 # PROFILE_MAP["1:8:1"]=" 1:3:15:X-MOE:173B_1L:no-ckpt:0  "
 # PROFILE_MAP["1:8:1"]=" 1:3:15:X-MOE:537B_1L:no-ckpt:0  "
-# PROFILE_MAP["1:8:1"]=" 1:4:20:X-MOE:10B_1L:no-ckpt:0 1:4:20:X-MOE:50B_1L:no-ckpt:0  1:4:20:X-MOE:173B_1L:no-ckpt:0  1:4:20:X-MOE:537B_1L:no-ckpt:0   1:4:20:X-MOE:1T_1L:no-ckpt:0 "
+# PROFILE_MAP["1:8:1"]=" 1:4:20:X-MOE:10B_1L:no-ckpt:0 1:4:20:X-MOE:50B_1L:no-ckpt:0  1:4:20:X-MOE:173B_1L:no-ckpt:0  1:4:20:X-MOE:537B_1L:no-ckpt:0   1:4:20:X-MOE:1.5T_1L:no-ckpt:0 "
 # PROFILE_MAP["2:16:1"]=" 1:3:15:X-MOE:537B_1L:no-ckpt:0  "
-# PROFILE_MAP["1:8:1"]=" 1:3:15:X-MOE:1T_1L:no-ckpt:0  "
-# PROFILE_MAP["2:16:1"]=" 1:3:15:X-MOE:1T_1L:no-ckpt:0  "
+# PROFILE_MAP["1:8:1"]=" 1:3:15:X-MOE:1.5T_1L:no-ckpt:0  "
+# PROFILE_MAP["2:16:1"]=" 1:3:15:X-MOE:1.5T_1L:no-ckpt:0  "
 
 
 
@@ -293,6 +610,8 @@ submit_profile_job() {
 
     echo "  - Generating Profiling job: ${JOB_NAME}" >&2
 
+    local ZERO=1
+
     # 4. Generate Script using the Planner Template
     sed -e "s/{{RUN_TYPE}}/${RUN_TYPE}/g" \
         -e "s/{{NODES}}/${NODES}/g" \
@@ -311,6 +630,7 @@ submit_profile_job() {
         -e "s/{{DYNAMIC_CHECKPOINT}}/False/g" \
         -e "s/{{UNEVEN_PP}}/False/g" \
         -e "s/{{PROFILING_ENABLED}}/true/g" \
+        -e "s/{{ZERO}}/${ZERO}/g" \
         ${PROF_TEMPLATE} > ${TEMP_SCRIPT}
 
     # 5. Submit and return ONLY the Job ID
@@ -382,9 +702,17 @@ for node_key in "${!PP_STRATEGY_MAP[@]}"; do
             RUN_PLANNER="false"
 
             # 2. Check if Planner is enabled for this run
-            if [[ "$PLANNER_MODE" == "yes-planner" ]]; then
+            # if [[ "$PLANNER_MODE" == "yes-planner" ]]; then
+            if [[ "$PLANNER_MODE" == "yes-planner" || "$PLANNER_MODE" == "yes-planner-membal" ]]; then
 
-                RUN_PLANNER="true"
+                if [[ "$PLANNER_MODE" == "yes-planner" ]]; then
+                    RUN_PLANNER="true"
+                elif [[ "$PLANNER_MODE" == "yes-planner-membal" ]]; then
+                    RUN_PLANNER="true-membal"
+                else
+                    RUN_PLANNER="false"
+                fi
+
                 # A. Determine Profiling Model Name (Ensure _1L)
                 PROF_MODEL_NAME="${MODEL_SIZE}_1L"
                 EP_NODES=$(( EP_PARALLEL_SIZE / 8 ))
@@ -428,6 +756,7 @@ for node_key in "${!PP_STRATEGY_MAP[@]}"; do
 
             RUN_TYPE="pp"
             JOB_NAME="${RUN_TYPE}_n${NODES}g${TOTAL_GPUS}_ep${EP_PARALLEL_SIZE}_nbs${NBS}_i${TRAIN_ITERS}_${MOE_TYPE}"
+            ZERO=1
             # TEMP_SLURM_SCRIPT="temp_slurm_${JOB_NAME}.slurm"
             TEMP_DIR="temp_slurm"
             TEMP_SLURM_SCRIPT="${TEMP_DIR}/temp_slurm_${JOB_NAME}.slurm"
@@ -451,6 +780,7 @@ for node_key in "${!PP_STRATEGY_MAP[@]}"; do
                 -e "s/{{DYNAMIC_CHECKPOINT}}/${DYNAMIC_CHECKPOINT}/g" \
                 -e "s/{{UNEVEN_PP}}/${UNEVEN_PP}/g" \
                 -e "s/{{RUN_PLANNER}}/${RUN_PLANNER}/g" \
+                -e "s/{{ZERO}}/${ZERO}/g" \
                 ${TEMPLATE_FILE} > ${TEMP_SLURM_SCRIPT}
 
             sbatch ${TEMP_SLURM_SCRIPT}
@@ -487,7 +817,7 @@ for node_key in "${!EP_BATCH_MAP[@]}"; do
 
 
     for batch_config in $batch_configs_string; do
-        IFS=':' read -r BS NBS TRAIN_ITERS MOE_TYPE MODEL_SIZE CHECKPOINT CHECKPOINT_NUM_LAYERS <<< "$batch_config"
+        IFS=':' read -r BS NBS TRAIN_ITERS MOE_TYPE MODEL_SIZE CHECKPOINT CHECKPOINT_NUM_LAYERS ZERO <<< "$batch_config"
 
         if [[ "$CHECKPOINT" == "ckpt" ]]; then
             ACTIVATION_CHECKPOINT="true"
@@ -517,6 +847,7 @@ for node_key in "${!EP_BATCH_MAP[@]}"; do
             -e "s/{{MODEL_SIZE}}/${MODEL_SIZE}/g" \
                 -e "s/{{ACTIVATION_CHECKPOINT}}/${ACTIVATION_CHECKPOINT}/g" \
                 -e "s/{{CHECKPOINT_NUM_LAYERS}}/${CHECKPOINT_NUM_LAYERS}/g" \
+                -e "s/{{ZERO}}/${ZERO}/g" \
             ${TEMPLATE_FILE} > ${TEMP_SLURM_SCRIPT}
 
         sbatch ${TEMP_SLURM_SCRIPT}
@@ -566,6 +897,8 @@ for node_key in "${!PROFILE_MAP[@]}"; do
 
             echo "  - Generating job: ${JOB_NAME}, BS:$BS"
 
+            ZERO=1
+
             sed -e "s/{{RUN_TYPE}}/${RUN_TYPE}/g" \
                 -e "s/{{NODES}}/${NODES}/g" \
                 -e "s/{{TOTAL_GPUS}}/${TOTAL_GPUS}/g" \
@@ -583,6 +916,7 @@ for node_key in "${!PROFILE_MAP[@]}"; do
                 -e "s/{{DYNAMIC_CHECKPOINT}}/False/g" \
                 -e "s/{{UNEVEN_PP}}/False/g" \
                 -e "s/{{PROFILING_ENABLED}}/true/g" \
+                -e "s/{{ZERO}}/${ZERO}/g" \
                 ${TEMPLATE_PLANNER_FILE} > ${TEMP_SLURM_SCRIPT}
 
             sbatch ${TEMP_SLURM_SCRIPT}

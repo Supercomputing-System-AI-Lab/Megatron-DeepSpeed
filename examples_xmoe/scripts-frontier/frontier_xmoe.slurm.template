@@ -2,18 +2,22 @@
 
 # --- 1. Templatized SLURM Header ---
 #SBATCH -A gen150
-#SBATCH -J {{MOE_TYPE}}-{{RUN_TYPE}}-nbs{{NUM_BATCHES}}
-#SBATCH -o logs/xmoe-{{RUN_TYPE}}-%j.o
-#SBATCH -e logs/xmoe-{{RUN_TYPE}}-%j.e
-#SBATCH -t 00:30:00
+#SBATCH -J {{MODEL_SIZE}}-{{RUN_TYPE}}-nbs{{NUM_BATCHES}}
+#SBATCH -o logs/job_%j_pp{{PP_SIZE}}_ep{{EP_PARALLEL_SIZE}}_{{MOE_TYPE}}_ckpt_{{ACTIVATION_CHECKPOINT}}_planner_{{RUN_PLANNER}}/a-xmoe-{{RUN_TYPE}}-%j.o
+#SBATCH -e logs/job_%j_pp{{PP_SIZE}}_ep{{EP_PARALLEL_SIZE}}_{{MOE_TYPE}}_ckpt_{{ACTIVATION_CHECKPOINT}}_planner_{{RUN_PLANNER}}/a-xmoe-{{RUN_TYPE}}-%j.e
+#SBATCH -t 00:15:00
 #SBATCH -p {{PARTITION}}
 #SBATCH -N {{NODES}}
 #SBATCH -d singleton
-# --nodelist=frontier00122,frontier00895,frontier01266,frontier01739,frontier02883,frontier03197,frontier03841,frontier04195,frontier04606,frontier04885,frontier05159,frontier05440,frontier05757,frontier06014,frontier06271,frontier06653,frontier06909,frontier07455,frontier07898,frontier08552,frontier08928,frontier09066,frontier09318,frontier10216
-#a SBATCH -p extended
 #a SBATCH -q debug
-#a --switches=1@00:15:00
+#a SBATCH -p extended
+#a --switches=1@00:20:00
 #a --contiguous
+####RUN_LOG_DIR="logs/job_${SLURM_JOB_ID}"
+##SBATCH -o logs/xmoe-{{RUN_TYPE}}-%j.o
+##SBATCH -e logs/xmoe-{{RUN_TYPE}}-%j.e
+
+# 01141-01142,02548,02551,02556,02676-02679
 
 # --- 2. Templatized Variable Definitions ---
 BATCH_SIZE={{BATCH_SIZE}}
@@ -55,26 +59,18 @@ echo "DYNAMIC_CHECKPOINT: $DYNAMIC_CHECKPOINT"
 echo "UNEVEN_PP: $UNEVEN_PP"
 echo "RUN_PLANNER: $RUN_PLANNER"
 
+which python 
+
+
+JOB_DIR="logs/job_${SLURM_JOB_ID}_pp{{PP_SIZE}}_ep{{EP_PARALLEL_SIZE}}_{{MOE_TYPE}}_ckpt_{{ACTIVATION_CHECKPOINT}}_planner_{{RUN_PLANNER}}"
+echo "JOB_DIR: {JOB_DIR}"
+
 export DYNAMIC_CHECKPOINT=$DYNAMIC_CHECKPOINT
 export UNEVEN_PP=$UNEVEN_PP
 
-# # --- 3. Environment Setup ---
-# # source /lustre/orion/world-shared/gen150/zixianw4/envs/TORCH-ROCM6.4.1_env/bin/activate
-# MY_ENV_PATH="/lustre/orion/world-shared/gen150/zixianw4/envs/TORCH-ROCM6.4.1_env_v2"
 
-# # 1. Prepend the environment's bin to PATH so 'python' runs from there
-# export PATH="$MY_ENV_PATH/bin:$PATH"
-
-# # 2. (Optional but recommended) Add library path to ensure system doesn't override libs
-# export LD_LIBRARY_PATH="$MY_ENV_PATH/lib:$LD_LIBRARY_PATH"
-
-# # Debug: verify which python we are using
-# which python
-# python --version
-
-# export ROCM_HOME=/opt/rocm-5.7.0
+# ================================================== Model & Data Setup =============================================================
 export LD_PRELOAD="/usr/lib64/libcrypto.so /usr/lib64/libssh.so.4 /usr/lib64/libssl.so.1.1"
-
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 export TORCH_EXTENSIONS_DIR=$PWD/deepspeed
@@ -109,144 +105,10 @@ echo "  EP_SIZE: $EP_SIZE"
 echo "  topk: $topk"
 echo "  SEQ_LEN: $SEQ_LEN"
 # -------------------------------------------------------------------------------------------
-
-# # --- 4. Dynamic Model Configuration ---
-# if [[ "${MODEL_SIZE}" == "10B" ]]; then
-#     NUM_LAYERS=24
-#     HIDDEN_SIZE=2048
-#     FFN_HIDDEN_SIZE=1408
-#     NUM_ATTN_HEADS=16
-#     EP_SIZE=64
-#     topk=6
-#     SEQ_LEN=2048
-# elif [[ "${MODEL_SIZE}" == "50B" ]]; then
-#     echo "Configuring 50B Model"
-#     NUM_LAYERS=24
-#     # MODEL_SIZE=50B
-#     HIDDEN_SIZE=5120
-#     FFN_HIDDEN_SIZE=1536
-#     NUM_ATTN_HEADS=40
-#     EP_SIZE=128
-#     topk=6
-#     SEQ_LEN=4096
-# elif [[ "${MODEL_SIZE}" == "63B" ]]; then
-#     echo "Configuring 63B Model"
-#     NUM_LAYERS=32
-#     # MODEL_SIZE=63B
-#     HIDDEN_SIZE=5120
-#     FFN_HIDDEN_SIZE=1536
-#     NUM_ATTN_HEADS=40
-#     EP_SIZE=128
-#     topk=6
-#     SEQ_LEN=4096
-# elif [[ "${MODEL_SIZE}" == "173B" ]]; then
-#     echo "Configuring 173B Model"
-#     NUM_LAYERS=24
-#     # MODEL_SIZE=173B
-#     HIDDEN_SIZE=7168
-#     FFN_HIDDEN_SIZE=2048
-#     NUM_ATTN_HEADS=56
-#     EP_SIZE=256
-#     topk=8
-#     SEQ_LEN=4096
-# elif [[ "${MODEL_SIZE}" == "537B" ]]; then
-#     echo "Configuring 537B Model"
-#     NUM_LAYERS=60
-#     # MODEL_SIZE=537B
-#     HIDDEN_SIZE=7168
-#     FFN_HIDDEN_SIZE=2560
-#     NUM_ATTN_HEADS=56
-#     EP_SIZE=256
-#     topk=8
-#     SEQ_LEN=4096
-# elif [[ "${MODEL_SIZE}" == "10B-1L" ]]; then
-#     echo "Configuring ${MODEL_SIZE} Model"
-#     NUM_LAYERS=1
-#     HIDDEN_SIZE=2048
-#     FFN_HIDDEN_SIZE=1408
-#     NUM_ATTN_HEADS=16
-#     EP_SIZE=64
-#     topk=6
-#     SEQ_LEN=2048
-# elif [[ "${MODEL_SIZE}" == "50B_1L" ]]; then
-#     echo "Configuring ${MODEL_SIZE} Model"
-#     NUM_LAYERS=6
-#     HIDDEN_SIZE=5120
-#     FFN_HIDDEN_SIZE=1536
-#     NUM_ATTN_HEADS=40
-#     EP_SIZE=128
-#     topk=6
-#     SEQ_LEN=4096
-# elif [[ "${MODEL_SIZE}" == "173B_1L" ]]; then
-#     echo "Configuring 173B Model But with only 1 layer"
-#     NUM_LAYERS=1
-#     # MODEL_SIZE=190_div_28
-#     HIDDEN_SIZE=7168
-#     FFN_HIDDEN_SIZE=2048
-#     NUM_ATTN_HEADS=56
-#     EP_SIZE=256
-#     topk=8
-#     SEQ_LEN=4096
-# else # Default / 10.1B
-#     echo "Configuring default 10B model"
-#     NUM_LAYERS=28
-#     HIDDEN_SIZE=2048
-#     FFN_HIDDEN_SIZE=1408
-#     NUM_ATTN_HEADS=16
-#     EP_SIZE=64
-#     topk=6
-#     SEQ_LEN=2048
-# fi
-
-if [[ "${RUN_PLANNER}" == "true" ]]; then
-
-    # PLANNER_CACHE_FILE='N1_n8_d2048_e64_f1406_k6_s4096 '
-
-    FULL_OUTPUT=$(python ../utils/planner.py \
-    --d_model ${HIDDEN_SIZE} --seqlen ${SEQ_LEN} --num_layers ${NUM_LAYERS} \
-    --pp_stages ${PP_SIZE} --dp ${EP_PARALLEL_SIZE} --ep ${EP_PARALLEL_SIZE} \
-    --num_experts ${EP_SIZE} --expert_dim ${FFN_HIDDEN_SIZE} --topk ${topk} \
-    --activation_checkpointing none --mbs 1 \
-    --fixed_num_batches ${NUM_BATCHES} \
-    --profile_dir "./planner_profiling_cache")
-
-    # 2. Print the logs to the screen immediately so you can read them
-    echo "$FULL_OUTPUT"
-
-    # 3. Extract the variables we need
-    #    We grep for lines starting with OPTIMAL_ inside the variable we already captured.
-    eval "$(echo "$FULL_OUTPUT" | grep "^OPTIMAL_")"
-
-    # 4. Check if optimization succeeded
-    if [ "$OPTIMAL_MBS" == "FAILED" ] || [ -z "$OPTIMAL_MBS" ]; then
-        echo "Error: Planner failed to find a valid configuration."
-        exit 1
-    fi
-
-    # 5. Now you can use the variables!
-    echo "---------------------------------------------------"
-    echo "Planner produced:"
-    echo "Micro-Batch Size: |$OPTIMAL_MBS|"
-    echo "Layer Partition:  |$OPTIMAL_PARTITION|"
-    echo "Checkpoints:      |$OPTIMAL_CKPT|"
-    
-
-    export UNEVEN_PP_PARTITION=$OPTIMAL_PARTITION
-    export DYNAMIC_CHECKPOINT_PARTITION=$OPTIMAL_CKPT
-    
-
-    BATCH_SIZE=$OPTIMAL_MBS
-
-    echo "UPDATED BATCH_SIZE=${OPTIMAL_MBS}"
-    echo "---------------------------------------------------"
-
-fi 
-
-# export UNEVEN_PP_PARTITION="7 6 6 5"
-# export DYNAMIC_CHECKPOINT="True"
-# export DYNAMIC_CHECKPOINT_PARTITION="1 0 0 0"
+# ================================================== END of Model & Data Setup =============================================================
 
 
+# ================================================== Megatron Setup =============================================================
 GLOBAL_BATCH_SIZE=$(( NUM_BATCHES * BATCH_SIZE * (TOTAL_GPUS / PP_SIZE / MP_SIZE) ))
 echo "GLOBAL_BATCH_SIZE=$GLOBAL_BATCH_SIZE"
 
@@ -349,14 +211,14 @@ megatron_options=" \
 	--use-rotary-position-embeddings"
     # --using-torchrun \
 
+        # --use-flash-attn-v2 \
+        
 # --- Conditional Logic ---
 # Set DeepSpeed flags and other settings based on whether this is a PP run.
 if [[ ${PP_SIZE} -gt 1 ]]; then
-    DEEPSPEED_PIPELINE_FLAG="--pipeline-model-parallel-size ${PP_SIZE}"
     WALL_CLOCK_BREAKDOWN="false"
     export WALL_CLOCK_BREAKDOWN="false"
 else
-    DEEPSPEED_PIPELINE_FLAG="--no-pipeline-parallel"
     # WALL_CLOCK_BREAKDOWN="true"
     # export WALL_CLOCK_BREAKDOWN="true"
     WALL_CLOCK_BREAKDOWN="false"
@@ -364,15 +226,23 @@ else
 fi
 
 if [[ "${MOE_TYPE}" == "X-MOE" ]]; then
-    # megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-rbd"
     megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft"
-fi
-if [[ "${MOE_TYPE}" == "TED-MOE" ]]; then
     # megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-rbd"
+elif [[ "${MOE_TYPE}" == "X-MOE-3D" ]]; then
+    megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft"
+
+elif [[ "${MOE_TYPE}" == "X-MOE-GroupedGEMM-triton" ]]; then
+    megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-groupedGEMM --use-triton"
+    export USE_TRITON_GROUPGEMM="True"
+
+elif [[ "${MOE_TYPE}" == "X-MOE-GroupedGEMM-primus" ]]; then
+    export USE_AITER_GROUPGEMM=True 
+    megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-groupedGEMM --no-bias-gelu-fusion --disable-bias-linear"
+
+elif [[ "${MOE_TYPE}" == "TED-MOE" ]]; then
     megatron_options="${megatron_options} --enable-expert-tensor-parallelism"
-fi
-if [[ "${MOE_TYPE}" == "TUTEL-MOE" ]]; then
-    # megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-rbd"
+
+elif [[ "${MOE_TYPE}" == "TUTEL-MOE" ]]; then
     megatron_options="${megatron_options} --use-tutel"
 fi
 
@@ -390,7 +260,10 @@ fi
 if [ "${MOE_DROP_TOKEN}" = "false" ]; then
     megatron_options="${megatron_options} --disable-moe-token-dropping"
 fi
+# ================================================== END of Megatron Setup =============================================================
 
+
+# ================================================== DeepSpeed Setup =============================================================
 # WALL_CLOCK_BREAKDOWN="false"
 template_json="../ds_config_gpt_TEMPLATE.json"
 # config_json="ds_config_gpt_Zero0_${NAME}.json"
@@ -402,7 +275,7 @@ mkdir -p "${config_dir}"
 sed "s/CONFIG_BATCH_SIZE/${GLOBAL_BATCH_SIZE}/" ${template_json} \
     | sed "s/CONFIG_MBSIZE/${BATCH_SIZE}/" \
     | sed "s/LOG_INTERVAL/${LOG_INTERVAL}/" \
-    | sed "s/ZERO_STAGE/1/" \
+    | sed "s/ZERO_STAGE/{{ZERO}}/" \
     | sed "s/PRESCALE_GRAD/false/" \
     | sed "s/CONFIG_FP16_ENABLED/true/" \
     | sed "s/CONFIG_BF16_ENABLED/false/" \
@@ -413,95 +286,109 @@ sed "s/CONFIG_BATCH_SIZE/${GLOBAL_BATCH_SIZE}/" ${template_json} \
     | sed "s/WALL_CLOCK_BREAKDOWN/${WALL_CLOCK_BREAKDOWN}/" \
     > ${config_json}
 
-deepspeed_options=" --deepspeed --deepspeed_config ${config_json} --no-pipeline-parallel"
-# Logic for pipeline parallel runs, if PP_SIZE > 1 this will be used.
+deepspeed_options=" --deepspeed --deepspeed_config ${config_json}"
 if [[ $PP_SIZE -gt 1 ]]; then
-    deepspeed_options=" --deepspeed --deepspeed_config ${config_json} --pipeline-model-parallel-size ${PP_SIZE}"
+    deepspeed_options=" ${deepspeed_options} --pipeline-model-parallel-size ${PP_SIZE}"
+else
+    deepspeed_options=" ${deepspeed_options} --no-pipeline-parallel"
 fi
+
 if [ "${ACTIVATION_CHECKPOINT}" = "true" ]; then
     deepspeed_options="${deepspeed_options} --deepspeed-activation-checkpointing"
 fi
+# ================================================== END of DeepSpeed Setup =============================================================
 
 
-export TRITON_DISABLE_CACHE=1
+# ================================================== Setup Moving Cache to prevent IO =============================================================
+# # export TRITON_DISABLE_CACHE=1
+# # export TRITON_CACHE_DIR="/lustre/orion/gen150/scratch/zixianw4/.triton/cache/"
+# TMP_TRITON_DIR="/tmp/triton_cache_${SLURM_JOB_ID}"
+# TRITON_CACHE_DIR="/tmp/triton_cache_${SLURM_JOB_ID}"
+# mkdir -p ${TRITON_CACHE_DIR}
+PERSISTENT_TRITON_CACHE="/lustre/orion/gen150/scratch/zixianw4/.triton/cache"
+TMP_TRITON_DIR="/tmp/triton_cache_${SLURM_JOB_ID}"
+export TRITON_CACHE_DIR="${TMP_TRITON_DIR}"
 
-export to_profile="False"
-# export to_profile="True"
-# export profile_memory="False"
-export profile_memory="True"
-export profile_dir="torch_profile/${current_time}/"
+echo "--- Warming Triton cache on all nodes at: $(date '+%F %T') ---"
+srun -N ${NODES} -n ${NODES} --ntasks-per-node=1 \
+    bash cache_setup.sh ${PERSISTENT_TRITON_CACHE} ${TMP_TRITON_DIR}
+echo "--- Cache warm done at: $(date '+%F %T') ---"
+# ================================================== END of Setup Moving Cache =============================================================
 
 
+# ================================================== Frontier Global Env Var Setup =============================================================
 # --- Execution Logic ---
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export OMP_NUM_THREADS=2
-export NCCL_NET_GDR_LEVEL=3
-export FI_MR_CACHE_MONITOR=userfaultfd
 
-# export FI_MR_CACHE_MONITOR=kdreg2
-# export LD_LIBRARY_PATH=/ccs/home/zixianw4/aws-ofi-rccl/lib/:${LD_LIBRARY_PATH}
 
-# # ---------------------------------------------------------------------------------------------------------------------
+export RANK=$SLURM_PROCID
+export WORLD_SIZE=$SLURM_NTASKS
+export LOCAL_RANK=$SLURM_LOCALID
 
-# --- OLCF/HPE Recommended Settings for Slingshot/Libfabric ---
-# export FI_MR_CACHE_MONITOR=kdreg
-# export FI_CXI_DEFAULT_CQ_SIZE=131072
-# export FI_CXI_RX_MATCH_MODE=hybrid
 
-# --- RCCL/NCCL Configuration ---
 export HIGH_SPEED_INTERFACE="hsn0"
-# export NCCL_SOCKET_IFNAME=${HIGH_SPEED_INTERFACE}
-# export NCCL_DEBUG=INFO
-
 export FI_MR_CACHE_MONITOR=kdreg2     # Required to avoid a deadlock.
 # export FI_CXI_DEFAULT_CQ_SIZE=131072  # Ask the network stack to allocate additional space to process message completions.
 # export FI_CXI_DEFAULT_TX_SIZE=2048    # Ask the network stack to allocate additional space to hold pending outgoing messages.
-export FI_CXI_DEFAULT_CQ_SIZE=262144  # Ask the network stack to allocate additional space to process message completions.
-export FI_CXI_DEFAULT_TX_SIZE=8196    # Ask the network stack to allocate additional space to hold pending outgoing messages.
+export FI_CXI_DEFAULT_CQ_SIZE=524288
+export FI_CXI_DEFAULT_TX_SIZE=16384
+# export FI_CXI_DEFAULT_CQ_SIZE=1048576
+# export FI_CXI_DEFAULT_TX_SIZE=32768
 export FI_CXI_RX_MATCH_MODE=hybrid    # Allow the network stack to transition to software mode if necessary.
 
-export NCCL_NET_GDR_LEVEL=3           # Typically improves performance, but remove this setting if you encounter a hang/crash.
-export NCCL_CROSS_NIC=0               # On large systems, this NCCL setting has been found to improve performance
+# export NCCL_NET_GDR_LEVEL=3           # Typically improves performance, but remove this setting if you encounter a hang/crash.
+# export NCCL_CROSS_NIC=0               # On large systems, this NCCL setting has been found to improve performance
 export NCCL_SOCKET_IFNAME=hsn0        # NCCL/RCCL will use the high speed network to coordinate startup.
+# export GLOO_SOCKET_IFNAME=hsn0
 
-# export TORCH_DISTRIBUTED_DEBUG=INFO
-
-# # --- MPI Configuration ---
-# # These will be passed to srun directly.
-# export OMPI_MCA_pml=ob1
-# export OMPI_MCA_btl=self,tcp
-# export OMPI_MCA_btl_tcp_if_include=${HIGH_SPEED_INTERFACE}
+# This tells the GLOO backend to prepare for a huge number of incoming connections.
+# It sets the listen() backlog to a high value.
+# export GLOO_TCP_IFACE_LISTEN_BACKLOG=4096
 
 # --- Robust Master Address Discovery ---
 readarray -t arr < <(scontrol show hostnames $SLURM_NODELIST)
 master_node=${arr[0]}
-export MASTER_ADDR=$(ssh $master_node "ip -4 addr show ${HIGH_SPEED_INTERFACE} | grep 'inet' | awk '{print \$2}' | cut -d/ -f1")
+export MASTER_ADDR=$(ssh $master_node "ip -4 addr show ${HIGH_SPEED_INTERFACE} | grep 'inet' | awk '{print \$2}' | cut -d/ -f1 | head -n1")
 if [[ -z "${MASTER_ADDR}" ]]; then
     echo "FATAL: Could not determine MASTER_ADDR for interface '${HIGH_SPEED_INTERFACE}' on master node '${master_node}'."
     exit 1
 fi
+export MASTER_PORT=29500
 
 echo "--- Frontier Distributed Training Setup ---"
 echo "MASTER_NODE: ${master_node}"
 echo "MASTER_ADDR: ${MASTER_ADDR} (using interface: ${NCCL_SOCKET_IFNAME})"
 echo "-----------------------------------------"
 
+
 # --- Other Script Variables ---
-export TRITON_DISABLE_CACHE=1
-export to_profile="False"
-export profile_memory="True"
 current_time=$(date +%Y-%m-%d_%H-%M-%S)
-export profile_dir="torch_profile/${current_time}/"
-export OMP_NUM_THREADS=2
+# export OMP_NUM_THREADS=2
+# export TRITON_PTXAS_NUM_WORKERS=4
+export TRITON_PTXAS_NUM_WORKERS=1
+export OMP_NUM_THREADS=1
+export NCCL_TIMEOUT=1200
+export NCCL_TIMEOUT_MS=1200000
+export TORCH_NCCL_BLOCKING_WAIT=1
+
+# help exit the program if nccl hang 
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_ASYNC_ERROR_HANDLING=1
+
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # export NCCL_P2P_DISABLE=1
+# ================================================== END of Frontier Global Env Var Setup Up =============================================================
 
+
+# ================================================== Nodes Connection Check =============================================================
 # --- Final srun Launch Command ---
 gpus_per_node=$(( TOTAL_GPUS / NODES ))
 LOG_FILE="logs/n${TOTAL_GPUS}-gbs${GLOBAL_BATCH_SIZE}-${MOE_TYPE}-${RUN_TYPE}.log"
 
 echo "--- Running Environment Diagnostic ---"
-srun -N ${NODES} -n ${TOTAL_GPUS} -c2 --ntasks-per-node=${gpus_per_node} --gpus-per-node=${gpus_per_node} \
+echo "--- Script started at: $(date '+%F %T') ---"
+srun -N ${NODES} -n ${TOTAL_GPUS} -c6 --ntasks-per-node=${gpus_per_node} --gpus-per-node=${gpus_per_node} \
     bash -c ' \
         if [[ $SLURM_PROCID -eq 0 ]]; then \
             echo "--- Environment on Rank 0 ---"; \
@@ -510,207 +397,125 @@ srun -N ${NODES} -n ${TOTAL_GPUS} -c2 --ntasks-per-node=${gpus_per_node} --gpus-
         fi \
     '
 
-srun -N ${NODES} -n ${TOTAL_GPUS} -c2 \
+echo "--- Cache warm done at: $(date '+%F %T') ---"
+
+# # ---- ADD THIS BLOCK HERE ----
+# echo "--- Pre-compiling Triton kernels (1 per node) at: $(date '+%F %T') ---"
+# srun -N ${NODES} -n ${NODES} --ntasks-per-node=1 --gpus-per-node=1 \
+#     bash -c "
+#     export TRITON_CACHE_DIR=${TMP_TRITON_DIR}
+#     python -c \"
+# import torch
+# from megatron.moe.exp_triton_groupgemm import k2_forward, k2_backward_dx, k2_backward_dw, get_num_sms
+# d = torch.randn(1, 7168, device='cuda', dtype=torch.bfloat16)
+# w = torch.randn(1, 2560, 7168, device='cuda', dtype=torch.bfloat16)
+# m = torch.ones(1, dtype=torch.int32, device='cuda')
+# o = torch.empty(1, 2560, device='cuda', dtype=torch.bfloat16)
+# S = get_num_sms()
+# k2_forward[(S,)](d, w, m, o, 2560, 7168, 1, S, 7168, 1, 2560*7168, 2560, 1, 2560, 1, num_warps=4, num_stages=1)
+# k2_backward_dx[(S,)](o, w, m, d, 7168, 2560, 1, S, 2560, 1, 2560*7168, 2560, 1, 7168, 1, num_warps=4, num_stages=1)
+# k2_backward_dw[(S,)](d, o, m, w, 2560, 7168, 1, S, 7168, 1, 2560, 1, 2560*7168, 2560, 1, num_warps=4, num_stages=1)
+# torch.cuda.synchronize()
+# import os; print(f'[{os.uname().nodename}] Triton K2 compiled OK')
+# \"
+# "
+# echo "--- Pre-compilation done at: $(date '+%F %T') ---"
+# # ---- END OF BLOCK ----
+
+# export to_profile="False"
+# export PYTHONDONTWRITEBYTECODE=1
+# ================================================== END of Nodes Connection Check =============================================================
+
+
+
+
+# ================================================== Launch ELMoE Training =============================================================
+export to_profile="False"
+export profile_memory="False"
+# export to_profile="True"
+# export profile_memory="True"
+export profile_dir="${JOB_DIR}/torch_profile"
+
+planner_mode="{{RUN_PLANNER}}"
+
+# Validate planner mode — default to false if unrecognized
+if [[ "$planner_mode" != "true" && "$planner_mode" != "true-membal" ]]; then
+    planner_mode="false"
+fi
+
+
+
+echo "Before launching srun python python ../pretrain_gpt_deepspeed.py"
+echo "--- Script started at: $(date '+%F %T') ---"
+
+srun -N ${NODES} -n ${TOTAL_GPUS} -c6 \
      --ntasks-per-node=${gpus_per_node} \
      --gpus-per-node=${gpus_per_node} \
-     --export=ALL,FI_MR_CACHE_MONITOR,FI_CXI_DEFAULT_CQ_SIZE,FI_CXI_RX_MATCH_MODE,NCCL_DEBUG,UNEVEN_PP \
-     python ../utils/test_switch_topo.py 
+     --kill-on-bad-exit=1 \
+     --export=ALL,FI_MR_CACHE_MONITOR,FI_CXI_DEFAULT_CQ_SIZE,FI_CXI_RX_MATCH_MODE,NCCL_DEBUG,UNEVEN_PP,TRITON_CACHE_DIR,TRITON_DISABLE_CACHE \
+     bash -c "
 
-# --- INSERT THIS HERE ---
-echo "\n--- SLURM JOB CONFIGURATION ---\n"
-# This will print the full job details to your stdout log
-scontrol show job $SLURM_JOB_ID
-echo "\n--- END SLURM JOB CONFIGURATION ---\n"
-# ------------------------
-
-
-
-# =======================================================================================
-# --- SMART TOPOLOGY SORTING, HOSTFILE GENERATION & VERIFICATION ---
-# =======================================================================================
-
-echo "---------------------------------------------------"
-echo "--- TOPOLOGY OPTIMIZATION STEP ---"
-
-# 1. Capture the Default Order from SLURM
-DEFAULT_NODELIST=$(scontrol show hostnames $SLURM_JOB_NODELIST | tr '\n' ',' | sed 's/,$//')
-echo "DEFAULT NODELIST (SLURM Order):"
-echo "$DEFAULT_NODELIST"
-
-# 2. Run the topology script on every node to gather hardware locations
-echo "Gathering hardware location data..."
-RAW_TOPO_DATA=$(srun -N $NODES -n $NODES --ntasks-per-node=1 \
-    --export=ALL \
-    python ../utils/test_switch_topo.py)
-
-# 3. Sort nodes by Switch ID using Python
-OPTIMIZED_NODELIST=$(python3 -c "
-import sys
-
-# The raw output from the srun command above
-raw_data = \"\"\"$RAW_TOPO_DATA\"\"\"
-
-node_switch_map = {}
-
-for line in raw_data.strip().split('\n'):
-    parts = line.split()
-    # Expecting: frontier1528 NIC 0 ... location 017.31.08
-    if 'location' in parts and 'NIC' in parts:
-        hostname = parts[0]
-        location = parts[-1] 
-        try:
-            # Parse: Group.Switch.Port
-            grp, sw, port = location.split('.')
-            if hostname not in node_switch_map:
-                node_switch_map[hostname] = int(sw)
-        except:
-            continue
-
-# Sort the nodes: Primary Key = Switch ID, Secondary Key = Hostname
-sorted_nodes = sorted(node_switch_map.keys(), key=lambda x: (node_switch_map[x], x))
-
-# Output comma-separated list
-print(','.join(sorted_nodes))
-")
-
-echo "---------------------------------------------------"
-echo "OPTIMIZED NODELIST (Switch-Aware Order):"
-echo "$OPTIMIZED_NODELIST"
-echo "Comparison:"
-echo "  [Before] $DEFAULT_NODELIST"
-echo "  [After ] $OPTIMIZED_NODELIST"
-
-# # =======================================================================================
-# # --- CRITICAL FIX: GENERATE RANK MAP FOR --distribution=arbitrary ---
-# # =======================================================================================
-
-# echo "---------------------------------------------------"
-# echo "--- GENERATING ARBITRARY RANK MAPPING ---"
-
-# RANK_MAP_FILE="${PWD}/rank_map_${SLURM_JOB_ID}.txt"
-# rm -f $RANK_MAP_FILE
-
-# # Convert comma-separated string to array
-# IFS=',' read -ra NODE_ARRAY <<< "$OPTIMIZED_NODELIST"
-
-# # Write hostname N times (where N = gpus_per_node)
-# for node in "${NODE_ARRAY[@]}"; do
-#     for ((i=0; i<${gpus_per_node}; i++)); do
-#         echo "$node" >> $RANK_MAP_FILE
-#     done
-# done
-
-# # Export this so srun sees it (Use absolute path)
-# export SLURM_HOSTFILE=$RANK_MAP_FILE
-
-# echo "Rank Map Generated: $SLURM_HOSTFILE"
-# echo "First $((gpus_per_node * 2)) lines (Should show all ranks for Node 1, then Node 2):"
-# head -n $((gpus_per_node * 2)) $SLURM_HOSTFILE
-# echo "..."
-
-# # =======================================================================================
-# # --- ENHANCED VERIFICATION (ROBUST MODE) ---
-# # =======================================================================================
-
-# echo "---------------------------------------------------"
-# echo "--- VERIFYING LIVE TOPOLOGY (Buffered via File) ---"
-
-# echo "Distribution Mode: arbitrary"
-# echo "SLURM_HOSTFILE: $SLURM_HOSTFILE"
-# echo ""
-# echo "Running srun verification..."
-
-# # 2. RUN SRUN -> FILE
-# #    FIX: Added resource flags (-c2, --ntasks-per-node, --gpus-per-node) 
-# #    so Frontier accepts the request.
-# #    We capture stdout to file, and let stderr print to the log.
-# srun -n ${TOTAL_GPUS} \
-#      --distribution=arbitrary \
-#      --ntasks-per-node=${gpus_per_node} \
-#      --gpus-per-node=${gpus_per_node} \
-#      -c2 \
-#      bash -c 'echo "Rank $SLURM_PROCID is on $(hostname)"' > debug_layout.txt
-
-# # 3. VERIFY THE FILE CONTENT
-# if [ ! -s debug_layout.txt ]; then
-#     echo "ERROR: srun produced no output! See stderr above for launch errors."
-# else
-#     echo "Output captured. Sorting and displaying first 16 lines:"
-#     echo "---------------------------------------------------"
-    
-#     # Sort by Rank ID (Column 2) and show the top
-#     sort -n -k2 debug_layout.txt | head -n 32
-    
-#     echo "---------------------------------------------------"
-#     echo "Checking Boundary Transition (Rank $((gpus_per_node-1)) -> Rank $gpus_per_node):"
-#     sort -n -k2 debug_layout.txt | grep -E "Rank $((gpus_per_node-1)) |Rank $gpus_per_node "
-# fi
-
-# echo "---------------------------------------------------"
-# echo "TOPOLOGY SETUP COMPLETE"
-# echo "---------------------------------------------------"
-# # =======================================================================================
-# # --- END OF VERIFICATION (ROBUST MODE) ---
-# # =======================================================================================
-
-
-
-
-# Normal nodes assignment: 
-# Use --export=ALL to propagate the whole environment, then explicitly list the
-# critical variables to ensure they are set correctly on all remote nodes.
-# unset SLURM_HOSTFILE
-srun -N ${NODES} -n ${TOTAL_GPUS} -c2 \
-     --ntasks-per-node=${gpus_per_node} \
-     --gpus-per-node=${gpus_per_node} \
-     --export=ALL,FI_MR_CACHE_MONITOR,FI_CXI_DEFAULT_CQ_SIZE,FI_CXI_RX_MATCH_MODE,NCCL_DEBUG,UNEVEN_PP \
-     python ../pretrain_gpt_deepspeed.py \
+     python ../ELMoE_launch.py \
+        --run-planner ${planner_mode} \
+        --planner-profile-dir ./planner_profiling_cache \
         ${megatron_options} \
         ${data_options} \
         ${deepspeed_options} \
         --master-addr=$MASTER_ADDR \
-        --zero-stage 1 \
-        2>&1 | tee ${LOG_FILE}
-# # # ---------------------------------------------------------------------------------------------------------------------
-# EP Alignment assignment: 
-# Use --export=ALL to propagate the whole environment, then explicitly list the
-# critical variables to ensure they are set correctly on all remote nodes.
-# srun -n ${TOTAL_GPUS} -c2 \
-#     --distribution=arbitrary \
-#      --ntasks-per-node=${gpus_per_node} \
-#      --gpus-per-node=${gpus_per_node} \
-#      --export=ALL,FI_MR_CACHE_MONITOR,FI_CXI_DEFAULT_CQ_SIZE,FI_CXI_RX_MATCH_MODE,NCCL_DEBUG,UNEVEN_PP \
-#      python ../pretrain_gpt_deepspeed.py \
-#         ${megatron_options} \
-#         ${data_options} \
-#         ${deepspeed_options} \
-#         --master-addr=$MASTER_ADDR \
-#         --zero-stage 1 \
-#         2>&1 | tee ${LOG_FILE}
-# srun -n ${TOTAL_GPUS} -c2 \
-#     --distribution=arbitrary \
-#      --ntasks-per-node=${gpus_per_node} \
-#      --gpus-per-node=${gpus_per_node} \
-#      --export=ALL,FI_MR_CACHE_MONITOR,FI_CXI_DEFAULT_CQ_SIZE,FI_CXI_RX_MATCH_MODE,NCCL_DEBUG,UNEVEN_PP \
-#      bash -c 'export TRITON_CACHE_DIR=/tmp/triton_cache_${USER}_${SLURM_JOB_ID}/rank${SLURM_PROCID}; \
-#               mkdir -p $TRITON_CACHE_DIR; \
-#               exec "$@"' \
-#      -- \
-#      python ../pretrain_gpt_deepspeed.py \
-#         ${megatron_options} \
-#         ${data_options} \
-#         ${deepspeed_options} \
-#         --master-addr=$MASTER_ADDR \
-#         --zero-stage 1 \
-#         2>&1 | tee ${LOG_FILE}
-# # # ---------------------------------------------------------------------------------------------------------------------
+        --zero-stage {{ZERO}} \
+        > ${JOB_DIR}/rank_\${SLURM_PROCID}.log"
+# ================================================== END of Launch ELMoE Training =============================================================
 
 
-# --- Analysis Script ---
-ANALYSIS_LOG_FILE="/lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe/scripts-frontier/logs/xmoe-${RUN_TYPE}-$SLURM_JOB_ID.o"
-echo "ANALYSIS_LOG_FILE: ${ANALYSIS_LOG_FILE}"
-python  /lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/examples_xmoe/utils/analyze_log.py \
-        ${ANALYSIS_LOG_FILE} \
+
+# ================================================== Start Run Analysis =============================================================
+echo "--- Starting Log Analysis ---"
+
+# 1. Define Paths
+LAST_RANK=$(( TOTAL_GPUS - 1 ))
+# JOB_DIR="logs/job_${SLURM_JOB_ID}"
+RANK_LOG_FILE="${JOB_DIR}/rank_${LAST_RANK}.log"
+RANK_LOG_FILE_2="${JOB_DIR}/rank_0.log"
+# SLURM_LOG_FILE="logs/xmoe-${RUN_TYPE}-${SLURM_JOB_ID}.o"
+SLURM_LOG_FILE="${JOB_DIR}/a-xmoe-${RUN_TYPE}-${SLURM_JOB_ID}.o"
+
+# 2. Define the Merged Log Path (Keeping it permanent)
+MERGED_LOG="${JOB_DIR}/full_run.log"
+
+# 3. Wait a moment for file system sync
+sleep 5
+
+# 4. Create the Merged Log
+#    First: Put the SLURM output (Config, Memory Stats, Env Vars)
+if [ -f "${SLURM_LOG_FILE}" ]; then
+    cat "${SLURM_LOG_FILE}" > "${MERGED_LOG}"
+else
+    echo "Warning: SLURM .o file not found at ${SLURM_LOG_FILE}" > "${MERGED_LOG}"
+fi
+
+#    Separator
+echo -e "\n\n==========================================================\n" >> "${MERGED_LOG}"
+echo -e "--- RANK ${LAST_RANK} METRICS (LOSS/TFLOPS) BELOW ---\n" >> "${MERGED_LOG}"
+echo -e "==========================================================\n" >> "${MERGED_LOG}"
+
+#    Second: Append the Rank Log (Loss, TFLOPS, Timers)
+if [ -f "${RANK_LOG_FILE_2}" ]; then
+    cat "${RANK_LOG_FILE_2}" >> "${MERGED_LOG}"
+else
+    echo "Error: Rank log file not found at ${RANK_LOG_FILE_2}" >> "${MERGED_LOG}"
+fi
+if [ -f "${RANK_LOG_FILE}" ]; then
+    cat "${RANK_LOG_FILE}" >> "${MERGED_LOG}"
+else
+    echo "Error: Rank log file not found at ${RANK_LOG_FILE}" >> "${MERGED_LOG}"
+fi
+
+echo "Merged log saved to: ${MERGED_LOG}"
+
+# 5. Run Analysis on the MERGED file
+#    The script will now find "Peak Memory" (from top) and "lm loss" (from bottom)
+python ../utils/analyze_log.py \
+        "${MERGED_LOG}" \
         --iterations $TRAIN_ITERS \
         --nodes $NODES \
         --gpus_per_node $gpus_per_node \
@@ -732,6 +537,9 @@ python  /lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/exa
         --activation_checkpointing $ACTIVATION_CHECKPOINT \
         --checkpoint_interval $CHECKPOINT_NUM_LAYERS \
         --dynamic_checkpoint $DYNAMIC_CHECKPOINT \
-        --uneven_pp $UNEVEN_PP
+        --uneven_pp $UNEVEN_PP >> "${MERGED_LOG}"
 
-echo "After python analyze log"
+python ../utils/analyze_memory.py "${MERGED_LOG}" #>> "${MERGED_LOG}"
+
+echo "Analysis Complete. Full log: ${MERGED_LOG}"
+# ================================================== END of Run Analysis =============================================================
