@@ -323,7 +323,7 @@ class Timers:
         """
         world_size = torch.distributed.get_world_size()
         rank = torch.distributed.get_rank()
-        print (f'[megatron/timers.py] inside log_global_average_times')
+        # print (f'[megatron/timers.py] inside log_global_average_times')
 
         # Create a tensor to hold this rank's data: [total_elapsed_time, num_calls] for each timer.
         # Using float64 for accumulators is safer to avoid precision issues.

@@ -93,15 +93,20 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
     else:
         # Megatron's MPU is the master. Complete initialization right away.
         finish_mpu_init()
+        print ("Finished _initialize_distributed()", flush=True)
 
         # Initialize memory buffers.
         _initialize_mem_buffs()
+        if args.rank < 8:
+            print ("Finished _initialize_mem_buffs()")
 
         # Autoresume.
         _init_autoresume()
 
         # Compile dependencies.
         _compile_dependencies()
+        if args.rank < 8:
+            print ("Finished _compile_dependencies()")
 
         # No continuation function
         return None
@@ -270,22 +275,8 @@ def _initialize_distributed():
             else:
                 args.local_rank = device
                 
-            print (f'[megatron/initialize.py]')
-            print (f'\n'* 7)
-            print (f'{device_count=}')
-            print (f'{args.rank=}')
-            print (f'{device=}')
-            print (f'{args.local_rank=}')
-            print (f'{os.getenv ("RANK")=}')
-            print (f'{os.getenv ("LOCAL_RANK")=}')
-            # print (f'Zixian: Oct 18: torch.cuda.set_device(local_rank)')
-            # torch.cuda.set_device(local_rank)
-            get_accelerator().set_device(device) # only do so when device_count > 0
-            print (f'after setting device')
-            print (f'\n'* 7)
 
     # Call the init process
-    print("args values:", args)
     # import os, socket
     # print("BOOTSTRAP:",
     #     "MASTER_ADDR=", os.getenv("MASTER_ADDR"),
