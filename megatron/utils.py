@@ -113,18 +113,23 @@ def average_losses_across_data_parallel_group(losses):
 def report_memory(name):
     """Simple GPU memory report."""
     mega_bytes = 1024.0 * 1024.0
-    string = name + ' memory (MB)'
+    giga_bytes = 1024.0 * 1024.0 * 1024.0
+    string = name + ' memory (GB)'
     string += ' | allocated: {}'.format(
-        get_accelerator().memory_allocated() / mega_bytes)
+        # get_accelerator().memory_allocated() / giga_bytes)
+        torch.cuda.memory_allocated() / giga_bytes)
     string += ' | max allocated: {}'.format(
-        get_accelerator().max_memory_allocated() / mega_bytes)
+        # get_accelerator().max_memory_allocated() / giga_bytes)
+        torch.cuda.max_memory_allocated() / giga_bytes)
     string += ' | reserved: {}'.format(
-        get_accelerator().memory_reserved() / mega_bytes)
+        # get_accelerator().memory_reserved() / giga_bytes)
+        torch.cuda.memory_reserved() / giga_bytes)
     string += ' | max reserved: {}'.format(
-        get_accelerator().max_memory_reserved() / mega_bytes)
-    if mpu.get_data_parallel_rank() == 0:
-        print("[Rank {}] {}".format(torch.distributed.get_rank(), string),
-              flush=True)
+        # get_accelerator().max_memory_reserved() / giga_bytes)
+        torch.cuda.max_memory_reserved() / giga_bytes)
+    # if mpu.get_data_parallel_rank() % 8 == 0:
+    print("[Rank {}] {}".format(torch.distributed.get_rank(), string),
+            flush=True)
 
 
 def print_params_min_max_norm(optimizer, iteration):
