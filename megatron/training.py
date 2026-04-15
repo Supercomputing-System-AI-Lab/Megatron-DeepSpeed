@@ -10,6 +10,9 @@ import json
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
 import torch
+import os
+import socket
+
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
 from megatron import get_args
@@ -117,10 +120,14 @@ def pretrain(train_valid_test_dataset_provider,
         args_defaults: a dictionary from argument-name to argument-value. It
             to set already parse arguments.
     """
+    rank = int (os.getenv ("RANK"))
+    # torch.cuda.set_device(local_rank)
 
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(extra_args_provider=extra_args_provider,
                         args_defaults=args_defaults)
+    print_rank_0 (f'after initialize_megatron')
+    
     # Set pytorch JIT layer fusion options and warmup JIT functions.
     #if get_accelerator().device_name() == 'cuda':
     #    set_jit_fusion_options()
@@ -128,14 +135,21 @@ def pretrain(train_valid_test_dataset_provider,
     # Adjust the startup time so it reflects the largest value.
     # This will be closer to what scheduler will see (outside of
     # image ... launches.
+    print (f'[megatron/training.py] before start_time_tensor = get_accelerator().DoubleTensor([_TRAIN_START_TIME]) {rank=} {get_accelerator().current_device()=}', flush=True)
     global _TRAIN_START_TIME
-    start_time_tensor = get_accelerator().DoubleTensor([_TRAIN_START_TIME])
+    # device_id = get_accelerator().current_device()
+    device_id = int (os.getenv ("LOCAL_RANK"))
+    # print ()
+    start_time_tensor = torch.tensor([_TRAIN_START_TIME], dtype=torch.float64, device=f'cuda:{device_id}')
+    # start_time_tensor = torch.cuda.FloatTensor([_TRAIN_START_TIME])
+    print (f'[megatron/training.py] before init all-reduce {rank=} {start_time_tensor=}', flush=True)
     torch.distributed.all_reduce(start_time_tensor,
                                  op=torch.distributed.ReduceOp.MIN)
     _TRAIN_START_TIME = start_time_tensor.item()
     print_rank_0('time to initialize megatron (seconds): {:.3f}'.format(
         time.time() - _TRAIN_START_TIME))
     print_datetime('after megatron is initialized')
+    print (f'[megatron/training.py] after init all-reduce', flush=True)
 
     args = get_args()
     timers = get_timers()
@@ -227,16 +241,23 @@ def pretrain(train_valid_test_dataset_provider,
         print_datetime('after training is done')
         # Clean the model
         if args.compression_training:
+            print (f"[training.py] {rank=} before cleaning the model", flush=True )
             model = [redundancy_clean(model[0], args.deepspeed_config_dict, mpu)]
+            print (f"[training.py] {rank=} after cleaning the model", flush=True )
+        
 
         if args.save and iteration != 0:
+            print (f"[training.py] {rank=} before saving checkpoint", flush=True )
             save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
+            print (f"[training.py] {rank=} after saving checkpoint", flush=True )
     else:
         print_rank_0('skipping training (--skip-train is on) ...')
 
         iteration = args.iteration
 
+    print (f"[training.py] {rank=} before core_transformer_config_from_args", flush=True )
     config = core_transformer_config_from_args(args)
+    print (f"[training.py] {rank=} returning pretrain", flush=True )
     '''
     if args.do_valid:
         prefix = f'iteration {iteration} on {args.eval_iters * args.global_batch_size}-sample draw from validation set'
@@ -1097,7 +1118,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
         print_rank_last(log_string)
-        if report_memory_flag and learning_rate > 0.:
+        # if report_memory_flag and learning_rate > 0.:
+        if (iteration % 2 == 0) and (learning_rate > 0.):
             # Report memory after optimizer state has been initialized.
             report_memory('(after {} iterations)'.format(iteration))
             report_memory_flag = False
@@ -1116,62 +1138,22 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler):
     checkpoint_throughput_calculator(model, timers('save-checkpoint').elapsed(reset=False))
     timers.log(['save-checkpoint'])
 
-# #############################################################################################################
-# ---------------------------
-# Global profiler object
-# ---------------------------
-import os
-from torch.profiler import profile, record_function, ProfilerActivity, schedule
-_PROF = None
 
+# 1. Get the directory containing training.py (.../Megatron-DeepSpeed-X-MoE/megatron)
+current_dir = os.path.dirname(os.path.abspath(__file__))
 
-def _get_rank_world():
-    # Works under DeepSpeed/Megatron once dist is initialized
-    if dist.is_available() and dist.is_initialized():
-        return dist.get_rank(), dist.get_world_size()
-    return 0, 1
+# 2. Go up one level to the project root (.../Megatron-DeepSpeed-X-MoE)
+project_root = os.path.dirname(current_dir)
 
-def _trace_handler(prof):
-    # out_dir = os.path.abspath("../scripts/torch_profile/xmoe_prof_yes_torch_tensor_v3")
-    out_dir = os.path.abspath(os.getenv ('profile_dir'))
-    os.makedirs(out_dir, exist_ok=True)
-    r, w = _get_rank_world()
-    fname = os.path.join(out_dir, f"trace_rank{r}_of_{w}.json")
+# 3. Build the absolute path to the examples_xmoe directory
+examples_dir = os.path.join(project_root, "examples_xmoe")
 
-    # optional: print summary to stdout
-    try:
-        print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
-    except Exception:
-        pass
+# 4. Add it to sys.path so Python can find profiler_manager.py
+if examples_dir not in sys.path:
+    sys.path.append(examples_dir)
 
-    # export *one* json per rank containing multiple steps
-    prof.export_chrome_trace(fname)
-
-def _get_profiler():
-    """Create the global profiler if not yet created."""
-    global _PROF
-    if _PROF is None:
-        sched = schedule(wait=2, warmup=3, active=2, repeat=1)
-        _PROF = profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            schedule=sched,
-            record_shapes=True,
-            with_stack=True,
-            with_flops=True,
-            with_modules=True,
-            profile_memory=True,
-            on_trace_ready=_trace_handler,
-        )
-        _PROF.__enter__()   # manually enter context once
-    return _PROF
-
-def finalize_profiler():
-    """Call this once at the very end of training (after pretrain)."""
-    global _PROF
-    if _PROF is not None:
-        _PROF.__exit__(None, None, None)
-        _PROF = None
-# #############################################################################################################
+# 5. Now you can safely import!
+from megatron.profiler_manager import _get_profiler, finalize_profiler
 
 def train(forward_step_func, model, optimizer, opt_param_scheduler,
           train_data_iterator, valid_data_iterator,
@@ -1179,12 +1161,37 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     """Train the model function."""
     args = get_args()
     timers = get_timers()
+    print (f'[megatron/training.py] train()', flush=True)
     
     # Zixian: 10/01/2025: Try to profile megatron pp 
+    # Zixian: 04/15/2025: Enabled a central file to control profiler args in X-MoE/Megatron-DeepSpeed-X-MoE/profiler_manager.py
+    
     to_profile=os.getenv ("to_profile")
-    print (f'[training.py] {to_profile=}')
+    if mpu.get_data_parallel_rank() == 0:
+        print (f'[training.py] {to_profile=}')
     if to_profile=='True': 
-        prof = _get_profiler()
+        wait=1
+        warmup=2
+        active=2
+        repeat=1
+        max_prof_steps = (wait + warmup + active) * repeat 
+        current_prof_step = 0
+        # prof = _get_profiler(wait=wait, warmup=warmup, active=active, repeat=repeat)
+        
+        # from ../examples_xmoe import 
+        # profiler_manager import _get_profiler, finalize_profiler
+        prof = _get_profiler(wait=wait, warmup=warmup, active=active, repeat=repeat)
+        
+        # >>>>>>> START MODIFICATION 1: ENABLE MEMORY HISTORY <<<<<<<
+        # This tells PyTorch to start tracking every memory allocation for the .pkl file
+        try:
+            torch.cuda.memory._record_memory_history(max_entries=2000000)
+            if mpu.get_data_parallel_rank() == 0:
+                print("[training.py] Enabled PyTorch memory history tracking for .pkl snapshot")
+        except AttributeError:
+            print("Warning: torch.cuda.memory._record_memory_history not available in this PyTorch version.")
+        # >>>>>>> END MODIFICATION 1 <<<<<<<
+        
 
     # Write args to tensorboard
     write_args_to_tensorboard()
@@ -1211,7 +1218,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     config.timers = timers
 
     timers('interval-time', log_level=0).start(barrier=True)
-    print_datetime('before the start of training step')
+    print_datetime('[megatron/training.py] before the start of training step')
     report_memory_flag = True
     if args.random_ltd:
         assert model[0].random_ltd_enabled()
@@ -1237,7 +1244,21 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         args.curr_iteration = iteration
         
         # Zixian: 10/01/2025: profiling 
-        if to_profile=='True': 
+        # if to_profile=='True': 
+        #     with record_function("pretrain"):
+        #         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
+        #         train_step(forward_step_func,
+        #                 train_data_iterator,
+        #                 model,
+        #                 optimizer,
+        #                 opt_param_scheduler,
+        #                 config)
+        #     prof.step()
+            
+        #     print (f'[training.py] processing {iteration=}')
+            
+        if to_profile == 'True': 
+            print(f'[training.py] processing {iteration=} (Profiler step {current_prof_step}/{max_prof_steps})')
             with record_function("pretrain"):
                 loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
                 train_step(forward_step_func,
@@ -1246,8 +1267,21 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                         optimizer,
                         opt_param_scheduler,
                         config)
+            print(f"[training.py] Profiling schedule step!")
             prof.step()
+            current_prof_step += 1
+            
+            # ---> THE FIX <---
+            if current_prof_step >= max_prof_steps:
+                print(f"[training.py] Profiling schedule complete! Closing handler early to save memory.")
+                finalize_profiler()   # 1. Close the background trace threads safely
+                to_profile = 'False'  # 2. Dynamically turn off profiling for remaining steps!
+            
+                
+            
+            
         else: 
+            print(f'[training.py] processing training_step {iteration=}')
             loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
                 train_step(forward_step_func,
                         train_data_iterator,
