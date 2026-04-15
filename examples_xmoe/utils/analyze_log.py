@@ -21,14 +21,16 @@ def parse_arguments():
     parser.add_argument("--tp", type=int, required=True, help="TP size.")
     parser.add_argument("--gbs", type=int, required=True, help="Global Batch Size.")
     parser.add_argument("--mbs", type=int, required=True, help="Micro Batch Size.")
-    parser.add_argument("--slurm_job_id", type=str, required=True, help="SLURM Job ID.")
+    # --- CHANGE THIS LINE ---
+    parser.add_argument("--slurm_job_id", type=str, required=False, help="SLURM Job ID. Auto-detected if not provided.")
+    # ------------------------
     parser.add_argument("--seqlen", type=int, required=True, help="Sequence length.")
     parser.add_argument("--num_layers", type=int, required=True, help="Number of layers.")
     parser.add_argument("--num_experts", type=int, required=True, help="Number of experts.")
     parser.add_argument("--expert_dim", type=int, required=True, help="Expert dimension.")
     parser.add_argument("--topk", type=int, required=True, help="Top-K for MoE.")
     parser.add_argument("--hidden_dim", type=int, required=True, help="Hidden dimension.")
-    parser.add_argument("--warmup_steps", type=int, default=5, required=False, help="Warmup steps before recording TFLOPS, default 5")
+    parser.add_argument("--warmup_steps", type=int, default=10, required=False, help="Warmup steps before recording TFLOPS, default 5")
     parser.add_argument("--moe_type", type=str, required=True, help="Type of the MoE implementation (e.g., X-MOE, DS-MOE).")
     parser.add_argument("--model_size", type=str, default="10B", required=False, help="Size of the model (e.g., 7b, 13b).")
 
@@ -59,7 +61,7 @@ def analyze_log(log_file, num_layers, warmup_steps, args):
     )
     time_pattern = re.compile(r"1st_a2a:\s+([0-9.]+),\s+experts:\s+([0-9.]+),\s+2nd_a2a:\s+([0-9.]+)")
     gemm_pattern = re.compile(r"qkv_gemm:\s+([0-9.]+)\s+\|\s+attn_gemm:\s+([0-9.]+)\s+\|\s+out_gemm:\s+([0-9.]+)")
-    peak_mem_pattern = re.compile(r"Overall Peak Reserved:\s+([0-9.]+)\s+GB")
+    peak_mem_pattern = re.compile(r"max reserved:\s+([0-9.]+)")
 
 
     tflops_values, samples_per_sec_values, elapsed_times = [], [], []
@@ -69,7 +71,52 @@ def analyze_log(log_file, num_layers, warmup_steps, args):
     peak_mem_values = []
 
 
-    temp_qkv, temp_attn, temp_out = [], [], []
+    # temp_qkv, temp_attn, temp_out = [], [], []
+
+    # with open(log_file, "r") as f:
+    #     for line in f:
+    #         iteration_match = iteration_pattern.search(line)
+    #         gemm_match = gemm_pattern.search(line)
+    #         time_match = time_pattern.search(line)
+    #         peak_mem_match = peak_mem_pattern.search(line)
+
+
+    #         if iteration_match:
+    #             if temp_qkv:
+    #                 qkv_gemm_values.append(statistics.mean(temp_qkv))
+    #                 attn_gemm_values.append(statistics.mean(temp_attn))
+    #                 out_gemm_values.append(statistics.mean(temp_out))
+    #                 temp_qkv, temp_attn, temp_out = [], [], []
+
+    #             elapsed_times.append(float(iteration_match.group(1)))
+    #             lm_losses.append(float(iteration_match.group(2)))
+    #             moe_losses.append(float(iteration_match.group(3)) if iteration_match.group(3) else 0.0)
+    #             samples_per_sec_values.append(float(iteration_match.group(4)))
+    #             tflops_values.append(float(iteration_match.group(5)))
+
+    #         if time_match:
+    #             first_a2a_values.append(float(time_match.group(1)))
+    #             experts_values.append(float(time_match.group(2)))
+    #             second_a2a_values.append(float(time_match.group(3)))
+
+    #         if gemm_match:
+    #             temp_qkv.append(float(gemm_match.group(1)))
+    #             temp_attn.append(float(gemm_match.group(2)))
+    #             temp_out.append(float(gemm_match.group(3)))
+            
+    #         if peak_mem_match:
+    #             peak_mem_values.append(float(peak_mem_match.group(1)))
+
+
+    # if temp_qkv:
+    #     qkv_gemm_values.append(statistics.mean(temp_qkv))
+    #     attn_gemm_values.append(statistics.mean(temp_attn))
+    #     out_gemm_values.append(statistics.mean(temp_out))
+    tflops_values, samples_per_sec_values, elapsed_times = [], [], []
+    lm_losses, moe_losses = [], []
+    first_a2a_values, experts_values, second_a2a_values = [], [], []
+    qkv_gemm_values, attn_gemm_values, out_gemm_values = [], [], []
+    peak_mem_values = []
 
     with open(log_file, "r") as f:
         for line in f:
@@ -78,14 +125,7 @@ def analyze_log(log_file, num_layers, warmup_steps, args):
             time_match = time_pattern.search(line)
             peak_mem_match = peak_mem_pattern.search(line)
 
-
             if iteration_match:
-                if temp_qkv:
-                    qkv_gemm_values.append(statistics.mean(temp_qkv))
-                    attn_gemm_values.append(statistics.mean(temp_attn))
-                    out_gemm_values.append(statistics.mean(temp_out))
-                    temp_qkv, temp_attn, temp_out = [], [], []
-
                 elapsed_times.append(float(iteration_match.group(1)))
                 lm_losses.append(float(iteration_match.group(2)))
                 moe_losses.append(float(iteration_match.group(3)) if iteration_match.group(3) else 0.0)
@@ -98,18 +138,12 @@ def analyze_log(log_file, num_layers, warmup_steps, args):
                 second_a2a_values.append(float(time_match.group(3)))
 
             if gemm_match:
-                temp_qkv.append(float(gemm_match.group(1)))
-                temp_attn.append(float(gemm_match.group(2)))
-                temp_out.append(float(gemm_match.group(3)))
+                qkv_gemm_values.append(float(gemm_match.group(1)))
+                attn_gemm_values.append(float(gemm_match.group(2)))
+                out_gemm_values.append(float(gemm_match.group(3)))
             
             if peak_mem_match:
                 peak_mem_values.append(float(peak_mem_match.group(1)))
-
-
-    if temp_qkv:
-        qkv_gemm_values.append(statistics.mean(temp_qkv))
-        attn_gemm_values.append(statistics.mean(temp_attn))
-        out_gemm_values.append(statistics.mean(temp_out))
 
     if not tflops_values: return None
 
@@ -120,15 +154,32 @@ def analyze_log(log_file, num_layers, warmup_steps, args):
         print(f"Warning: Less than {warmup_steps} iterations found. Calculating stats over all available iterations.", file=sys.stderr)
         start_index = 0
 
+    # tflops_for_calc = tflops_values[start_index:]
+    # samples_for_calc = samples_per_sec_values[start_index:]
+    # elapsed_for_calc = elapsed_times[start_index:]
+    # first_a2a_for_calc = first_a2a_values[start_index:]
+    # experts_for_calc = experts_values[start_index:]
+    # second_a2a_for_calc = second_a2a_values[start_index:]
+    # qkv_for_calc = qkv_gemm_values[start_index:]
+    # attn_for_calc = attn_gemm_values[start_index:]
+    # out_for_calc = out_gemm_values[start_index:]
     tflops_for_calc = tflops_values[start_index:]
     samples_for_calc = samples_per_sec_values[start_index:]
     elapsed_for_calc = elapsed_times[start_index:]
     first_a2a_for_calc = first_a2a_values[start_index:]
     experts_for_calc = experts_values[start_index:]
     second_a2a_for_calc = second_a2a_values[start_index:]
-    qkv_for_calc = qkv_gemm_values[start_index:]
-    attn_for_calc = attn_gemm_values[start_index:]
-    out_for_calc = out_gemm_values[start_index:]
+
+    # Dynamically align the GEMM values with iterations to drop warmup steps properly
+    if len(qkv_gemm_values) > 0 and len(tflops_values) > 0:
+        chunk_size = len(qkv_gemm_values) // len(tflops_values)
+        gemm_start_index = start_index * chunk_size
+    else:
+        gemm_start_index = 0
+
+    qkv_for_calc = qkv_gemm_values[gemm_start_index:] if len(qkv_gemm_values) > gemm_start_index else qkv_gemm_values
+    attn_for_calc = attn_gemm_values[gemm_start_index:] if len(attn_gemm_values) > gemm_start_index else attn_gemm_values
+    out_for_calc = out_gemm_values[gemm_start_index:] if len(out_gemm_values) > gemm_start_index else out_gemm_values
 
     avg_tflops = statistics.mean(tflops_for_calc) if tflops_for_calc else 0.0
     tflops_std_dev = statistics.stdev(tflops_for_calc) if len(tflops_for_calc) > 1 else 0.0
@@ -307,11 +358,43 @@ def write_profile_json(data, args):
         
     return filename
 
+def extract_job_id(log_file_path):
+    """
+    Attempts to extract Job ID from:
+    1. The filename (Old style: xmoe-type-12345.o)
+    2. The parent directory (New style: logs/job_12345/rank_0.log)
+    """
+    filename = os.path.basename(log_file_path)
+    abs_path = os.path.abspath(log_file_path)
+    parent_dir = os.path.basename(os.path.dirname(abs_path))
+
+    # 1. Try filename regex (Old Style)
+    match_filename = re.search(r"xmoe-\w+-(\d+\.?\d*)\.o", filename)
+    if match_filename:
+        return match_filename.group(1)
+
+    # 2. Try directory regex (New Style)
+    match_dir = re.search(r"job_(\d+)", parent_dir)
+    if match_dir:
+        return match_dir.group(1)
+    
+    return None
 
 
 def main():
     """Main function to run the analysis and save results."""
     args = parse_arguments()
+    
+    if not args.slurm_job_id:
+        detected_id = extract_job_id(args.log_file)
+        if detected_id:
+            args.slurm_job_id = detected_id
+            print(f"Auto-detected SLURM Job ID from path: {args.slurm_job_id}")
+        else:
+            print("Warning: Could not auto-detect SLURM Job ID. Defaulting to '000000'.")
+            args.slurm_job_id = "000000"
+    
+    
     print (f'{args.profiling=}')
     analysis_results = analyze_log(args.log_file, args.num_layers, args.warmup_steps, args)
 
