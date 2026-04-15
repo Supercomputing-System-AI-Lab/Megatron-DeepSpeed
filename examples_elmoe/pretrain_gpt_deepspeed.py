@@ -727,7 +727,7 @@ if __name__ == "__main__":
     if to_profile=='True': 
         try: 
             # prof = _get_profiler()
-            from profiler_manager import _get_profiler, finalize_profiler
+            from megatron.profiler_manager import _get_profiler, finalize_profiler
             prof = _get_profiler(wait=0, warmup=0, active=2, repeat=1) # Passes arguments once
 
             with record_function("pretrain"):

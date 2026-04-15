@@ -78,7 +78,7 @@ def _set_env_variables(args):
     all_procs = comm.allgather(proc_name)
     local_rank = sum([i == proc_name for i in all_procs[:rank]])
     
-    print (f'{rank=}, {comm=}, {world_size=}, {master_addr=}, {proc_name=}, {all_procs=}, {local_rank=}')
+    # print (f'{rank=}, {comm=}, {world_size=}, {master_addr=}, {proc_name=}, {all_procs=}, {local_rank=}')
     
     os.environ['RANK'] = str(rank)
     os.environ['WORLD_SIZE'] = str(world_size)
@@ -90,7 +90,7 @@ def _set_env_variables(args):
     using_mpi = torch.distributed.get_backend() == 'mpi'
     print("using_mpi=", using_mpi)
     
-    print (f'[pretrain_gpt_deepspeed.py] after _set_env_variables')
+    # print (f'[pretrain_gpt_deepspeed.py] after _set_env_variables')
 
 def get_env_variables(args):
     rank = int(os.environ["RANK"])
@@ -123,12 +123,12 @@ def model_provider(pre_process=True, post_process=True):
     config = core_transformer_config_from_args(args)
     
     
-    if os.getenv ('profile_memory') == 'True': 
-        print (f'[pretrain_gpt_deepspeed.py] init_memory_logger() ')
-        from profiling_utils.memory_profiler import init_memory_logger
-        init_memory_logger() 
-    else: 
-        print (f'[pretrain_gpt_deepspeed.py] DISABLED init_memory_logger() ')
+    # if os.getenv ('profile_memory') == 'True': 
+    #     print (f'[pretrain_gpt_deepspeed.py] init_memory_logger() ')
+    #     from profiling_utils.memory_profiler import init_memory_logger
+    #     init_memory_logger() 
+    # else: 
+    #     print (f'[pretrain_gpt_deepspeed.py] DISABLED init_memory_logger() ')
     
     
     
@@ -369,7 +369,52 @@ def calculate_mos_loss(args, stu_output, teacher_model, tokens, position_ids, at
 # ---------------------------
 # Global profiler object
 # ---------------------------
+# ================================================ Original pretrain_gpt_deepspeed.py ==================================================
+# _PROF = None
+
+# def _get_rank_world():
+#     # Works under DeepSpeed/Megatron once dist is initialized
+#     if dist.is_available() and dist.is_initialized():
+#         return dist.get_rank(), dist.get_world_size()
+#     return 0, 1
+
+# def _trace_handler(prof):
+#     # out_dir = os.path.abspath("../scripts/torch_profile/xmoe_prof_yes_torch_tensor_v3")
+#     out_dir = os.path.abspath("../scripts/torch_profile/ds_prof_no_torch_tensor_v6")
+#     os.makedirs(out_dir, exist_ok=True)
+#     r, w = _get_rank_world()
+#     fname = os.path.join(out_dir, f"trace_rank{r}_of_{w}.json")
+
+#     # optional: print summary to stdout
+#     try:
+#         print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
+#     except Exception:
+#         pass
+
+#     # export *one* json per rank containing multiple steps
+#     prof.export_chrome_trace(fname)
+
+# def _get_profiler():
+#     """Create the global profiler if not yet created."""
+#     global _PROF
+#     if _PROF is None:
+#         sched = schedule(wait=1, warmup=1, active=5, repeat=1)
+#         _PROF = profile(
+#             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+#             schedule=sched,
+#             record_shapes=True,
+#             with_stack=True,
+#             with_flops=True,
+#             with_modules=True,
+#             profile_memory=True,
+#             on_trace_ready=_trace_handler,
+#         )
+#         _PROF.__enter__()   # manually enter context once
+#     return _PROF
+
+# ================================================ Copied from training.py ==================================================
 _PROF = None
+
 
 def _get_rank_world():
     # Works under DeepSpeed/Megatron once dist is initialized
@@ -378,26 +423,60 @@ def _get_rank_world():
     return 0, 1
 
 def _trace_handler(prof):
-    # out_dir = os.path.abspath("../scripts/torch_profile/xmoe_prof_yes_torch_tensor_v3")
-    out_dir = os.path.abspath("../scripts/torch_profile/ds_prof_no_torch_tensor_v6")
+    # Fallback to '.' if 'profile_dir' environment variable is not set
+    out_dir = os.path.abspath(os.getenv('profile_dir', '.'))
     os.makedirs(out_dir, exist_ok=True)
     r, w = _get_rank_world()
-    fname = os.path.join(out_dir, f"trace_rank{r}_of_{w}.json")
+    
+    # # 1. Safely export chrome trace
+    # fname_json = os.path.join(out_dir, f"trace_rank{r}_of_{w}.json")
+    # try:
+    #     print(f"--- Profiler Exporting chrome trace for rank {r} ---")
+    #     prof.export_chrome_trace(fname_json)
+    # except Exception as e:
+    #     print(f"[Rank {r}] Warning: Failed to export chrome trace: {e}")
 
-    # optional: print summary to stdout
+    # # 2. Optional: print summary to stdout
+    # try:
+    #     print(f"--- Profiler Summary for Rank {r} ---")
+    #     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
+    # except Exception:
+    #     pass
+
+    # # 3. Safely export memory timeline
+    # fname_html = os.path.join(out_dir, f"memory_trace_rank{r}_of_{w}.html")
+    # try:
+    #     # On ROCm, sometimes specifying the exact device (e.g., "cuda:0") helps,
+    #     # but the primary fix is preventing the empty sequence error from crashing training.
+    #     device_str = f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cuda"
+    #     prof.export_memory_timeline(fname_html, device=device_str)
+    # except ValueError:
+    #     print(f"[Rank {r}] Warning: No memory events found to export timeline (ignoring empty sequence).")
+    # except Exception as e:
+    #     print(f"[Rank {r}] Warning: Failed to export memory timeline: {e}")
+        
+    # Memory pickle
     try:
-        print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
-    except Exception:
+        pickle_fname = os.path.join(out_dir, f"snapshot_rank{r}_of_{w}.pickle")
+        torch.cuda.memory._dump_snapshot(pickle_fname)
+        if r == 0:
+            print(f"[training.py] Dumped memory snapshot to {pickle_fname}")
+    except Exception as e:
+        print(f"[Rank {r}] Warning: Failed to dump memory snapshot: {e}")
+
+    # Finally, turn off the memory tracker AFTER dumping
+    try:
+        torch.cuda.memory._record_memory_history(enabled=None)
+    except AttributeError:
         pass
 
-    # export *one* json per rank containing multiple steps
-    prof.export_chrome_trace(fname)
 
-def _get_profiler():
+def _get_profiler(wait=0, warmup=0, active=2, repeat=1):
     """Create the global profiler if not yet created."""
     global _PROF
     if _PROF is None:
-        sched = schedule(wait=1, warmup=1, active=5, repeat=1)
+        print (f'[pretrain_gpt_deepspeed.py]: global _PROF is None, initiating a new one')
+        sched = schedule(wait=wait, warmup=warmup, active=active, repeat=repeat)
         _PROF = profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
             schedule=sched,
@@ -409,22 +488,29 @@ def _get_profiler():
             on_trace_ready=_trace_handler,
         )
         _PROF.__enter__()   # manually enter context once
+    else:
+        print (f'[pretrain_gpt_deepspeed.py] loading pre-allocated global _PROF')
     return _PROF
 
+# ================================================ Original pretrain_gpt_deepspeed.py finalize prof ==================================================
 def finalize_profiler():
     """Call this once at the very end of training (after pretrain)."""
+    rank, _ = _get_rank_world()
+    
+    print (f'[pretrain_gpt_deepspeed.py] {rank=} closing profiler')
     global _PROF
     if _PROF is not None:
         _PROF.__exit__(None, None, None)
         _PROF = None
         
-    # Ensure all ranks have finished writing their trace files
-    if dist.is_available() and dist.is_initialized():
-        dist.barrier()
+    # # Ensure all ranks have finished writing their trace files
+    # if dist.is_available() and dist.is_initialized():
+    #     dist.barrier()
 
     # Have only rank 0 perform the merge
-    rank, _ = _get_rank_world()
+    
     if rank == 0:
+        print (f'[pretrain_gpt_deepspeed.py] {rank=} merging traces', flush=True)
         merge_traces()
         
 import json
@@ -627,13 +713,22 @@ def get_data(train_val_test_num_samples):
 if __name__ == "__main__":
     git_ds_info()
     
+    import sys
+
+    # print(f"[pretrained_gpt_deepspeed.py] Python executable: {sys.executable} \n Python version: {sys.version}", flush=True)
+    # print("[pretrained_gpt_deepspeed.py] \nModule search paths:")
+    # for path in sys.path:
+    #     print(f"  {path}", flush=True)
+    
 
     to_profile=os.getenv ("to_profile")
     print (f'{to_profile=}')
     
     if to_profile=='True': 
         try: 
-            prof = _get_profiler()
+            # prof = _get_profiler()
+            from megatron.profiler_manager import _get_profiler, finalize_profiler
+            prof = _get_profiler(wait=0, warmup=0, active=2, repeat=1) # Passes arguments once
 
             with record_function("pretrain"):
                 print (f'Trying to profile')
@@ -643,8 +738,22 @@ if __name__ == "__main__":
                         forward_step,
                         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
                         data_post_process=data_post_process)
+            print (f'pretrain_gpt_deepspee.py: after pretrain')
         finally: 
+            rank = int(os.environ["RANK"])
+            print (f'[pretrain_gpt_deepspee.py] {rank=}, before finalize_profiler')
             finalize_profiler()
+            
+            # # 1. Ensure all GPUs finish writing their traces before anyone exits
+            # if dist.is_initialized():
+            #     print(f"[Rank {dist.get_rank()}] Waiting for all ranks to finish...", flush=True)
+            #     dist.barrier()
+            #     dist.destroy_process_group()
+            
+            print("[pretrained_gpt_deepspeed.py] Exiting forcefully.", flush=True)
+            
+            # 2. Force the OS to terminate the process immediately 
+            os._exit(0)
     else: 
         pretrain(train_valid_test_datasets_provider,
                     model_provider,
