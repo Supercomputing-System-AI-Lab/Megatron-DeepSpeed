@@ -23,6 +23,7 @@ from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
 from megatron.model.checkpointed_functions import custom_checkpoint
 
 from torch.profiler import profile, record_function, ProfilerActivity, schedule
+from megatron import utils
 
 import deepspeed
 try:
@@ -68,7 +69,7 @@ try:
 except ImportError:
     MixedFusedRMSNorm = None
     
-from profiling_utils.memory_profiler import log_memory, set_step
+# from profiling_utils.memory_profiler import log_memory, set_step
 
 
 """ We use the following notation throughout this file:
@@ -121,7 +122,7 @@ class ParallelMLP(MegatronModule):
         args = get_args()
 
         self.add_bias = config.add_bias_linear
-        self.add_bias = False
+        # self.add_bias = False
         ffn_hidden_size = config.ffn_hidden_size
         if config.gated_linear_unit:
             ffn_hidden_size *= 2
@@ -1100,25 +1101,27 @@ class ParallelTransformerLayer(MegatronModule):
                 else:   
                     # print (f'[transformer.py] Using Fine-grained MoE \n'*10)
                    self.mlp = MoE(args.hidden_size, 
-                                ParallelMLP(config,
-                                    moe=True,
-                                    enable_expert_tensor_parallelism=enable_expert_tensor_parallelism),
-                                num_experts=self.num_experts,
-                                ep_size=args.moe_expert_parallel_size,
-                                k=args.topk,
-                                use_residual=(args.mlp_type == 'residual'),
-                                capacity_factor=args.moe_train_capacity_factor,
-                                eval_capacity_factor=args.moe_eval_capacity_factor,
-                                min_capacity=args.moe_min_capacity,
-                                drop_tokens=args.moe_token_dropping, use_tutel=args.use_tutel,
-                                enable_expert_tensor_parallelism=enable_expert_tensor_parallelism,
-                                enable_expert_sequence_parallelism=args.enable_expert_sequence_parallelism,
-                                use_uneven_all2all=args.use_uneven_all_to_all,
-                                use_pft=args.use_pft,
-                                use_rbd=args.use_rbd,
-                                use_groupedGEMM=args.use_groupedGEMM,
-                                use_triton=args.use_triton,
-                                rbd_mesh_size=args.rbd_mesh_size)
+                                  config=config, 
+                                    expert= ParallelMLP(config,
+                                        moe=True,
+                                        enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
+                                    ),
+                                    num_experts=self.num_experts,
+                                    ep_size=args.moe_expert_parallel_size,
+                                    k=args.topk,
+                                    use_residual=(args.mlp_type == 'residual'),
+                                    capacity_factor=args.moe_train_capacity_factor,
+                                    eval_capacity_factor=args.moe_eval_capacity_factor,
+                                    min_capacity=args.moe_min_capacity,
+                                    drop_tokens=args.moe_token_dropping, use_tutel=args.use_tutel,
+                                    enable_expert_tensor_parallelism=enable_expert_tensor_parallelism,
+                                    enable_expert_sequence_parallelism=args.enable_expert_sequence_parallelism,
+                                    use_uneven_all2all=args.use_uneven_all_to_all,
+                                    use_pft=args.use_pft,
+                                    use_rbd=args.use_rbd,
+                                    use_groupedGEMM=args.use_groupedGEMM,
+                                    use_triton=args.use_triton,
+                                    rbd_mesh_size=args.rbd_mesh_size)
 
         # Set bias+dropout+add fusion grad_enable execution handler.
         TORCH_MAJOR = int(torch.__version__.split('.')[0])
@@ -1458,8 +1461,10 @@ class ParallelTransformerLayer(MegatronModule):
                 inference_params=None,
                 rotary_pos_emb=None):
         # hidden_states: [s, b, h]
-        import os 
-        rank = os.getenv (f'RANK')
+        # import os 
+        # rank = int (os.getenv (f'RANK'))
+        # if (rank < 2): 
+        #     print (f"[transformer.py ParallelTransformerLayer  Forward !!!!!!!!] {rank=} {self.layer_number=}", flush=True)
         
         from megatron.core import mpu
         # Get parallel sizes
@@ -1482,7 +1487,9 @@ class ParallelTransformerLayer(MegatronModule):
         
         # print(f"[megatron/model/transformer.py - ParallelTransformerLayer - forward] {rank=}, {self.layer_number=}, before ATTENTION")
         # log_mem (file_name = 'megatron/model/transformer.py', rank=rank, message=f'layer-{self.layer_number} before ATTENTION')
-        log_memory(event="before_attention", layer_num=self.layer_number)
+        # log_memory(event="before_attention", layer_num=self.layer_number)
+        # utils.report_memory (f"  - before_attention_L{self.layer_number}")
+        
         
 #        print(f"[MEM-UTIL-CHECK] [megatron/model/transformer.py - ParallelTransformerLayer - forward] before ATTENTION {rank=}, {self.layer_number=}, ")
 #        # log_mem (file_name = 'megatron/model/transformer.py - ParallelTransformerLayer - forward', rank=rank, message=f'layer-{self.layer_number} before ATTENTION')
@@ -1539,7 +1546,8 @@ class ParallelTransformerLayer(MegatronModule):
         else:
             raise NotImplementedError("fine-grained control is not implemented")
         
-        log_memory(event="after_attention", layer_num=self.layer_number)
+        # log_memory(event="after_attention", layer_num=self.layer_number)
+        # utils.report_memory (f"  - after_attention_L{self.layer_number}")
         
         # print(f"[megatron/model/transformer.py - ParallelTransformerLayer - forward] {rank=}, {self.layer_number=}, before MLP")
         # print(f"[megatron/model/transformer.py - ParallelTransformerLayer - forward] {self.mlp=}")
@@ -1553,7 +1561,8 @@ class ParallelTransformerLayer(MegatronModule):
         # mlp_bias = None                             # only create if truly needed
 
         # print (f'BEFORE MLP, {rank=}, {self.layer_number=} {layernorm_output.shape=}') 
-        log_memory(event="before_moe", layer_num=self.layer_number)
+        # log_memory(event="before_moe", layer_num=self.layer_number)
+        # utils.report_memory (f"  - before_moe_L{self.layer_number}")
 #        # print (f'BEFORE MLP, {rank=}, {self.layer_number=} {layernorm_output.shape=}, {layernorm_output=}') 
 #        log_mem (file_name = 'megatron/model/transformer.py - ParallelTransformerLayer - forward', rank=rank, message=f'layer-{self.layer_number} before MOE')
         if self.num_experts == 1:
@@ -1564,7 +1573,9 @@ class ParallelTransformerLayer(MegatronModule):
                 mlp_output, moe_loss, _ = self.mlp(layernorm_output)
         if TIMING:
             self.moe_timer.stop()
-        log_memory(event="after_moe", layer_num=self.layer_number)
+        # log_memory(event="after_moe", layer_num=self.layer_number)
+        # utils.report_memory (f"  - after_moe_L{self.layer_number}")
+        torch.cuda.reset_peak_memory_stats()
             
         # print (f'AFTER MLP, {rank=}, {self.layer_number=} {layernorm_output.shape=}') 
         
@@ -2201,6 +2212,8 @@ class ParallelTransformer(MegatronModule):
                 
                 # Forward pass.
                 moe_losses = []
+                print (f'[transformer.py] {self.checkpoint_activations=}')
+                print (f'[transformer.py] {self.recompute_granularity=}')
                 if self.checkpoint_activations:
                     hidden_states, moe_losses = self._checkpointed_forward(hidden_states,
                                                                attention_mask,
