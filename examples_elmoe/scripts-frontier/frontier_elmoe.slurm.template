@@ -5,7 +5,7 @@
 #SBATCH -J {{MODEL_SIZE}}-{{RUN_TYPE}}-nbs{{NUM_BATCHES}}
 #SBATCH -o logs/job_%j_pp{{PP_SIZE}}_ep{{EP_PARALLEL_SIZE}}_{{MOE_TYPE}}_ckpt_{{ACTIVATION_CHECKPOINT}}_planner_{{RUN_PLANNER}}/a-xmoe-{{RUN_TYPE}}-%j.o
 #SBATCH -e logs/job_%j_pp{{PP_SIZE}}_ep{{EP_PARALLEL_SIZE}}_{{MOE_TYPE}}_ckpt_{{ACTIVATION_CHECKPOINT}}_planner_{{RUN_PLANNER}}/a-xmoe-{{RUN_TYPE}}-%j.e
-#SBATCH -t 00:10:00
+#SBATCH -t 01:00:00
 #SBATCH -p {{PARTITION}}
 #SBATCH -N {{NODES}}
 #SBATCH -d singleton

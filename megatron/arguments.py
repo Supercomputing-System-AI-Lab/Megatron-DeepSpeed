@@ -961,6 +961,12 @@ def _add_training_args(parser):
                        dest='gradient_accumulation_fusion')
     group.add_argument('--use-dataset-only', type=bool, required=False, default=False,
                        help='If set to True, only use the megatron dataset for external trainer ')
+    
+    # ELMoE uneven pp + ckpt partitioning 
+    group.add_argument('--uneven-pp-partition', type=int, nargs='+', default=None,
+                    help='Layer counts per PP stage, e.g. 6 8 8 10')
+    group.add_argument('--dynamic-checkpoint-partition', type=int, nargs='+', default=None,
+                    help='Checkpoint layer counts per PP stage, e.g. 6 0 0 0')
     return parser
 
 

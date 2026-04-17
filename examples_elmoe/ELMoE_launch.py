@@ -158,11 +158,24 @@ def apply_planner_result(result, remaining_argv):
     os.environ['UNEVEN_PP'] = 'True'
     os.environ['DYNAMIC_CHECKPOINT'] = 'True'
     
+    print (f'[ELMoE_launch.py] {partition_str=}')
+    print (f'[ELMoE_launch.py] {ckpt_str=}')
+    
     # Override --micro-batch-size and --global-batch-size in argv
     remaining_argv = _override_arg(remaining_argv, '--micro-batch-size', 
                                     str(result.micro_batch_size))
     remaining_argv = _override_arg(remaining_argv, '--global-batch-size', 
                                     str(result.effective_global_batch_size))
+    
+    sorted_plans = sorted(result.stage_plans, key=lambda x: x.stage_id)
+    partition_list = [str(p.num_layers) for p in sorted_plans]
+    ckpt_list = [str(p.num_checkpoints) for p in sorted_plans]
+    
+    # Pass as CLI args (nargs='+' expects separate entries)
+    remaining_argv.extend(['--uneven-pp-partition'] + partition_list)
+    remaining_argv.extend(['--dynamic-checkpoint-partition'] + ckpt_list) 
+    print (f'[ELMoE_launch.py] {partition_list=}')
+    print (f'[ELMoE_launch.py] {ckpt_list=}')
     
     if rank == 0:
         print("=" * 70)
