@@ -9,7 +9,7 @@
 #SBATCH -p {{PARTITION}}
 #SBATCH -N {{NODES}}
 #SBATCH -d singleton
-#a SBATCH -q debug
+#aa SBATCH -q debug
 #a SBATCH -p extended
 #a --switches=1@00:20:00
 #a --contiguous
