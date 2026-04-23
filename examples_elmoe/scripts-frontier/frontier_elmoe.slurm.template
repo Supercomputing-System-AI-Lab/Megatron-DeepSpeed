@@ -37,6 +37,7 @@ CHECKPOINT_NUM_LAYERS="{{CHECKPOINT_NUM_LAYERS}}"
 DYNAMIC_CHECKPOINT="{{DYNAMIC_CHECKPOINT}}"
 UNEVEN_PP="{{UNEVEN_PP}}"
 RUN_PLANNER="{{RUN_PLANNER}}"
+COLLECT_PROFILING_CACHE="{{COLLECT_PROFILING_CACHE}}"
 
 
 # ACTIVATION_CHECKPOINT="false"
@@ -58,8 +59,30 @@ echo "CHECKPOINT_NUM_LAYERS: $CHECKPOINT_NUM_LAYERS"
 echo "DYNAMIC_CHECKPOINT: $DYNAMIC_CHECKPOINT"
 echo "UNEVEN_PP: $UNEVEN_PP"
 echo "RUN_PLANNER: $RUN_PLANNER"
+echo "COLLECT_PROFILING_CACHE: $COLLECT_PROFILING_CACHE"
 
-which python 
+# --- Profiling-cache-collection overrides -----------------------------------
+# When COLLECT_PROFILING_CACHE=true, this run populates planner_profiling_cache/
+# via analyze_log.py --profiling. To produce a clean log for that extraction:
+#   (1) PP_SIZE=1 so the existing PP conditionals select WALL_CLOCK_BREAKDOWN=true
+#       and --no-pipeline-parallel (required for per-module timer lines).
+#   (2) TRITON_DISABLE_CACHE=1 so first-call compile timings are observed.
+#   (3) profile_memory=True for memory-balanced planner data.
+#   (4) RUN_PLANNER=false — producer path must not also invoke the consumer,
+#       which would try to read a cache that doesn't exist yet.
+#   (5) Skip the Triton cache warmup (contradicts TRITON_DISABLE_CACHE=1).
+#   (6) Pass --profiling to analyze_log.py so write_profile_json() runs.
+if [[ "$COLLECT_PROFILING_CACHE" == "true" ]]; then
+    PP_SIZE=1
+    RUN_PLANNER="false"
+    PROFILING_SKIP_CACHE_WARM=1
+    ANALYZE_LOG_PROFILING_FLAG="--profiling"
+else
+    PROFILING_SKIP_CACHE_WARM=0
+    ANALYZE_LOG_PROFILING_FLAG=""
+fi
+
+which python
 
 
 JOB_DIR="logs/job_${SLURM_JOB_ID}_pp{{PP_SIZE}}_ep{{EP_PARALLEL_SIZE}}_{{MOE_TYPE}}_ckpt_{{ACTIVATION_CHECKPOINT}}_planner_{{RUN_PLANNER}}"
@@ -219,23 +242,30 @@ if [[ ${PP_SIZE} -gt 1 ]]; then
     WALL_CLOCK_BREAKDOWN="false"
     export WALL_CLOCK_BREAKDOWN="false"
 else
-    # WALL_CLOCK_BREAKDOWN="true"
-    # export WALL_CLOCK_BREAKDOWN="true"
-    WALL_CLOCK_BREAKDOWN="false"
-    export WALL_CLOCK_BREAKDOWN="false"
+    
+    # If enabling profiling caches 
+    if [[ "$COLLECT_PROFILING_CACHE" == "true" ]]; then
+        WALL_CLOCK_BREAKDOWN="true"
+        export WALL_CLOCK_BREAKDOWN="true"
+    else 
+        WALL_CLOCK_BREAKDOWN="false"
+        export WALL_CLOCK_BREAKDOWN="false"
+        # WALL_CLOCK_BREAKDOWN="true"
+        # export WALL_CLOCK_BREAKDOWN="true"
+    fi 
 fi
 
 if [[ "${MOE_TYPE}" == "X-MOE" ]]; then
     megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft"
     # megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-rbd"
-elif [[ "${MOE_TYPE}" == "X-MOE-3D" ]]; then
+elif [[ "${MOE_TYPE}" == "ELMOE-3D" ]]; then
     megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft"
 
-elif [[ "${MOE_TYPE}" == "X-MOE-GroupedGEMM-triton" ]]; then
+elif [[ "${MOE_TYPE}" == "ELMOE-GroupedGEMM-triton" ]]; then
     megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-groupedGEMM --use-triton"
     export USE_TRITON_GROUPGEMM="True"
 
-elif [[ "${MOE_TYPE}" == "X-MOE-GroupedGEMM-primus" ]]; then
+elif [[ "${MOE_TYPE}" == "ELMOE-GroupedGEMM-primus" ]]; then
     export USE_AITER_GROUPGEMM=True 
     megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-groupedGEMM --no-bias-gelu-fusion --disable-bias-linear"
 
@@ -246,9 +276,6 @@ elif [[ "${MOE_TYPE}" == "TUTEL-MOE" ]]; then
     megatron_options="${megatron_options} --use-tutel"
 fi
 
-# if [[ $EP_SIZE -gt 32 ]]; then
-#     megatron_options="${megatron_options} --use-rbd"
-# fi 
 
 if [ "${ACTIVATION_CHECKPOINT}" = "true" ]; then
     megatron_options="${megatron_options} --checkpoint-activations"
@@ -309,16 +336,22 @@ PERSISTENT_TRITON_CACHE="/lustre/orion/gen150/scratch/zixianw4/.triton/cache"
 TMP_TRITON_DIR="/tmp/triton_cache_${SLURM_JOB_ID}"
 export TRITON_CACHE_DIR="${TMP_TRITON_DIR}"
 
-echo "--- Warming Triton cache on all nodes at: $(date '+%F %T') ---"
-srun -N ${NODES} -n ${NODES} --ntasks-per-node=1 \
-    bash cache_setup.sh ${PERSISTENT_TRITON_CACHE} ${TMP_TRITON_DIR}
-echo "--- Cache warm done at: $(date '+%F %T') ---"
+if [[ "${PROFILING_SKIP_CACHE_WARM}" != "1" ]]; then
+    echo "--- Warming Triton cache on all nodes at: $(date '+%F %T') ---"
+    srun -N ${NODES} -n ${NODES} --ntasks-per-node=1 \
+        bash cache_setup.sh ${PERSISTENT_TRITON_CACHE} ${TMP_TRITON_DIR}
+    echo "--- Cache warm done at: $(date '+%F %T') ---"
+else
+    echo "--- Profiling-cache-collection run: skipping Triton cache warm (TRITON_DISABLE_CACHE=1) ---"
+fi
 # ================================================== END of Setup Moving Cache =============================================================
 
 
 # ================================================== Frontier Global Env Var Setup =============================================================
 # --- Execution Logic ---
 export CUDA_DEVICE_MAX_CONNECTIONS=1
+# Try to mitigate triton groupgemm's effect for 4 arenas per thread instead of default 8. 
+# export MALLOC_ARENA_MAX=4
 
 
 export RANK=$SLURM_PROCID
@@ -434,6 +467,8 @@ export to_profile="False"
 export profile_memory="False"
 # export to_profile="True"
 # export profile_memory="True"
+
+
 export profile_dir="${JOB_DIR}/torch_profile"
 
 planner_mode="{{RUN_PLANNER}}"
@@ -536,7 +571,7 @@ python ../utils/analyze_log.py \
         --activation_checkpointing $ACTIVATION_CHECKPOINT \
         --checkpoint_interval $CHECKPOINT_NUM_LAYERS \
         --dynamic_checkpoint $DYNAMIC_CHECKPOINT \
-        --uneven_pp $UNEVEN_PP >> "${MERGED_LOG}"
+        --uneven_pp $UNEVEN_PP ${ANALYZE_LOG_PROFILING_FLAG} >> "${MERGED_LOG}"
 
 python ../utils/analyze_memory.py "${MERGED_LOG}" #>> "${MERGED_LOG}"
 
