@@ -30,6 +30,9 @@ def build_tokenizer(args):
         assert args.vocab_file is not None
         assert args.merge_file is not None
         tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file)
+    elif args.tokenizer_type == 'HFTokenizer':
+        assert args.vocab_file is not None
+        tokenizer = _HFTokenizer(args.vocab_file)
     elif args.tokenizer_type == 'SentencePieceTokenizer':
         assert args.tokenizer_model is not None
         tokenizer = _SentencePieceTokenizer(args.tokenizer_model, vocab_extra_ids=args.vocab_extra_ids)
@@ -280,6 +283,47 @@ class _GPT2BPETokenizer(AbstractTokenizer):
 
     def tokenize(self, text):
         return self.tokenizer.encode(text)
+
+    def detokenize(self, token_ids):
+        return self.tokenizer.decode(token_ids)
+
+    @property
+    def eod(self):
+        return self.eod_id
+
+
+class _HFTokenizer(AbstractTokenizer):
+    """Wraps a HuggingFace fast tokenizer (tokenizer.json file)."""
+
+    def __init__(self, tokenizer_file, eod_token=None):
+        super().__init__('HFTokenizer')
+        from tokenizers import Tokenizer
+        self.tokenizer = Tokenizer.from_file(tokenizer_file)
+        # Probe known EOD token names across tokenizer families:
+        #   GPT-2 / GPT-NeoX: <|endoftext|>
+        #   Llama 3 / 3.1:    <|end_of_text|>
+        candidates = [eod_token] if eod_token else ['<|endoftext|>', '<|end_of_text|>']
+        self.eod_id = next((self.tokenizer.token_to_id(t) for t in candidates
+                            if self.tokenizer.token_to_id(t) is not None), None)
+        assert self.eod_id is not None, \
+            f'No known EOD token found. Tried: {candidates}'
+        self._vocab = self.tokenizer.get_vocab()
+        self._inv_vocab = {i: t for t, i in self._vocab.items()}
+
+    @property
+    def vocab_size(self):
+        return self.tokenizer.get_vocab_size()
+
+    @property
+    def vocab(self):
+        return self._vocab
+
+    @property
+    def inv_vocab(self):
+        return self._inv_vocab
+
+    def tokenize(self, text):
+        return self.tokenizer.encode(text).ids
 
     def detokenize(self, token_ids):
         return self.tokenizer.decode(token_ids)
