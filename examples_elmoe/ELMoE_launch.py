@@ -13,6 +13,8 @@ Usage (from srun):
 """
 import sys
 import os
+import json
+import time
 import argparse
 
 
@@ -28,7 +30,9 @@ def split_args():
                         choices=['optimize', 'optimize-membal'])
     parser.add_argument('--planner-profile-dir', type=str,
                         default='./planner_profiling_cache')
-    parser.add_argument('--planner-memory-limit-gb', type=float, default=62.0)
+    # parser.add_argument('--planner-memory-limit-gb', type=float, default=62.0)
+    # Zixian: added to prevent unexpected memory surge --> OOM
+    parser.add_argument('--planner-memory-limit-gb', type=float, default=61.5)
     parser.add_argument('--planner-overhead-ms', type=float, default=55.0)
     parser.add_argument('--planner-optimizer-ratio', type=float, default=0.10)
     parser.add_argument('--planner-max-mbs', type=int, default=8)
@@ -69,7 +73,7 @@ def run_planner(remaining_argv, planner_args):
     parser.add_argument('--checkpoint-num-layers', type=int, default=1)
     model_args, _ = parser.parse_known_args(remaining_argv)
 
-    rank = int(os.environ.get('SLURM_PROCID', 0))
+    rank = _get_global_rank()
     total_gpus = int(os.environ.get('SLURM_NTASKS', 8))
     num_nodes = int(os.environ.get('SLURM_NNODES', 1))
 
@@ -146,7 +150,7 @@ def apply_planner_result(result, remaining_argv):
     Inject planner outputs into env vars and Megatron's argv.
     Called by every rank with the same deterministic result.
     """
-    rank = int(os.environ.get('SLURM_PROCID', 0))
+    rank = _get_global_rank()
     
     sorted_plans = sorted(result.stage_plans, key=lambda x: x.stage_id)
     partition_str = " ".join(str(p.num_layers) for p in sorted_plans)
@@ -164,9 +168,13 @@ def apply_planner_result(result, remaining_argv):
     # Override --micro-batch-size and --global-batch-size in argv
     remaining_argv = _override_arg(remaining_argv, '--micro-batch-size', 
                                     str(result.micro_batch_size))
-    remaining_argv = _override_arg(remaining_argv, '--global-batch-size', 
+    remaining_argv = _override_arg(remaining_argv, '--global-batch-size',
                                     str(result.effective_global_batch_size))
-    
+
+    # Keep the DeepSpeed config JSON's batch sizes consistent with the planner's
+    # mbs/gbs so the engine and Megatron's data loader agree (see function docstring).
+    _sync_ds_config_with_planner(remaining_argv, result)
+
     sorted_plans = sorted(result.stage_plans, key=lambda x: x.stage_id)
     partition_list = [str(p.num_layers) for p in sorted_plans]
     ckpt_list = [str(p.num_checkpoints) for p in sorted_plans]
@@ -186,7 +194,9 @@ def apply_planner_result(result, remaining_argv):
         print(f"  Global Batch Size: {result.effective_global_batch_size}")
         print(f"  Layer Partition:   [{partition_str}]")
         print(f"  Ckpt Partition:    [{ckpt_str}]")
-        print(f"  Throughput Est:    {result.throughput_tokens_per_sec:.0f} tokens/s")
+        mem_str = " ".join(f"{p.memory_used_gb:.1f}" for p in sorted_plans)
+        print(f"  Stage Memory (GB): [{mem_str}]")
+        print(f"  Peak Memory (GB):  {max(p.memory_used_gb for p in sorted_plans):.2f}")
         print("=" * 70, flush=True)
     
     return remaining_argv
@@ -202,13 +212,114 @@ def _override_arg(argv, flag, value):
     return argv
 
 
+def _get_global_rank():
+    """Global rank, launcher-agnostic (torchrun / SLURM / MPI), not SLURM-only."""
+    for var in ('RANK', 'SLURM_PROCID', 'OMPI_COMM_WORLD_RANK', 'PMI_RANK', 'PMIX_RANK'):
+        val = os.environ.get(var)
+        if val is not None:
+            try:
+                return int(val)
+            except ValueError:
+                pass
+    return 0
+
+
+def _shared_job_id():
+    """An id shared by all ranks of this job, used to namespace the barrier marker.
+    Returns None when no launcher-provided shared id exists (then we skip the
+    explicit marker barrier and rely on atomic rename + the later dist-init
+    collective for cross-rank visibility)."""
+    for var in ('SLURM_JOB_ID', 'PBS_JOBID', 'LSB_JOBID', 'TORCHELASTIC_RUN_ID', 'JOB_ID'):
+        val = os.environ.get(var)
+        if val:
+            return val
+    return None
+
+
+def _find_arg_value(argv, flag):
+    """Return the token following `flag` in argv, or None if absent/danging."""
+    try:
+        idx = argv.index(flag)
+        return argv[idx + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+def _patch_ds_config_file(config_path, micro_batch_size, global_batch_size):
+    """Rewrite the DeepSpeed config JSON so its batch sizes match the planner's
+    choice. Atomic (tmp + os.replace). Writer-only. Returns the patched dict."""
+    with open(config_path, 'r', encoding='utf-8') as f:
+        cfg = json.load(f)
+    cfg['train_batch_size'] = int(global_batch_size)
+    cfg['train_micro_batch_size_per_gpu'] = int(micro_batch_size)
+    # Let DeepSpeed re-derive gas = train_batch_size / (mbs * dp); drop any stale value.
+    cfg.pop('gradient_accumulation_steps', None)
+    tmp_path = os.path.join(
+        os.path.dirname(os.path.abspath(config_path)),
+        f".{os.path.basename(config_path)}.tmp.{os.getpid()}",
+    )
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(cfg, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, config_path)  # atomic on the same filesystem
+    return cfg
+
+
+def _sync_ds_config_with_planner(remaining_argv, result, _wait_timeout_s=120.0):
+    """Make the DeepSpeed config's batch sizes consistent with the planner.
+
+    Megatron's data loader honors the planner's --micro-batch-size, but DeepSpeed
+    reads the static JSON written by the SLURM template (train_micro_batch_size_per_gpu
+    baked at template time, typically 1). When the planner picks mbs>=2 the two
+    disagree: the engine pulls gbs/dp micro-batches each holding mbs samples, draining
+    the data index ~mbs x too fast -> StopIteration mid-run, and the reported TFLOPs
+    are credited against the nominal gbs -> ~halved. We rewrite the JSON so the engine
+    and the data loader agree (single writer + atomic rename; an optional filesystem
+    barrier gates the readers when a shared job id is available)."""
+    rank = _get_global_rank()
+    config_path = _find_arg_value(remaining_argv, '--deepspeed_config')
+    if config_path is None or not os.path.exists(config_path):
+        if rank == 0:
+            print(f"[ELMoE_launch.py] WARNING: --deepspeed_config not usable "
+                  f"({config_path!r}); skipping ds-config mbs sync.", flush=True)
+        return
+
+    job_id = _shared_job_id()
+    marker = f"{config_path}.ready.{job_id}" if job_id else None
+
+    if rank == 0:
+        cfg = _patch_ds_config_file(config_path, result.micro_batch_size,
+                                    result.effective_global_batch_size)
+        if marker is not None:
+            with open(marker, 'w', encoding='utf-8') as f:
+                f.write("ready\n")
+        print(f"[ELMoE_launch.py] ds-config synced: "
+              f"train_micro_batch_size_per_gpu={cfg['train_micro_batch_size_per_gpu']} "
+              f"train_batch_size={cfg['train_batch_size']} "
+              f"(gradient_accumulation_steps re-derived by DeepSpeed)", flush=True)
+    elif marker is not None:
+        # Barrier: block until rank 0 has atomically replaced the file. The marker is
+        # namespaced by job id, so a stale marker from a previous job can't be matched.
+        waited = 0.0
+        while not os.path.exists(marker):
+            time.sleep(0.05)
+            waited += 0.05
+            if waited >= _wait_timeout_s:
+                raise RuntimeError(
+                    f"[ELMoE_launch.py] rank {rank}: timed out after "
+                    f"{_wait_timeout_s}s waiting for ds-config marker {marker}")
+    # If no shared job id, the atomic rename plus the dist-init collective that runs
+    # before deepspeed.initialize() reads the file provides cross-rank visibility.
+
+
 # =========================================================
 # 3. Main Entry Point
 # =========================================================
 def main():
     planner_args, remaining_argv = split_args()
     
-    rank = int(os.environ.get('SLURM_PROCID', 0))
+    rank = _get_global_rank()
 
     if planner_args.run_planner != 'false':
         if planner_args.run_planner == 'true-membal':
