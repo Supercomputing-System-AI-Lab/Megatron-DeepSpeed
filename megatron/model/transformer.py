@@ -2354,3 +2354,97 @@ class LMHeadPipe(MegatronModule):
             return logits
         else:
             return logits, attention_mask
+
+# ====================================================================
+# Per-layer timing (Forward / Recompute / Backward)
+# Enable with: export LAYER_TIMING=1   (default: only times layer 0)
+# Optionally:   export LAYER_TIMING_TARGETS=0,5,15  (any layer numbers)
+# ====================================================================
+import os as _os
+
+class LayerTimingProfiler:
+    def __init__(self):
+        self.enabled = _os.getenv("LAYER_TIMING", "0") == "1"
+        targets = _os.getenv("LAYER_TIMING_TARGETS", "1")
+        self.targets = {int(x) for x in targets.split(",") if x.strip()}
+        self.fwd, self.recompute, self.bwd = [], [], []
+        # NEW — per-component
+        self.components = {}   # name → list of ms (per fwd call)
+        self.component_iter = 0   # tracks which fwd-call we're on
+
+    def attach(self, layer):
+        if not self.enabled or layer.layer_number not in self.targets:
+            return
+        layer._tp_state = {}
+        layer.register_forward_pre_hook(self._fwd_pre)
+        layer.register_forward_hook(self._fwd_post)
+        layer.register_full_backward_pre_hook(self._bwd_pre)
+        layer.register_full_backward_hook(self._bwd_post)
+        # NEW — walk submodules and instrument every linear-ish module
+        for name, sub in layer.named_modules():
+            cls = type(sub).__name__
+            if any(k in cls for k in ("Linear",)):   # catches Column/Row/Parallel-Linear, nn.Linear
+                sub._tp_name = f"L{layer.layer_number}.{name}.{cls}"
+                sub.register_forward_pre_hook(self._sub_pre)
+                sub.register_forward_hook(self._sub_post)
+
+    def _sub_pre(self, mod, args):
+        e = torch.cuda.Event(enable_timing=True); e.record()
+        mod._tp_sub_start = e
+
+    def _sub_post(self, mod, args, out):
+        e = torch.cuda.Event(enable_timing=True); e.record()
+        torch.cuda.synchronize()
+        ms = mod._tp_sub_start.elapsed_time(e)
+        self.components.setdefault(mod._tp_name, []).append(ms)
+
+    # _fwd_pre, _fwd_post, _bwd_pre, _bwd_post — unchanged from before
+
+    def _fwd_pre(self, mod, args):
+        is_recompute = torch.is_grad_enabled() 
+        e = torch.cuda.Event(enable_timing=True); e.record()
+        mod._tp_state['fwd_start'] = e
+        mod._tp_state['is_recompute'] = is_recompute
+
+    def _fwd_post(self, mod, args, out):
+        e = torch.cuda.Event(enable_timing=True); e.record()
+        torch.cuda.synchronize()
+        ms = mod._tp_state['fwd_start'].elapsed_time(e)
+        bucket = self.recompute if mod._tp_state['is_recompute'] else self.fwd
+        bucket.append(ms)
+        # ← REMOVE the print call from here
+
+    def _bwd_pre(self, mod, grad_output):
+        e = torch.cuda.Event(enable_timing=True); e.record()
+        mod._tp_state['bwd_start'] = e
+
+    def _bwd_post(self, mod, grad_input, grad_output):
+        e = torch.cuda.Event(enable_timing=True); e.record()
+        torch.cuda.synchronize()
+        ms = mod._tp_state['bwd_start'].elapsed_time(e)
+        self.bwd.append(ms)
+        self._print(mod.layer_number)   # ← ADD print here, fires after backward completes
+
+    def _print(self, ln):
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+        i = len(self.bwd) - 1
+        f = self.fwd[i] if i < len(self.fwd) else 0.0
+        r = self.recompute[i] if i < len(self.recompute) else 0.0
+        b = self.bwd[i] if i < len(self.bwd) else 0.0
+        b_pure = max(b - r, 0.0)
+        print(f"[LAYER-{ln}-TIMING iter={i+1}] "
+              f"fwd={f:.2f} ms | recompute={r:.2f} ms | bwd_total={b:.2f} ms | bwd_pure={b_pure:.2f} ms")
+        # NEW — print per-component on the recompute iteration only (cleaner attribution)
+        # Per-component buckets fill 2× per iter (original fwd + recompute), so take the latest tail.
+        # We sum over the most recent N component calls = number of submodules × 2.
+        print(f"[LAYER-{ln}-COMPONENTS iter={i+1}]")
+        for name in sorted(self.components.keys()):
+            times = self.components[name]
+            if len(times) >= 2:
+                # last call is recompute, second-to-last is original fwd
+                fwd_t = times[-2]
+                rec_t = times[-1]
+                print(f"   {name:60s} fwd={fwd_t:6.2f} ms  recomp={rec_t:6.2f} ms")
+
+_LAYER_TIMER = LayerTimingProfiler()
