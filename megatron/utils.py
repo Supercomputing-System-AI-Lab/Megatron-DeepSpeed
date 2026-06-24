@@ -304,7 +304,8 @@ def throughput_calculator(model, args, iteration_time, total_iterations):
     if hasattr(args, 'actual_seq_length'):
         seq_len = args.actual_seq_length
 
-    pre_and_post_mha_gemm_macs = batch_size * num_layers * (1 + (2 // gqa) + 1) * (hidden_size**2) * seq_len
+    # 05/06/2026: Zixian: changed from (2 // gqa) --> (2 / gqa) to correctly account for GQA (q_heads / kv_heads)>2. 
+    pre_and_post_mha_gemm_macs = batch_size * num_layers * (1 + (2 / gqa) + 1) * (hidden_size**2) * seq_len
     mha_bgemm_macs = batch_size * num_layers * 2 * head_dim * num_attention_heads * (seq_len**2)
     ffn_gemm_macs = batch_size * num_layers * ffn_multiplier * ffn_hidden_size * hidden_size * seq_len * num_experts_routed_to
     logit_lmhead_gemm_macs = batch_size * vocab_size * hidden_size * seq_len
