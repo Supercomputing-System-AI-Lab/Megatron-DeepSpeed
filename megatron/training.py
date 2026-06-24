@@ -1087,6 +1087,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             elapsed_time_per_iteration * 1000.0)
         log_string += ' learning rate: {:.3E} |'.format(learning_rate)
         log_string += ' global batch size: {:5d} |'.format(batch_size)
+        loss_for_wandb = {}
         for key in total_loss_dict:
             if key not in [advanced_iters_key, skipped_iters_key,
                            nan_iters_key]:
@@ -1094,6 +1095,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                       float(max(1, total_loss_dict[advanced_iters_key]))
                 if avg > 0.0:
                     log_string += ' {}: {:.6E} |'.format(key, avg)
+                    loss_for_wandb[key] = avg
                 total_loss_dict[key] = get_accelerator().FloatTensor([0.0])
         if loss_scale is not None:
             log_string += ' loss scale: {:.1f} |'.format(loss_scale)
@@ -1114,10 +1116,47 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             total_loss_dict[nan_iters_key])
         log_string += ' samples per second: {:.3f} |'.format(samples_per_sec)
         log_string += ' TFLOPs: {:.2f} |'.format(tflops)
+        skipped_count = total_loss_dict[skipped_iters_key]
+        nan_count = total_loss_dict[nan_iters_key]
         total_loss_dict[advanced_iters_key] = 0
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
         print_rank_last(log_string)
+
+        # Wandb: log the rest of the iteration-line fields + memory.
+        # Throughput keys are already covered by the wandb.run.log(tput) block above.
+        # Gated on wandb.run is not None -- only the last rank ever has it set
+        # (init lives in pretrain_gpt_deepspeed.py:_maybe_init_wandb).
+        if wandb is not None and getattr(wandb, 'run', None) is not None:
+            wandb_log = {
+                'train/iteration': iteration,
+                'train/consumed_samples': args.consumed_train_samples,
+                'train/consumed_tokens': args.consumed_train_tokens,
+                'train/learning_rate': learning_rate,
+                'train/global_batch_size': batch_size,
+                'train/actual_seqlen': seq_len,
+                'train/skipped_iterations': skipped_count,
+                'train/nan_iterations': nan_count,
+                'memory/allocated_gb': torch.cuda.memory_allocated() / (1024.0 ** 3),
+                'memory/max_allocated_gb': torch.cuda.max_memory_allocated() / (1024.0 ** 3),
+                'memory/reserved_gb': torch.cuda.memory_reserved() / (1024.0 ** 3),
+                'memory/max_reserved_gb': torch.cuda.max_memory_reserved() / (1024.0 ** 3),
+            }
+            if loss_scale is not None:
+                wandb_log['train/loss_scale'] = float(loss_scale)
+            if grad_norm is not None:
+                wandb_log['train/grad_norm'] = float(grad_norm)
+            if num_zeros_in_grad is not None:
+                wandb_log['train/num_zeros_in_grad'] = float(num_zeros_in_grad)
+            if params_norm is not None:
+                wandb_log['train/params_norm'] = float(params_norm)
+            for k, v in loss_for_wandb.items():
+                wandb_log[f'loss/{k}'] = v
+            try:
+                wandb.run.log(wandb_log, step=iteration)
+            except Exception as e:
+                print_rank_last(f'[wandb] log failed at iter {iteration}: {e}')
+
         # if report_memory_flag and learning_rate > 0.:
         if (iteration % 2 == 0) and (learning_rate > 0.):
             # Report memory after optimizer state has been initialized.
@@ -1181,16 +1220,21 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         # from ../examples_xmoe import 
         # profiler_manager import _get_profiler, finalize_profiler
         prof = _get_profiler(wait=wait, warmup=warmup, active=active, repeat=repeat)
-        
-        # >>>>>>> START MODIFICATION 1: ENABLE MEMORY HISTORY <<<<<<<
-        # This tells PyTorch to start tracking every memory allocation for the .pkl file
-        try:
-            torch.cuda.memory._record_memory_history(max_entries=2000000)
+
+    # Standalone CUDA-allocator memory snapshot (.pickle for https://pytorch.org/memory_viz).
+    # Independent of the torch profiler (`to_profile`): runs whenever profile_memory=True, so
+    # memory tracing works even with kineto OFF and isn't taken down if kineto crashes.
+    profile_memory = os.getenv('profile_memory') == 'True'
+    mem_snapshot_after_steps = int(os.getenv('mem_snapshot_after_steps', '3'))
+    _mem_snapshot_done = False
+    if profile_memory:
+        from megatron.profiler_manager import enable_memory_history
+        if enable_memory_history():
             if mpu.get_data_parallel_rank() == 0:
-                print("[training.py] Enabled PyTorch memory history tracking for .pkl snapshot")
-        except AttributeError:
-            print("Warning: torch.cuda.memory._record_memory_history not available in this PyTorch version.")
-        # >>>>>>> END MODIFICATION 1 <<<<<<<
+                print(f"[training.py] Memory history ON; dumping .pickle after "
+                      f"{mem_snapshot_after_steps} steps", flush=True)
+        else:
+            profile_memory = False
         
 
     # Write args to tensorboard
@@ -1291,6 +1335,13 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                         config)
         iteration += 1
         args.iteration = iteration
+
+        # One-shot allocator snapshot after a few warm steps (standalone; no kineto needed).
+        if profile_memory and not _mem_snapshot_done and iteration >= mem_snapshot_after_steps:
+            from megatron.profiler_manager import dump_memory_snapshot
+            dump_memory_snapshot()
+            _mem_snapshot_done = True
+
         new_samples = mpu.get_data_parallel_world_size() * \
                                        args.micro_batch_size * \
                                        get_num_microbatches()

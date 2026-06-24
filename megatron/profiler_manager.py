@@ -133,38 +133,76 @@ def _trace_handler(prof):
         prof.export_chrome_trace(fname_json)
     except Exception as e:
         print(f"[Rank {r}] Warning: Failed to export chrome trace: {e}")
+    # NOTE: memory (.pickle) is NOT dumped here. The CUDA-allocator snapshot is handled
+    # standalone by dump_memory_snapshot() (called from training.py), so memory tracing
+    # works even when this kineto profiler is off or crashes.
 
-    
-    # # pickle memory 
-    # try:
-    #     pickle_fname = os.path.join(out_dir, f"snapshot_rank{r}_of_{w}.pickle")
-    #     torch.cuda.memory._dump_snapshot(pickle_fname)
-    #     if r == 0:
-    #         print(f"[profiler_manager.py] Dumped memory snapshot to {pickle_fname}")
-    # except Exception as e:
-    #     print(f"[Rank {r}] Warning: Failed to dump memory snapshot: {e}")
 
-    # try:
-    #     torch.cuda.memory._record_memory_history(enabled=None)
-    # except AttributeError:
-    #     pass
+def _snapshot_rank_allowed():
+    """Which ranks write a memory snapshot. `mem_snapshot_ranks` env: comma-list of global
+    ranks, or 'all'. Default '0' (rank 0 only) -- avoids a write storm of large .pickles
+    from every rank. Set e.g. mem_snapshot_ranks="0,8,16" for one rank per pipeline stage."""
+    r, _ = _get_rank_world()
+    sel = os.getenv('mem_snapshot_ranks', '0').strip()
+    if sel.lower() == 'all':
+        return True
+    allowed = {int(x) for x in sel.split(',') if x.strip().lstrip('-').isdigit()}
+    return r in allowed
+
+
+def enable_memory_history(max_entries=2_000_000):
+    """Start recording CUDA caching-allocator history (for the .pickle snapshot), on the
+    ranks selected by mem_snapshot_ranks. Standalone -- no torch.profiler. Returns True if
+    this rank will snapshot."""
+    if not _snapshot_rank_allowed():
+        return False
+    try:
+        torch.cuda.memory._record_memory_history(max_entries=max_entries)
+        return True
+    except AttributeError:
+        print("Warning: torch.cuda.memory._record_memory_history not available.")
+        return False
+
+
+def dump_memory_snapshot():
+    """Dump the CUDA caching-allocator snapshot to <profile_dir>/snapshot_rank{r}.pickle
+    and stop recording. Independent of torch.profiler; load at https://pytorch.org/memory_viz."""
+    out_dir = os.path.abspath(os.getenv('profile_dir', '.'))
+    os.makedirs(out_dir, exist_ok=True)
+    r, w = _get_rank_world()
+    try:
+        pickle_fname = os.path.join(out_dir, f"snapshot_rank{r}_of_{w}.pickle")
+        torch.cuda.memory._dump_snapshot(pickle_fname)
+        if r == 0:
+            print(f"[profiler_manager.py] Dumped memory snapshot to {pickle_fname}", flush=True)
+    except Exception as e:
+        print(f"[Rank {r}] Warning: Failed to dump memory snapshot: {e}", flush=True)
+    try:
+        torch.cuda.memory._record_memory_history(enabled=None)
+    except AttributeError:
+        pass
+
 
 def _get_profiler(wait=0, warmup=0, active=2, repeat=1):
     global _PROF
     if _PROF is None:
+        # Kineto tracks ONLY kernel/timing here. Memory (.pickle) is handled separately by
+        # the standalone allocator snapshot (enable_memory_history/dump_memory_snapshot), so
+        # memory tracing doesn't depend on this profiler. with_stack/with_flops dropped
+        # (heavy at scale); profile_memory=False (kineto memory was a crash suspect on ROCm).
         print(f'[profiler_manager.py]: global _PROF is None, initiating a new one')
         sched = schedule(wait=wait, warmup=warmup, active=active, repeat=repeat)
         _PROF = profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
             schedule=sched,
             record_shapes=True,
-            with_stack=True,
-            with_flops=True,
+            with_stack=False,
+            with_flops=False,
             with_modules=True,
-            profile_memory=True,
+            profile_memory=False,
             on_trace_ready=_trace_handler,
         )
-        _PROF.__enter__() 
+        _PROF.__enter__()
     else:
         print(f'[profiler_manager.py]: loading pre-allocated global _PROF')
     return _PROF
