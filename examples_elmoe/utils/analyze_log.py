@@ -41,6 +41,7 @@ def parse_arguments():
     # Updated to include defaults as requested
     parser.add_argument("--dynamic_checkpoint", type=str, required=False, default="False", help="Whether dynamic checkpointing activations. True if arg is str(True)")
     parser.add_argument("--uneven_pp", type=str, required=False, default="False", help="Whether use uneven pipeline layer partitioning. True if arg is str(True)")
+    parser.add_argument("--zero", type=int, required=False, default=0, help="DeepSpeed ZeRO stage (0=disabled, 1, 2, or 3).")
 
     parser.add_argument('--profiling', action='store_true', help='This will store the gemm & comm time into a json file and redirect the output file')
     
@@ -191,7 +192,7 @@ def analyze_log(log_file, num_layers, warmup_steps, args):
     avg_attn_gemm_time = statistics.mean(attn_for_calc) if attn_for_calc else 0.0
     avg_out_gemm_time = statistics.mean(out_for_calc) if out_for_calc else 0.0
 
-    THEORETICAL_MAX_TFLOPS = 181.0
+    THEORETICAL_MAX_TFLOPS = 191.0
     b, s, h, h_ffn, topk, ep = args.mbs, args.seqlen, args.hidden_dim, args.expert_dim, args.topk, args.ep
 
     flops_expert = (2 * 2 * b * s * topk * h * h_ffn) / ep if ep > 0 else 0
@@ -259,6 +260,7 @@ def write_to_xlsx(data, args):
         "Expert Util (%)", "QKV Util (%)", "Attn Util (%)", "Out Util (%)",
         "SeqLen", "Num Experts", "Expert Dim", "Hidden Dim", "Top-K",
         "SLURM_JOB_ID", "Avg Iteration Time (ms)",
+        "ZeRO Stage",
     ]
 
     # --- UPDATED: Main row dictionary with new data ---
@@ -291,6 +293,7 @@ def write_to_xlsx(data, args):
         "Top-K": args.topk,
         "SLURM_JOB_ID": args.slurm_job_id,
         "Avg Iteration Time (ms)": f"{data['avg_elapsed']:.1f}", # <<< THIS LINE WAS ADDED
+        "ZeRO Stage": args.zero,
     }
     new_main_df = pd.DataFrame([main_row_dict])[header]
 
@@ -381,6 +384,106 @@ def extract_job_id(log_file_path):
     return None
 
 
+def compare_predicted_vs_actual_memory(args):
+    """Compare the planner's PREDICTED per-stage memory (the 'Stage Memory (GB): [...]' line that
+    ELMoE_launch.py prints) against the ACTUAL profiled per-rank 'max reserved' memory.
+
+    Layout: the run samples one rank per node (stride = gpus_per_node). For a model replica
+    (DP) >= 2, each pipeline stage spans nodes_per_stage = nodes // pp adjacent nodes
+    (pp_stage0_dp0, pp_stage0_dp1, pp_stage1_dp0, ...). We collapse the DP replicas of each
+    stage two ways -- MAX over DP and MEAN over DP -- and report MAE and MAPE of each against
+    the per-stage prediction."""
+    import os, re
+    job_dir = os.path.dirname(os.path.abspath(args.log_file))
+    pp = args.pp
+    gpus_per_node = args.gpus_per_node
+    total_nodes = args.nodes
+    total_gpus = total_nodes * gpus_per_node
+
+    # --- 1. predicted per-stage memory (planner output, printed on rank 0) ---
+    predicted = None
+    pat = re.compile(r"Stage Memory \(GB\):\s*\[([^\]]*)\]")
+    for src in (args.log_file, os.path.join(job_dir, "rank_0.log")):
+        try:
+            with open(src, 'r', errors='ignore') as f:
+                m = pat.findall(f.read())
+        except OSError:
+            continue
+        if m:
+            predicted = [float(x) for x in re.findall(r"[-+]?\d*\.?\d+", m[-1])]
+            break
+    if not predicted:
+        print("\n[mem-compare] No planner 'Stage Memory (GB):' line found (planner disabled?); "
+              "skipping predicted-vs-actual memory comparison.")
+        return
+
+    # --- 2. actual per-node 'max reserved' (one rank per node) ---
+    res_re = re.compile(r"max reserved:\s*([\d.]+)")
+    node_reserved = []
+    for rank in range(0, total_gpus, gpus_per_node):
+        val = None
+        try:
+            with open(os.path.join(job_dir, f"rank_{rank}.log"), 'r', errors='ignore') as f:
+                hits = res_re.findall(f.read())
+                if hits:
+                    val = max(float(x) for x in hits)
+        except OSError:
+            pass
+        node_reserved.append(val)
+
+    # --- 3. group nodes -> pipeline stages (DP replicas adjacent), collapse via max & mean ---
+    nps = max(1, total_nodes // pp)            # nodes (DP replicas) per pipeline stage
+    actual_max, actual_avg = [], []
+    for s in range(pp):
+        grp = [v for v in node_reserved[s * nps:(s + 1) * nps] if v is not None]
+        actual_max.append(max(grp) if grp else None)
+        actual_avg.append(sum(grp) / len(grp) if grp else None)
+
+    # --- 4. MAE / MAPE vs the per-stage prediction ---
+    n = min(len(predicted), pp)
+    def _errs(act):
+        ae, ape = [], []
+        for i in range(n):
+            a = act[i] if i < len(act) else None
+            if a is not None:
+                d = abs(predicted[i] - a)
+                ae.append(d)
+                if a != 0:
+                    ape.append(d / abs(a) * 100.0)
+        mae = sum(ae) / len(ae) if ae else float('nan')
+        mape = sum(ape) / len(ape) if ape else float('nan')
+        return mae, mape, len(ae)
+    mae_max, mape_max, k_max = _errs(actual_max)
+    mae_avg, mape_avg, k_avg = _errs(actual_avg)
+
+    # --- 5. report (same style as the rest) ---
+    print("\n================================================================================\n"
+          "--- Predicted vs Actual Per-Stage Memory (Max Reserved GB) ---\n"
+          "================================================================================")
+    print(f"PP stages: {pp} | DP replicas (nodes) per stage: {nps} | predicted entries: {len(predicted)}")
+    print(f"{'Stage':<6} {'Predicted':<11} {'Actual(maxDP)':<14} {'Actual(avgDP)':<14} {'|err|max':<9} {'|err|avg':<9}")
+    print("-" * 72)
+    for i in range(n):
+        p, am, av = predicted[i], actual_max[i], actual_avg[i]
+        sm = f"{am:.2f}" if am is not None else "N/A"
+        sa = f"{av:.2f}" if av is not None else "N/A"
+        em = f"{abs(p - am):.2f}" if am is not None else "N/A"
+        ev = f"{abs(p - av):.2f}" if av is not None else "N/A"
+        print(f"{i:<6} {p:<11.2f} {sm:<14} {sa:<14} {em:<9} {ev:<9}")
+    print("-" * 72)
+    print(f"{'MAE  vs MAX-over-DP  (GB):':<30} {mae_max:.4f}   (over {k_max} stages)")
+    print(f"{'MAPE vs MAX-over-DP  (%):':<30} {mape_max:.2f}")
+    print(f"{'MAE  vs MEAN-over-DP (GB):':<30} {mae_avg:.4f}   (over {k_avg} stages)")
+    print(f"{'MAPE vs MEAN-over-DP (%):':<30} {mape_avg:.2f}")
+    print("\nPredicted per-stage (GB):")
+    print(", ".join(f"{x:.2f}" for x in predicted[:n]))
+    print("Actual MAX-over-DP per-stage (GB):")
+    print(", ".join((f"{x:.2f}" if x is not None else "N/A") for x in actual_max[:n]))
+    print("Actual MEAN-over-DP per-stage (GB):")
+    print(", ".join((f"{x:.2f}" if x is not None else "N/A") for x in actual_avg[:n]))
+    print("================================================================================")
+
+
 def main():
     """Main function to run the analysis and save results."""
     args = parse_arguments()
@@ -435,7 +538,7 @@ def main():
         print(f"{'Peak Memory (GB):':<{align_width}} {analysis_results['peak_mem_gb']:.4f}")
 
         print(f'================================================================================\n'
-              f'--- FLOPS Utilization Analysis (Per Layer @ 181 TFLOPS (MI250 FP16) Max) ---\n'
+              f'--- FLOPS Utilization Analysis (Per Layer @ 191 TFLOPS (MI250 FP16) Max) ---\n'
               f'================================================================================')
 
         b, s, h, h_ffn, topk, ep = args.mbs, args.seqlen, args.hidden_dim, args.expert_dim, args.topk, args.ep
@@ -465,6 +568,12 @@ def main():
         print(f"  - {'Utilization:':<20} {analysis_results['util_out']:.2f}%")
 
         print(f'================================================================================')
+
+        # Predicted (planner) per-stage memory vs actual profiled per-rank reserved memory.
+        try:
+            compare_predicted_vs_actual_memory(args)
+        except Exception as _e:
+            print(f"[mem-compare] skipped due to error: {_e}")
     else:
         print("No iteration stats found in log.")
 
