@@ -30,6 +30,16 @@ examples_xmoe/data/*.idx
 examples_xmoe/data/*.jsonl
 examples_xmoe/data/index-cache/
 
+examples_elmoe/data/FORGE/*
+examples_elmoe/data/llama31_tokenizer
+examples_elmoe/data/index-cache
+examples_elmoe/data/*.txt
+examples_elmoe/data/*.json
+examples_elmoe/data/*.bin
+examples_elmoe/data/*.idx
+examples_elmoe/data/*.jsonl
+examples_elmoe/data/index-cache/
+
 examples_xmoe/scripts-frontier/logs/*
 examples_xmoe/scripts-frontier/logs_old/*
 examples_xmoe/scripts-frontier/output/*
@@ -44,3 +54,11 @@ examples_xmoe/scripts-frontier/results/*# auto-generated json files and logs
 megatron/fused_kernels/*_hip.cpp
 megatron/fused_kernels/*_hip.h
 megatron/fused_kernels/*_hip.hip
+
+# Checkpoints
+examples_elmoe/scripts-frontier/checkpoint
+
+# Run artifacts 
+examples_elmoe/scripts-frontier/output
+examples_elmoe/scripts-frontier/temp_slurm
+examples_elmoe/scripts-frontier/temp_ds_json
