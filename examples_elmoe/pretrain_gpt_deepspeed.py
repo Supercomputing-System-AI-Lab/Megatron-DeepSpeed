@@ -39,6 +39,67 @@ from datetime import timedelta
 
 from deepspeed.moe.layer import MoE
 
+
+try:
+    import wandb
+except (ImportError, ModuleNotFoundError):
+    wandb = None
+
+
+def _maybe_init_wandb():
+    """Opt-in wandb on the last rank only.
+
+    Activates only when WANDB_PROJECT is set in the env (so a commented-out
+    wandb block in the SLURM template means no wandb activity). Uses RANK /
+    WORLD_SIZE env vars set by the SLURM template before pretrain runs to
+    gate to the last rank without needing torch.distributed up.
+
+    Once initialized here, the wandb.run.log() blocks inside megatron/training.py
+    light up automatically (they're already gated on `wandb.run is not None`):
+      - throughput keys (TFLOPs, samples_per_sec, ...) at line ~1060
+      - iteration-line metrics + memory (lm_loss, learning_rate, grad_norm,
+        nan iters, memory_*_gb, ...) right after print_rank_last
+
+    Auth comes from WANDB_API_KEY env var or ~/.netrc (`wandb login`).
+    """
+    if wandb is None:
+        return
+    if not os.environ.get('WANDB_PROJECT'):
+        return
+    if os.environ.get('WANDB_DISABLED', '').lower() in ('true', '1', 'yes'):
+        return
+    # Read SLURM_PROCID/SLURM_NTASKS first: under srun these are the only env
+    # vars guaranteed to be per-task. RANK/WORLD_SIZE in this template are
+    # exported once at script level (where SLURM_PROCID=0) and then propagated
+    # by --export=ALL, so every child task would see RANK=0 and the gate would
+    # let every rank init -> N duplicate wandb runs. Fall back to RANK only
+    # for non-SLURM launchers (torchrun etc.).
+    rank = int(os.environ.get('SLURM_PROCID', os.environ.get('RANK', '0')))
+    world = int(os.environ.get('SLURM_NTASKS', os.environ.get('WORLD_SIZE', '1')))
+    if rank != world - 1:
+        return
+    try:
+        wandb.init(
+            project=os.environ['WANDB_PROJECT'],
+            name=os.environ.get('WANDB_NAME'),
+            entity=os.environ.get('WANDB_ENTITY'),
+            group=os.environ.get('WANDB_GROUP'),
+            dir=os.environ.get('WANDB_DIR'),
+            mode=os.environ.get('WANDB_MODE', 'online'),
+        )
+        # Use Megatron's iteration counter as the x-axis for every chart.
+        # Continuation runs land iter 1801..N (logged by the comprehensive
+        # block in training.py) and overlay cleanly with the original run's
+        # iter 0..1800 in the wandb UI — no per-run x-axis offset.
+        wandb.define_metric('train/iteration')
+        wandb.define_metric('*', step_metric='train/iteration')
+        run = getattr(wandb, 'run', None)
+        url = getattr(run, 'url', None) or getattr(run, 'dir', '?')
+        print(f'[wandb] initialized "{run.name}" -> {url}', flush=True)
+    except Exception as e:
+        print(f'[wandb] init failed: {e}; continuing without wandb', flush=True)
+
+
 master_port = "29500"
 default_pg_timeout = timedelta(minutes=1)
 # def setup_distributed_env(init_method=None, rank = 0, world_size=16):
@@ -593,11 +654,11 @@ def forward_step(data_iterator, model):
     to_profile = os.getenv ("to_profile")
     # print (f'inside forward_step')
     # print (f'{to_profile=}')
-    if to_profile=="True": 
+    if to_profile=="True":
         # """
-        print (f'Getting profiler: ')
-        prof = _get_profiler()
-
+        # Profiler is owned solely by megatron/training.py (single owner). Here we only
+        # add record_function labels -- they attach to that active profiler. Do NOT
+        # create/step a profiler here (that was a second, separate profiler object).
         with record_function("get_batch"):
             tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator)
 
@@ -619,9 +680,6 @@ def forward_step(data_iterator, model):
                 if args.teacher_forward and args.teacher_model is not None:
                     mos_loss = calculate_mos_loss(args, stu_output, args.teacher_model[0], tokens, position_ids, attention_mask)
             loss = partial(loss_func, loss_mask, moe_loss, mos_loss)
-
-            # Backward pass (in pretrain function, for example)
-            prof.step()  # Record each iteration or step
         return output_tensor, loss
     
     else: 
@@ -712,7 +770,8 @@ def get_data(train_val_test_num_samples):
 
 if __name__ == "__main__":
     git_ds_info()
-    
+    _maybe_init_wandb()    # opt-in via WANDB_PROJECT env var; runs once before pretrain
+
     import sys
 
     # print(f"[pretrained_gpt_deepspeed.py] Python executable: {sys.executable} \n Python version: {sys.version}", flush=True)
@@ -724,11 +783,14 @@ if __name__ == "__main__":
     to_profile=os.getenv ("to_profile")
     print (f'{to_profile=}')
     
-    if to_profile=='True': 
-        try: 
-            # prof = _get_profiler()
-            from megatron.profiler_manager import _get_profiler, finalize_profiler
-            prof = _get_profiler(wait=0, warmup=0, active=2, repeat=1) # Passes arguments once
+    if to_profile=='True':
+        _exit_code = 0
+        try:
+            # The profiler is created/owned by megatron/training.py (sole owner), so it
+            # starts at the training loop -- NOT during model build. Here we only wrap
+            # pretrain and guarantee the trace is flushed on exit (safety net for an
+            # early crash before training.py's own finalize fires).
+            from megatron.profiler_manager import finalize_profiler
 
             with record_function("pretrain"):
                 print (f'Trying to profile')
@@ -736,30 +798,40 @@ if __name__ == "__main__":
                         model_provider,
                         ModelType.encoder_or_decoder,
                         forward_step,
-                        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+                        args_defaults={},
                         data_post_process=data_post_process)
             print (f'pretrain_gpt_deepspee.py: after pretrain')
-        finally: 
-            rank = int(os.environ["RANK"])
+        except BaseException:
+            # IMPORTANT: os._exit() below bypasses normal exception printing, so without
+            # this the real error (e.g. a profiler crash in the first train_step) is
+            # silently swallowed and the job exits 0. Print the traceback and fail loud.
+            import traceback
+            _exit_code = 1
+            print("[pretrain_gpt_deepspeed.py] EXCEPTION during profiled pretrain "
+                  "(see traceback below):", flush=True)
+            traceback.print_exc()
+            sys.stdout.flush(); sys.stderr.flush()
+        finally:
+            rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", 0)))
             print (f'[pretrain_gpt_deepspee.py] {rank=}, before finalize_profiler')
             finalize_profiler()
-            
+
             # # 1. Ensure all GPUs finish writing their traces before anyone exits
             # if dist.is_initialized():
             #     print(f"[Rank {dist.get_rank()}] Waiting for all ranks to finish...", flush=True)
             #     dist.barrier()
             #     dist.destroy_process_group()
-            
-            print("[pretrained_gpt_deepspeed.py] Exiting forcefully.", flush=True)
-            
-            # 2. Force the OS to terminate the process immediately 
-            os._exit(0)
+
+            print(f"[pretrained_gpt_deepspeed.py] Exiting (code={_exit_code}).", flush=True)
+
+            # 2. Force the OS to terminate the process immediately
+            os._exit(_exit_code)
     else: 
         pretrain(train_valid_test_datasets_provider,
                     model_provider,
                     ModelType.encoder_or_decoder,
                     forward_step,
-                    args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+                    args_defaults={},
                     data_post_process=data_post_process)
 
     
@@ -767,5 +839,5 @@ if __name__ == "__main__":
     #          model_provider,
     #          ModelType.encoder_or_decoder,
     #          forward_step,
-    #          args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+    #          args_defaults={},
     #          data_post_process=data_post_process)
