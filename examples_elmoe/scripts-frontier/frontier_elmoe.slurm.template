@@ -5,11 +5,11 @@
 #SBATCH -J {{MODEL_SIZE}}-{{RUN_TYPE}}-nbs{{NUM_BATCHES}}
 #SBATCH -o logs/job_%j_pp{{PP_SIZE}}_ep{{EP_PARALLEL_SIZE}}_{{MOE_TYPE}}_ckpt_{{ACTIVATION_CHECKPOINT}}_planner_{{RUN_PLANNER}}/a-xmoe-{{RUN_TYPE}}-%j.o
 #SBATCH -e logs/job_%j_pp{{PP_SIZE}}_ep{{EP_PARALLEL_SIZE}}_{{MOE_TYPE}}_ckpt_{{ACTIVATION_CHECKPOINT}}_planner_{{RUN_PLANNER}}/a-xmoe-{{RUN_TYPE}}-%j.e
-#SBATCH -t 01:00:00
+#SBATCH -t 1:00:00
 #SBATCH -p {{PARTITION}}
 #SBATCH -N {{NODES}}
 #SBATCH -d singleton
-#aa SBATCH -q debug
+#a SBATCH -q debug
 #a SBATCH -p extended
 #a --switches=1@00:20:00
 #a --contiguous
@@ -38,6 +38,7 @@ DYNAMIC_CHECKPOINT="{{DYNAMIC_CHECKPOINT}}"
 UNEVEN_PP="{{UNEVEN_PP}}"
 RUN_PLANNER="{{RUN_PLANNER}}"
 COLLECT_PROFILING_CACHE="{{COLLECT_PROFILING_CACHE}}"
+ZERO_STAGE={{ZERO}}
 
 
 # ACTIVATION_CHECKPOINT="false"
@@ -67,13 +68,15 @@ echo "COLLECT_PROFILING_CACHE: $COLLECT_PROFILING_CACHE"
 #   (1) PP_SIZE=1 so the existing PP conditionals select WALL_CLOCK_BREAKDOWN=true
 #       and --no-pipeline-parallel (required for per-module timer lines).
 #   (2) TRITON_DISABLE_CACHE=1 so first-call compile timings are observed.
-#   (3) profile_memory=True for memory-balanced planner data.
+#   (3) to_profile=False AND profile_memory=False — the planner cache is built from the
+#       per-module TIMERS only (WALL_CLOCK_BREAKDOWN=true). The kineto trace (traces.json)
+#       and the CUDA memory .pickle are irrelevant to it and are forced OFF in the Launch
+#       section regardless of the manual toggles there.
 #   (4) RUN_PLANNER=false — producer path must not also invoke the consumer,
 #       which would try to read a cache that doesn't exist yet.
 #   (5) Skip the Triton cache warmup (contradicts TRITON_DISABLE_CACHE=1).
 #   (6) Pass --profiling to analyze_log.py so write_profile_json() runs.
 if [[ "$COLLECT_PROFILING_CACHE" == "true" ]]; then
-    PP_SIZE=1
     RUN_PLANNER="false"
     PROFILING_SKIP_CACHE_WARM=1
     ANALYZE_LOG_PROFILING_FLAG="--profiling"
@@ -93,14 +96,14 @@ export UNEVEN_PP=$UNEVEN_PP
 
 
 # ================================================== Model & Data Setup =============================================================
-export LD_PRELOAD="/usr/lib64/libcrypto.so /usr/lib64/libssh.so.4 /usr/lib64/libssl.so.1.1"
+# export LD_PRELOAD="/usr/lib64/libcrypto.so /usr/lib64/libssh.so.4 /usr/lib64/libssl.so.1.1"
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 export TORCH_EXTENSIONS_DIR=$PWD/deepspeed
 export HF_HOME=$PWD/hfdata
 export OMP_NUM_THREADS=1
 
-export CHECKPOINT_PATH=checkpoint/small
+export CHECKPOINT_PATH=checkpoint/$(date +%Y-%m-%d)_${SLURM_JOB_ID}_forge_small_dsv2_0.1_warmup
 export VOCAB_FILE=../data/gpt2-vocab.json
 export MERGE_FILE=../data/gpt2-merges.txt
 export DATA_PATH=../data/my-gpt2_text_document
@@ -127,6 +130,7 @@ echo "  NUM_ATTN_HEADS: $NUM_ATTN_HEADS"
 echo "  EP_SIZE: $EP_SIZE"
 echo "  topk: $topk"
 echo "  SEQ_LEN: $SEQ_LEN"
+echo "  KV_HEADS: $KV_HEADS"
 # -------------------------------------------------------------------------------------------
 # ================================================== END of Model & Data Setup =============================================================
 
@@ -136,13 +140,17 @@ GLOBAL_BATCH_SIZE=$(( NUM_BATCHES * BATCH_SIZE * (TOTAL_GPUS / PP_SIZE / MP_SIZE
 echo "GLOBAL_BATCH_SIZE=$GLOBAL_BATCH_SIZE"
 
 # --- Static Training Parameters ---
-LR=1.2e-4
-MIN_LR=1.0e-6
-TRAIN_TOKENS=300000000000
+# -----------------------------------------------------------
+# 10B tokens 
+# DeepSeek-v2-16B 
+LR=4.2e-4
+MIN_LR=4.2e-5
+TRAIN_TOKENS=10000000000 
+WARMUP_TOKENS=1000000000         # 200M tokens 
+LR_DECAY_TOKENS=9000000000      # 9.8B = TRAIN_TOKENS - WARMUP_TOKENS
+# -----------------------------------------------------------
 EXIT_DURATION=30000000
-WARMUP_TOKENS=375000000
-LR_DECAY_TOKENS=300000000000
-MLC=0.01
+MLC=0.001
 MOE_TRAIN_CAP_FACTOR=1.0
 MOE_EVAL_CAP_FACTOR=1.0
 MOE_MIN_CAP=4
@@ -154,9 +162,9 @@ CL_TOKENS=60
 CL_TOKENS=$((CL_TOKENS * 1000000000))
 CL_STEP=$(( CL_TOKENS / (GLOBAL_BATCH_SIZE * CL_AVG_SEQLEN) ))
 LOG_INTERVAL=1
-EVAL_ITERS=5
-EVAL_INTERVAL=100
-SAVE_INTERVAL=50
+EVAL_ITERS=0
+EVAL_INTERVAL=300
+SAVE_INTERVAL=60
 INIT_STD=0.014
 
 # --- Output and Data Configs ---
@@ -177,8 +185,38 @@ mkdir -p "${OUTPUT_BASEPATH}/log/"
 TENSORBOARD_DIR="${OUTPUT_BASEPATH}/tensorboard/${NAME}_${host}_${current_time}"
 mkdir -p ${TENSORBOARD_DIR}
 
+# # --- Wandb (online; last-rank only) ---
+# # Setup before submitting:
+# #   1. Export your API key in your shell (or put it in ~/.netrc):
+# #        export WANDB_API_KEY=<your_key_from_https://wandb.ai/authorize>
+# #      The export is propagated to compute nodes via srun --export=ALL.
+# #   2. Frontier compute nodes reach the internet through the OLCF proxy;
+# #      the http(s)_proxy exports below are required for online mode to work.
+# # To disable wandb for a single run, set WANDB_DISABLED=true before sbatch.
+# export WANDB_MODE="${WANDB_MODE:-online}"
+# export WANDB_PROJECT="${WANDB_PROJECT:-DEBUG}"
+# export WANDB_ENTITY="${WANDB_ENTITY:-fill_in_your_identify}"
+# export WANDB_DIR="${WANDB_DIR:-${OUTPUT_BASEPATH}/wandb}"
+# export WANDB_NAME="${WANDB_NAME:-job${SLURM_JOB_ID}_${NAME}}"
+# export WANDB_GROUP="${WANDB_GROUP:-${MODEL_SIZE}_${MOE_TYPE}}"
+
+# mkdir -p "${WANDB_DIR}"
+
+# if [[ -z "${WANDB_API_KEY:-}" && ! -f "${HOME}/.netrc" \
+#       && "${WANDB_MODE}" != "disabled" && "${WANDB_DISABLED:-false}" != "true" ]]; then
+#     echo "WARNING: no WANDB_API_KEY and no ~/.netrc found; wandb online init will fail on the last rank."
+#     echo "         Either run \`wandb login\` once (writes ~/.netrc) or export WANDB_API_KEY=<key> before sbatch."
+# fi
+
+# OLCF outbound HTTP proxy (required on Frontier compute nodes for online wandb).
+export http_proxy="${http_proxy:-http://proxy.ccs.ornl.gov:3128}"
+export https_proxy="${https_proxy:-http://proxy.ccs.ornl.gov:3128}"
+export no_proxy="${no_proxy:-localhost,127.0.0.1,.olcf.ornl.gov,.ccs.ornl.gov,.frontier.olcf.ornl.gov}"
+
+
 # --- Megatron & Deepspeed Options ---
 data_options=" \
+         --tokenizer-type GPT2BPETokenizer \
          --vocab-file ${VOCAB_FILE} \
          --merge-file ${MERGE_FILE} \
          --data-path ${DATA_PATH}"
@@ -220,21 +258,25 @@ megatron_options=" \
         --clip-grad 1.0 \
         --hysteresis 2 \
         --num-workers 0 \
-        --fp16 \
+        --bf16 \
         --tensorboard-queue-size 1 \
         --log-timers-to-tensorboard \
         --log-batch-size-to-tensorboard \
         --log-validation-ppl-to-tensorboard \
         --tensorboard-dir ${TENSORBOARD_DIR} \
-        --eval-iters 0 \
         --moe-train-capacity-factor 1.25 \
 	    --expert-interval 1 \
 	    --topk $topk \
         --use-flash-attn-v2 \
+        --adam-eps 1e-8 \
+        --seed 1000 \
 	--use-rotary-position-embeddings"
     # --using-torchrun \
 
-        # --use-flash-attn-v2 \
+        # --save ${CHECKPOINT_PATH}\
+        # --load ${LOAD_CHECKPOINT_PATH}\
+        # --save-interval ${SAVE_INTERVAL} \
+        
         
 # --- Conditional Logic ---
 # Set DeepSpeed flags and other settings based on whether this is a PP run.
@@ -256,13 +298,12 @@ else
 fi
 
 if [[ "${MOE_TYPE}" == "X-MOE" ]]; then
-    megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft"
-    # megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-rbd"
+    megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --no-bias-gelu-fusion"
 elif [[ "${MOE_TYPE}" == "ELMOE-3D" ]]; then
-    megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft"
+    megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --no-bias-gelu-fusion"
 
 elif [[ "${MOE_TYPE}" == "ELMOE-GroupedGEMM-triton" ]]; then
-    megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-groupedGEMM --use-triton"
+    megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-groupedGEMM --use-triton --no-bias-gelu-fusion"
     export USE_TRITON_GROUPGEMM="True"
 
 elif [[ "${MOE_TYPE}" == "ELMOE-GroupedGEMM-primus" ]]; then
@@ -274,8 +315,13 @@ elif [[ "${MOE_TYPE}" == "TED-MOE" ]]; then
 
 elif [[ "${MOE_TYPE}" == "TUTEL-MOE" ]]; then
     megatron_options="${megatron_options} --use-tutel"
-fi
 
+elif [[ "${MOE_TYPE}" == "DENSE" ]]; then
+    megatron_options="${megatron_options} --num-key-value-heads ${KV_HEADS} --swiglu  --normalization rmsnorm --disable-bias-linear --no-bias-gelu-fusion  --untie-embeddings-and-output-weights"
+fi
+# Turn off to 0, on to 1
+export LAYER_TIMING=0
+export LAYER_TIMING_TARGETS=0
 
 if [ "${ACTIVATION_CHECKPOINT}" = "true" ]; then
     megatron_options="${megatron_options} --checkpoint-activations"
@@ -304,8 +350,8 @@ sed "s/CONFIG_BATCH_SIZE/${GLOBAL_BATCH_SIZE}/" ${template_json} \
     | sed "s/LOG_INTERVAL/${LOG_INTERVAL}/" \
     | sed "s/ZERO_STAGE/{{ZERO}}/" \
     | sed "s/PRESCALE_GRAD/false/" \
-    | sed "s/CONFIG_FP16_ENABLED/true/" \
-    | sed "s/CONFIG_BF16_ENABLED/false/" \
+    | sed "s/CONFIG_FP16_ENABLED/false/" \
+    | sed "s/CONFIG_BF16_ENABLED/true/" \
     | sed "s/CONFIG_CL_ENABLED/${CL_ENABLED}/" \
     | sed "s/CONFIG_CL_MIN/${CL_START_SEQLEN}/" \
     | sed "s/CONFIG_CL_MAX/${SEQ_LEN}/" \
@@ -410,6 +456,12 @@ export NCCL_ASYNC_ERROR_HANDLING=1
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
+
+export NCCL_DEBUG=INFO
+# export NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH
+# export NCCL_NET=ofi               # FAILS the run if OFI plugin can't load (vs silent fallback)
+# export NCCL_NET_PLUGIN=ofi        # belt-and-suspenders for older RCCL builds
+
 # export NCCL_P2P_DISABLE=1
 # ================================================== END of Frontier Global Env Var Setup Up =============================================================
 
@@ -432,41 +484,44 @@ srun -N ${NODES} -n ${TOTAL_GPUS} -c6 --ntasks-per-node=${gpus_per_node} --gpus-
 
 echo "--- Cache warm done at: $(date '+%F %T') ---"
 
-# # ---- ADD THIS BLOCK HERE ----
-# echo "--- Pre-compiling Triton kernels (1 per node) at: $(date '+%F %T') ---"
-# srun -N ${NODES} -n ${NODES} --ntasks-per-node=1 --gpus-per-node=1 \
-#     bash -c "
-#     export TRITON_CACHE_DIR=${TMP_TRITON_DIR}
-#     python -c \"
-# import torch
-# from megatron.moe.exp_triton_groupgemm import k2_forward, k2_backward_dx, k2_backward_dw, get_num_sms
-# d = torch.randn(1, 7168, device='cuda', dtype=torch.bfloat16)
-# w = torch.randn(1, 2560, 7168, device='cuda', dtype=torch.bfloat16)
-# m = torch.ones(1, dtype=torch.int32, device='cuda')
-# o = torch.empty(1, 2560, device='cuda', dtype=torch.bfloat16)
-# S = get_num_sms()
-# k2_forward[(S,)](d, w, m, o, 2560, 7168, 1, S, 7168, 1, 2560*7168, 2560, 1, 2560, 1, num_warps=4, num_stages=1)
-# k2_backward_dx[(S,)](o, w, m, d, 7168, 2560, 1, S, 2560, 1, 2560*7168, 2560, 1, 7168, 1, num_warps=4, num_stages=1)
-# k2_backward_dw[(S,)](d, o, m, w, 2560, 7168, 1, S, 7168, 1, 2560, 1, 2560*7168, 2560, 1, num_warps=4, num_stages=1)
-# torch.cuda.synchronize()
-# import os; print(f'[{os.uname().nodename}] Triton K2 compiled OK')
-# \"
-# "
-# echo "--- Pre-compilation done at: $(date '+%F %T') ---"
-# # ---- END OF BLOCK ----
-
-# export to_profile="False"
-# export PYTHONDONTWRITEBYTECODE=1
 # ================================================== END of Nodes Connection Check =============================================================
 
-
+# ================================================== Monitor Runs ==================================
+# Async pipeline-stall monitor (body lives in monitor_run.sh, same dir). Backgrounded so it never
+# blocks the training srun. Writes into ${JOB_DIR}/monitor/ :
+#   a-monitor.txt   — SUMMARY: per-interval state histogram across ALL ranks + frozen/odd counts +
+#                     unsamplable ranks + culprit native stack (read this first; scales to 960 GPUs).
+#   <hostname>.txt  — per-node detail (one row per rank: STATUS RANK GPU PID TRACE).
+#   monitor.tsv     — one row per (interval,rank) for grep/plot.
+# Needs ~/.local/bin/py-spy on $HOME (shared across nodes).
+# Adaptive cadence: every 1 min for the first 5 min (catch first-iteration hangs), then every 3 min.
+MON_FAST=120; MON_SLOW=240; MON_WINDOW=600; MON_TRACE_FRAMES=20
+bash "${DIR:-.}/monitor_run.sh" "${JOB_DIR}" "${MON_FAST}" "${MON_SLOW}" "${MON_WINDOW}" "${MON_TRACE_FRAMES}" &
+MONITOR_PID=$!
+trap 'kill ${MONITOR_PID} 2>/dev/null' EXIT
+echo "[monitor] pid ${MONITOR_PID} -> ${JOB_DIR}/monitor/ (a-monitor.txt summary + per-node files; ${MON_FAST}s for first ${MON_WINDOW}s, then ${MON_SLOW}s)"
+# ================================================== END of Monitor Runs ==================================
 
 
 # ================================================== Launch ELMoE Training =============================================================
-export to_profile="False"
-export profile_memory="False"
-# export to_profile="True"
-# export profile_memory="True"
+# Profiling-cache runs (COLLECT_PROFILING_CACHE=true) record ONLY the per-module timers
+# (WALL_CLOCK_BREAKDOWN=true, set in the Conditional Logic section); analyze_log.py
+# --profiling turns those into planner_profiling_cache/. Force the kineto trace
+# (traces.json) and the CUDA memory snapshot (.pickle) OFF for that path regardless of the
+# manual toggles below — they are unrelated to the timing cache and only add IO/overhead.
+# For NORMAL runs (COLLECT_PROFILING_CACHE=false) uncomment the toggles below to capture them.
+if [[ "$COLLECT_PROFILING_CACHE" == "true" ]]; then
+    export to_profile="False"
+    export profile_memory="False"
+else
+    export to_profile="False"
+    export profile_memory="False"
+    # # Turn on profiling trace.json, memory.pkl 
+    # export to_profile="True"
+    # export profile_memory="True"
+fi
+# export mem_snapshot_ranks="all"          # which ranks dump a memory .pickle: "all", "0", or "0,8,16,..."
+# export mem_snapshot_after_steps="3"    # dump after N warm steps (default 3; needs train_iters > N)
 
 
 export profile_dir="${JOB_DIR}/torch_profile"
@@ -488,7 +543,6 @@ srun -N ${NODES} -n ${TOTAL_GPUS} -c6 \
      --kill-on-bad-exit=1 \
      --export=ALL,FI_MR_CACHE_MONITOR,FI_CXI_DEFAULT_CQ_SIZE,FI_CXI_RX_MATCH_MODE,NCCL_DEBUG,UNEVEN_PP,TRITON_CACHE_DIR,TRITON_DISABLE_CACHE \
      bash -c "
-
      python ../ELMoE_launch.py \
         --run-planner ${planner_mode} \
         --planner-profile-dir ./planner_profiling_cache \
@@ -571,7 +625,8 @@ python ../utils/analyze_log.py \
         --activation_checkpointing $ACTIVATION_CHECKPOINT \
         --checkpoint_interval $CHECKPOINT_NUM_LAYERS \
         --dynamic_checkpoint $DYNAMIC_CHECKPOINT \
-        --uneven_pp $UNEVEN_PP ${ANALYZE_LOG_PROFILING_FLAG} >> "${MERGED_LOG}"
+        --uneven_pp $UNEVEN_PP \
+        --zero $ZERO_STAGE ${ANALYZE_LOG_PROFILING_FLAG} >> "${MERGED_LOG}"
 
 python ../utils/analyze_memory.py "${MERGED_LOG}" #>> "${MERGED_LOG}"
 

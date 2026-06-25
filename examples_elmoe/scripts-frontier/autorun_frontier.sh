@@ -44,14 +44,12 @@ PP_STRATEGY_MAP["144:1152"]="12:8"
 PP_STRATEGY_MAP["288:2304"]="12:8" 
 
 declare -A PP_BATCH_MAP
-
-
 # ================================== 63B ELMoE ==================================
 # ==================== 64 GPUs ===================
 # PP4-EP8-DP2
-PP_STRATEGY_MAP["8:64"]="4:8" # **
+# PP_STRATEGY_MAP["8:64"]="4:8" # **
 # ELMoE configurations: 
-PP_BATCH_MAP["8:64"]=" 1:256:15:ELMOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner  1:256:15:ELMOE-GroupedGEMM-primus:63B:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["8:64"]=" 1:256:15:ELMOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner  1:256:15:ELMOE-GroupedGEMM-primus:63B:dynamic-ckpt:1:uneven:yes-planner "
 # PP_BATCH_MAP["8:64"]=" 1:256:15:ELMOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner  "
 # PP_BATCH_MAP["8:64"]=" 1:256:15:ELMOE-GroupedGEMM-primus:63B:dynamic-ckpt:1:uneven:yes-planner "
 # PP_BATCH_MAP["8:64"]=" 1:256:15:ELMOE-GroupedGEMM-primus:63B:dynamic-ckpt:1:uneven:yes-planner  " # **
@@ -93,6 +91,7 @@ PP_BATCH_MAP["8:64"]=" 1:256:15:ELMOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner  
 # PP_STRATEGY_MAP["32:256"]="8:8" # **
 # PP_BATCH_MAP["32:256"]="1:256:15:ELMOE-3D:173B:dynamic-ckpt:1:uneven:yes-planner " # **
 # PP_BATCH_MAP["32:256"]="1:256:15:ELMOE-GroupedGEMM-primus:173B:dynamic-ckpt:1:uneven:yes-planner " # **
+# PP_BATCH_MAP["32:256"]="1:256:15:ELMOE-GroupedGEMM-triton:173B:dynamic-ckpt:1:uneven:yes-planner " # **
 
 
 
@@ -142,7 +141,7 @@ PP_BATCH_MAP["8:64"]=" 1:256:15:ELMOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner  
 # *******************************************************************************************************
 
 
-# EP-centric baselines 
+# EP-centric baselines
 declare -A EP_BATCH_MAP
 
 
@@ -151,7 +150,7 @@ declare -A EP_BATCH_MAP
 # X-MoE
 # EP_BATCH_MAP["8:64:1"]=" 1:64:15:X-MOE:63B:no-ckpt:0:1"
 # X-MoE, DeepSpeed-MoE, Tutel, DeepSpeed-TED
-EP_BATCH_MAP["8:64:1"]=" 1:64:15:X-MOE:63B:no-ckpt:0:1  1:64:15:DS-MOE:63B:no-ckpt:0:1  1:64:15:TUTEL-MOE:63B:ckpt:1:1  1:64:15:TED-MOE:63B:ckpt:1:1 " 
+# EP_BATCH_MAP["8:64:1"]=" 1:64:15:X-MOE:63B:no-ckpt:0:1  1:64:15:DS-MOE:63B:no-ckpt:0:1  1:64:15:TUTEL-MOE:63B:ckpt:1:1  1:64:15:TED-MOE:63B:ckpt:1:1 " 
 
 
 # ================================== 173B Baselines ==================================
@@ -169,9 +168,9 @@ EP_BATCH_MAP["8:64:1"]=" 1:64:15:X-MOE:63B:no-ckpt:0:1  1:64:15:DS-MOE:63B:no-ck
 
 # ================================== 1T Baselines ==================================
 # ==================== 1024 GPUs ===================
-# X-MoE: 
+# X-MoE:
 # EP_BATCH_MAP["128:256:4"]="1:16:15:X-MOE:1T:ckpt:1:1 "
-# DeepSpeed-MoE, Tutel, DeepSpeed-TED: OOM 
+# DeepSpeed-MoE, Tutel, DeepSpeed-TED: OOM
 
 
 
@@ -204,8 +203,7 @@ EP_BATCH_MAP["8:64:1"]=" 1:64:15:X-MOE:63B:no-ckpt:0:1  1:64:15:DS-MOE:63B:no-ck
 
 
 declare -A PROFILE_MAP
-# PROFILE_MAP["1:8:1"]=" 1:20:30:X-MOE:10B_1L:no-ckpt:0 1:20:30:X-MOE:63B_1L:no-ckpt:0  1:20:30:X-MOE:173B_1L:no-ckpt:0  1:20:30:X-MOE:537B_1L:no-ckpt:0   1:20:30:X-MOE:1T_1L:no-ckpt:0 "
-
+PROFILE_MAP["1:8:1"]=" 1:20:30:X-MOE:10B_1L:no-ckpt:0 1:20:30:X-MOE:63B_1L:no-ckpt:0  1:20:30:X-MOE:173B_1L:no-ckpt:0  1:20:30:X-MOE:537B_1L:no-ckpt:0   1:20:30:X-MOE:1T_1L:no-ckpt:0 "
 
 
 
@@ -442,7 +440,8 @@ for node_key in "${!PROFILE_MAP[@]}"; do
     # Set partition for the new environment
     PARTITION="batch"
     # MP_SIZE=2
-    TEMPLATE_PLANNER_FILE="planner.slurm.template"
+    # TEMPLATE_PLANNER_FILE="planner.slurm.template"
+    TEMPLATE_PLANNER_FILE="frontier_elmoe.slurm.template"
     
     echo "Found EP configurations for ${NODES} nodes, ${TOTAL_GPUS} GPUs..."
 
@@ -486,8 +485,9 @@ for node_key in "${!PROFILE_MAP[@]}"; do
                 -e "s/{{DYNAMIC_CHECKPOINT}}/False/g" \
                 -e "s/{{UNEVEN_PP}}/False/g" \
                 -e "s/{{COLLECT_PROFILING_CACHE}}/true/g" \
+                -e "s/{{RUN_PLANNER}}/false/g" \
                 -e "s/{{ZERO}}/${ZERO}/g" \
-                ${TEMPLATE_PLANNER_FILE} > ${TEMP_SLURM_SCRIPT}
+                ${TEMPLATE_FILE} > ${TEMP_SLURM_SCRIPT}
 
             sbatch ${TEMP_SLURM_SCRIPT}
             # rm ${TEMP_SLURM_SCRIPT}
