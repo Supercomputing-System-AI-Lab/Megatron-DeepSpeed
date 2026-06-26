@@ -2212,8 +2212,8 @@ class ParallelTransformer(MegatronModule):
                 
                 # Forward pass.
                 moe_losses = []
-                print (f'[transformer.py] {self.checkpoint_activations=}')
-                print (f'[transformer.py] {self.recompute_granularity=}')
+                # print (f'[transformer.py] {self.checkpoint_activations=}')
+                # print (f'[transformer.py] {self.recompute_granularity=}')
                 if self.checkpoint_activations:
                     hidden_states, moe_losses = self._checkpointed_forward(hidden_states,
                                                                attention_mask,
