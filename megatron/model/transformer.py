@@ -1100,8 +1100,26 @@ class ParallelTransformerLayer(MegatronModule):
                                     enable_expert_tensor_parallelism=enable_expert_tensor_parallelism)
                 else:   
                     # print (f'[transformer.py] Using Fine-grained MoE \n'*10)
-                   self.mlp = MoE(args.hidden_size, 
-                                  config=config, 
+                   # ===== IMPLEMENTING SHARED EXPERT =====
+                   #   Added: build a wider SwiGLU dense MLP for the DeepSeek-style shared
+                   #   expert and pass it (+ num_shared_experts) into MoE(). Width =
+                   #   config.ffn_hidden_size (== moe_intermediate_size) * num_shared_experts.
+                   #   moe=False => standard TP + DP-REPLICATED (untagged) params, so its
+                   #   gradient reduces over the full DP group like attention.
+                   #   _n_shared == 0 (default) => _shared_expert_mlp stays None => no shared
+                   #   expert (behavior unchanged for existing X-MoE runs).
+                   #   NOTE: assumes --ffn-hidden-size == moe_intermediate_size; the dense
+                   #   layer-0 (first_k_dense_replace) width is handled separately (Phase 1b).
+                   # ===== END SHARED EXPERT =====
+                   import copy as _copy
+                   _n_shared = args.num_shared_experts[0] if isinstance(args.num_shared_experts, (list, tuple)) else args.num_shared_experts
+                   _shared_expert_mlp = None
+                   if _n_shared and _n_shared > 0:
+                       _shared_cfg = _copy.copy(config)
+                       _shared_cfg.ffn_hidden_size = config.ffn_hidden_size * _n_shared
+                       _shared_expert_mlp = ParallelMLP(_shared_cfg, moe=False)
+                   self.mlp = MoE(args.hidden_size,
+                                  config=config,
                                     expert= ParallelMLP(config,
                                         moe=True,
                                         enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
@@ -1121,7 +1139,9 @@ class ParallelTransformerLayer(MegatronModule):
                                     use_rbd=args.use_rbd,
                                     use_groupedGEMM=args.use_groupedGEMM,
                                     use_triton=args.use_triton,
-                                    rbd_mesh_size=args.rbd_mesh_size)
+                                    rbd_mesh_size=args.rbd_mesh_size,
+                                    num_shared_experts=_n_shared,        # IMPLEMENTING SHARED EXPERT: Added
+                                    shared_expert=_shared_expert_mlp)    # IMPLEMENTING SHARED EXPERT: Added
 
         # Set bias+dropout+add fusion grad_enable execution handler.
         TORCH_MAJOR = int(torch.__version__.split('.')[0])

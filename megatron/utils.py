@@ -309,8 +309,20 @@ def throughput_calculator(model, args, iteration_time, total_iterations):
     mha_bgemm_macs = batch_size * num_layers * 2 * head_dim * num_attention_heads * (seq_len**2)
     ffn_gemm_macs = batch_size * num_layers * ffn_multiplier * ffn_hidden_size * hidden_size * seq_len * num_experts_routed_to
     logit_lmhead_gemm_macs = batch_size * vocab_size * hidden_size * seq_len
+    
+    
+    # 06/30/2026: Zixian: IMPLEMENTING SHARED EXPERT: 
+    # num_shared_experts (the arg is a list; take a scalar).
+    num_shared_experts = getattr(args, 'num_shared_experts', 0)
+    if isinstance(num_shared_experts, (list, tuple)):
+        num_shared_experts = num_shared_experts[0] if len(num_shared_experts) > 0 else 0
 
-    fwd_macs = pre_and_post_mha_gemm_macs + mha_bgemm_macs + ffn_gemm_macs + logit_lmhead_gemm_macs
+    # IMPLEMENTING SHARED EXPERT: a single wider SwiGLU MLP of width
+    # (ffn_hidden_size * num_shared_experts) runs on EVERY token (no top-k), so its MACs
+    # equal `num_shared_experts` experts of width ffn_hidden_size executed once per token.
+    shared_ffn_gemm_macs = batch_size * num_layers * ffn_multiplier * ffn_hidden_size * hidden_size * seq_len * num_shared_experts
+
+    fwd_macs = pre_and_post_mha_gemm_macs + mha_bgemm_macs + ffn_gemm_macs + logit_lmhead_gemm_macs + shared_ffn_gemm_macs
     bwd_macs = 2 * fwd_macs
     fwd_bwd_macs = fwd_macs + bwd_macs
 
