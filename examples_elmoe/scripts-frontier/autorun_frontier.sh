@@ -45,6 +45,24 @@ PP_STRATEGY_MAP["288:2304"]="12:8"
 
 declare -A PP_BATCH_MAP
 # ================================== 63B ELMoE ==================================
+# ==================== 24 GPUs ===================
+# PP4-EP8-DP1
+PP_STRATEGY_MAP["3:24"]="3:8" # **
+# ELMoE configurations: 
+PP_BATCH_MAP["3:24"]=" 1:64:15:ELMOE-3D:56B:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["3:24"]=" 1:64:15:ELMOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["4:32"]=" 1:64:15:ELMOE-3D:63B:no-ckpt:0:even:no-planner "
+# PP_BATCH_MAP["3:24"]=" 1:64:15:ELMOE-3D:56B:ckpt:1:even:no-planner "
+
+# ==================== 32 GPUs ===================
+# PP4-EP8-DP1
+# PP_STRATEGY_MAP["4:32"]="4:8" # **
+# ELMoE configurations: 
+# PP_BATCH_MAP["4:32"]=" 1:64:15:ELMOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["4:32"]=" 1:64:15:ELMOE-3D:63B:no-ckpt:0:even:no-planner "
+# PP_BATCH_MAP["4:32"]=" 2:32:15:ELMOE-3D:63B:ckpt:1:even:no-planner "
+
+
 # ==================== 64 GPUs ===================
 # PP4-EP8-DP2
 # PP_STRATEGY_MAP["8:64"]="4:8" # **
@@ -150,13 +168,16 @@ declare -A EP_BATCH_MAP
 # X-MoE
 # EP_BATCH_MAP["8:64:1"]=" 1:64:15:X-MOE:63B:no-ckpt:0:1"
 # X-MoE, DeepSpeed-MoE, Tutel, DeepSpeed-TED
-# EP_BATCH_MAP["8:64:1"]=" 1:64:15:X-MOE:63B:no-ckpt:0:1  1:64:15:DS-MOE:63B:no-ckpt:0:1  1:64:15:TUTEL-MOE:63B:ckpt:1:1  1:64:15:TED-MOE:63B:ckpt:1:1 " 
+# EP_BATCH_MAP["8:64:1"]=" 1:64:15:X-MOE:63B:no-ckpt:0:1  1:64:15:DS-MOE:63B:ckpt:1:1  1:64:15:TUTEL-MOE:63B:ckpt:1:1  1:64:15:TED-MOE:63B:ckpt:1:1 " 
 
 
 # ================================== 173B Baselines ==================================
 # ==================== 256 GPUs ===================
 # EP_BATCH_MAP["32:128:2"]=" 1:32:15:X-MOE:173B:no-ckpt:0:1 " 
 # EP_BATCH_MAP["32:128:2"]=" 1:32:13:DS-MOE:173B:ckpt:1:1  1:32:13:TUTEL-MOE:173B:ckpt:1:1  1:32:13:TED-MOE:173B:ckpt:1:1 "
+# EP_BATCH_MAP["32:128:2"]=" 2:4:13:TED-MOE:173B:ckpt:1:1 "
+# EP_BATCH_MAP["32:64:4"]=" 2:4:13:TED-MOE:173B:ckpt:1:1 "
+# EP_BATCH_MAP["32:32:8"]=" 1:32:13:TED-MOE:173B:ckpt:1:1 "
 
 
 # ================================== 537B Baselines ==================================
@@ -203,7 +224,7 @@ declare -A EP_BATCH_MAP
 
 
 declare -A PROFILE_MAP
-PROFILE_MAP["1:8:1"]=" 1:20:30:X-MOE:10B_1L:no-ckpt:0 1:20:30:X-MOE:63B_1L:no-ckpt:0  1:20:30:X-MOE:173B_1L:no-ckpt:0  1:20:30:X-MOE:537B_1L:no-ckpt:0   1:20:30:X-MOE:1T_1L:no-ckpt:0 "
+# PROFILE_MAP["1:8:1"]=" 1:20:30:X-MOE:10B_1L:no-ckpt:0 1:20:30:X-MOE:63B_1L:no-ckpt:0  1:20:30:X-MOE:173B_1L:no-ckpt:0  1:20:30:X-MOE:537B_1L:no-ckpt:0   1:20:30:X-MOE:1T_1L:no-ckpt:0 "
 
 
 

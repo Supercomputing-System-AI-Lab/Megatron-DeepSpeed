@@ -5,7 +5,7 @@
 #SBATCH -J {{MODEL_SIZE}}-{{RUN_TYPE}}-nbs{{NUM_BATCHES}}
 #SBATCH -o logs/job_%j_pp{{PP_SIZE}}_ep{{EP_PARALLEL_SIZE}}_{{MOE_TYPE}}_ckpt_{{ACTIVATION_CHECKPOINT}}_planner_{{RUN_PLANNER}}/a-xmoe-{{RUN_TYPE}}-%j.o
 #SBATCH -e logs/job_%j_pp{{PP_SIZE}}_ep{{EP_PARALLEL_SIZE}}_{{MOE_TYPE}}_ckpt_{{ACTIVATION_CHECKPOINT}}_planner_{{RUN_PLANNER}}/a-xmoe-{{RUN_TYPE}}-%j.e
-#SBATCH -t 1:00:00
+#SBATCH -t 0:20:00
 #SBATCH -p {{PARTITION}}
 #SBATCH -N {{NODES}}
 #SBATCH -d singleton
@@ -103,7 +103,7 @@ export TORCH_EXTENSIONS_DIR=$PWD/deepspeed
 export HF_HOME=$PWD/hfdata
 export OMP_NUM_THREADS=1
 
-export CHECKPOINT_PATH=checkpoint/$(date +%Y-%m-%d)_${SLURM_JOB_ID}_forge_small_dsv2_0.1_warmup
+export CHECKPOINT_PATH=checkpoint/$(date +%Y-%m-%d)_${SLURM_JOB_ID}
 export VOCAB_FILE=../data/gpt2-vocab.json
 export MERGE_FILE=../data/gpt2-merges.txt
 export DATA_PATH=../data/my-gpt2_text_document
@@ -185,28 +185,28 @@ mkdir -p "${OUTPUT_BASEPATH}/log/"
 TENSORBOARD_DIR="${OUTPUT_BASEPATH}/tensorboard/${NAME}_${host}_${current_time}"
 mkdir -p ${TENSORBOARD_DIR}
 
-# # --- Wandb (online; last-rank only) ---
-# # Setup before submitting:
-# #   1. Export your API key in your shell (or put it in ~/.netrc):
-# #        export WANDB_API_KEY=<your_key_from_https://wandb.ai/authorize>
-# #      The export is propagated to compute nodes via srun --export=ALL.
-# #   2. Frontier compute nodes reach the internet through the OLCF proxy;
-# #      the http(s)_proxy exports below are required for online mode to work.
-# # To disable wandb for a single run, set WANDB_DISABLED=true before sbatch.
-# export WANDB_MODE="${WANDB_MODE:-online}"
-# export WANDB_PROJECT="${WANDB_PROJECT:-DEBUG}"
-# export WANDB_ENTITY="${WANDB_ENTITY:-fill_in_your_identify}"
-# export WANDB_DIR="${WANDB_DIR:-${OUTPUT_BASEPATH}/wandb}"
-# export WANDB_NAME="${WANDB_NAME:-job${SLURM_JOB_ID}_${NAME}}"
-# export WANDB_GROUP="${WANDB_GROUP:-${MODEL_SIZE}_${MOE_TYPE}}"
+# --- Wandb (online; last-rank only) ---
+# Setup before submitting:
+#   1. Export your API key in your shell (or put it in ~/.netrc):
+#        export WANDB_API_KEY=<your_key_from_https://wandb.ai/authorize>
+#      The export is propagated to compute nodes via srun --export=ALL.
+#   2. Frontier compute nodes reach the internet through the OLCF proxy;
+#      the http(s)_proxy exports below are required for online mode to work.
+# To disable wandb for a single run, set WANDB_DISABLED=true before sbatch.
+export WANDB_MODE="${WANDB_MODE:-online}"
+export WANDB_PROJECT="${WANDB_PROJECT:-DEBUG}"
+export WANDB_ENTITY="${WANDB_ENTITY:-zixianw4-university-of-illinois-urbana-champaign}"
+export WANDB_DIR="${WANDB_DIR:-${OUTPUT_BASEPATH}/wandb}"
+export WANDB_NAME="${WANDB_NAME:-job${SLURM_JOB_ID}_${NAME}}"
+export WANDB_GROUP="${WANDB_GROUP:-${MODEL_SIZE}_${MOE_TYPE}}"
 
-# mkdir -p "${WANDB_DIR}"
+mkdir -p "${WANDB_DIR}"
 
-# if [[ -z "${WANDB_API_KEY:-}" && ! -f "${HOME}/.netrc" \
-#       && "${WANDB_MODE}" != "disabled" && "${WANDB_DISABLED:-false}" != "true" ]]; then
-#     echo "WARNING: no WANDB_API_KEY and no ~/.netrc found; wandb online init will fail on the last rank."
-#     echo "         Either run \`wandb login\` once (writes ~/.netrc) or export WANDB_API_KEY=<key> before sbatch."
-# fi
+if [[ -z "${WANDB_API_KEY:-}" && ! -f "${HOME}/.netrc" \
+      && "${WANDB_MODE}" != "disabled" && "${WANDB_DISABLED:-false}" != "true" ]]; then
+    echo "WARNING: no WANDB_API_KEY and no ~/.netrc found; wandb online init will fail on the last rank."
+    echo "         Either run \`wandb login\` once (writes ~/.netrc) or export WANDB_API_KEY=<key> before sbatch."
+fi
 
 # OLCF outbound HTTP proxy (required on Frontier compute nodes for online wandb).
 export http_proxy="${http_proxy:-http://proxy.ccs.ornl.gov:3128}"
@@ -272,10 +272,10 @@ megatron_options=" \
         --seed 1000 \
 	--use-rotary-position-embeddings"
     # --using-torchrun \
-
-        # --save ${CHECKPOINT_PATH}\
-        # --load ${LOAD_CHECKPOINT_PATH}\
+        # --save ${CHECKPOINT_PATH} \
+        # --load ${LOAD_CHECKPOINT_PATH} \
         # --save-interval ${SAVE_INTERVAL} \
+
         
         
 # --- Conditional Logic ---
@@ -298,7 +298,7 @@ else
 fi
 
 if [[ "${MOE_TYPE}" == "X-MOE" ]]; then
-    megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --no-bias-gelu-fusion"
+    megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --no-bias-gelu-fusion "
 elif [[ "${MOE_TYPE}" == "ELMOE-3D" ]]; then
     megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --no-bias-gelu-fusion"
 

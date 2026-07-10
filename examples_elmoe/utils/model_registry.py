@@ -5,12 +5,18 @@ import sys
 # This matches exactly what was in your SLURM template
 MODEL_SPECS = {
     "10B":    {"h": 2048, "ffn": 1408, "heads": 16, "ep": 64,  "k": 6, "s": 2048, "layers": 24},
+    "10B_k7":    {"h": 2048, "ffn": 1408, "heads": 16, "ep": 64,  "k": 7, "s": 2048, "layers": 24},
+    "10B_k8":    {"h": 2048, "ffn": 1408, "heads": 16, "ep": 64,  "k": 8, "s": 2048, "layers": 24},
     "50B":    {"h": 5120, "ffn": 1536, "heads": 40, "ep": 128, "k": 6, "s": 4096, "layers": 24},
+    "56B":    {"h": 5120, "ffn": 1536, "heads": 40, "ep": 128, "k": 6, "s": 4096, "layers": 27},
     "63B":    {"h": 5120, "ffn": 1536, "heads": 40, "ep": 128, "k": 6, "s": 4096, "layers": 32},
     "173B":   {"h": 7168, "ffn": 2048, "heads": 56, "ep": 256, "k": 8, "s": 4096, "layers": 24},
     "537B":   {"h": 7168, "ffn": 2560, "heads": 56, "ep": 256, "k": 8, "s": 4096, "layers": 60},
     "1T":     {"h": 7168, "ffn": 2560, "heads": 56, "ep": 512, "k": 8, "s": 4096, "layers": 60},
     
+    "FORGE_10B":    {"h": 2048, "ffn": 1408, "heads": 16, "ep": 64,  "k": 6, "s": 4096, "layers": 24},
+    "Llama31_8B":    {"h": 4096, "ffn": 14336, "heads": 32, "kv_heads": 8,"ep": 1, "k": 1, "s": 4096, "layers": 32},
+    "65B_Dense":    {"h": 8192, "ffn": 32768, "heads": 64, "ep": 1, "k": 1, "s": 2048, "layers": 80},
     "63B_Dense":    {"h": 4096, "ffn": 16384, "heads": 32, "ep": 1, "k": 1, "s": 4096, "layers": 32},
     "63B_Coarse":    {"h": 4096, "ffn": 8192, "heads": 32, "ep": 8, "k": 2, "s": 4096, "layers": 32},
     "63B_Sparse":    {"h": 4096, "ffn": 1024, "heads": 32, "ep": 64, "k": 16, "s": 4096, "layers": 32},
@@ -26,7 +32,7 @@ MODEL_SPECS = {
     "537B_1L":{"h": 7168, "ffn": 2560, "heads": 56, "ep": 256, "k": 8, "s": 4096, "layers": 1},
     "1T_1L":  {"h": 7168, "ffn": 2560, "heads": 56, "ep": 512, "k": 8, "s": 4096, "layers": 1},
     
-    "1.5T_1L":  {"h": 7168, "ffn": 2560, "heads": 56, "ep": 1024, "k": 8, "s": 4096, "layers": 1},
+    "1.5T_1L":  {"h": 7168, "ffn": 256, "heads": 56, "ep": 1024, "k": 8, "s": 4096, "layers": 1},
     
     
     "10B_2L": {"h": 2048, "ffn": 1408, "heads": 16, "ep": 64,  "k": 6, "s": 2048, "layers": 2},
@@ -114,5 +120,6 @@ if __name__ == "__main__":
             print(f"export topk={s['k']}")
             print(f"export SEQ_LEN={s['s']}")
             print(f"export NUM_LAYERS={s['layers']}")
+            print(f"export KV_HEADS={s.get('kv_heads', s['heads'])}")
         except Exception as e:
             sys.exit(1)

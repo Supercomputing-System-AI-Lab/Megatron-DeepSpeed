@@ -16,7 +16,7 @@
 #
 # Per-rank columns: STATUS RANK GPU PID WATTS HBM% RAM_GB TRACE(deepest<-outer).
 #   WATTS   = GPU pkg power (rocm-smi; "N/A" on MI250X secondary dies — power is per-card)
-#   HBM%    = VRAM used on this rank's GCD, percent (concise rocm-smi VRAM% column, by GPU index = local rank)
+#   HBM%    = VRAM used on this rank's GCD, percent (rocm-smi --showmeminfo vram used/total, by GPU index = local rank)
 #   RAM_GB  = host resident RAM of this rank's process in GiB (ps rss) — flat RAM_GB + low WATTS + FROZEN = hung
 # TRACE depth is the 5th arg (TRACE_FRAMES, default 14 frames, deepest first).
 #
@@ -66,18 +66,30 @@ categorize() {
 # TRACE_FRAMES is injected by the ssh caller (prepended assignment); default kept here for safety.
 REMOTE='
   : "${TRACE_FRAMES:=14}"
-  SMI=$(ls /opt/rocm*/bin/rocm-smi 2>/dev/null | head -1)
-  RP=""; RM=""
-  [ -n "$SMI" ] && RP=$("$SMI" --showpower 2>/dev/null) && RM=$("$SMI" 2>/dev/null)
+  # Pick a rocm-smi that MATCHES the node driver: the one on PATH (loaded module) if any, else the
+  # site default symlink, else the NEWEST installed (sort -V). NOT "head -1", which picks the oldest
+  # (rocm-5.6.0) lexicographically and mis-reads MI250X GCDs under a newer driver -> "?" everywhere.
+  SMI=$(command -v rocm-smi 2>/dev/null)
+  [ -x "$SMI" ] || SMI=/opt/rocm-default/bin/rocm-smi
+  [ -x "$SMI" ] || SMI=$(ls /opt/rocm-*/bin/rocm-smi 2>/dev/null | sort -V | tail -1)
+  # Query power and VRAM INDEPENDENTLY (never chain with && -- a non-zero --showpower must not skip
+  # the VRAM read and blank every HBM%). Each guarded by timeout so a wedged rocm-smi cannot stall.
+  RP=""; RV=""
+  if [ -x "$SMI" ]; then
+    RP=$(timeout 15 "$SMI" --showpower 2>/dev/null)
+    RV=$(timeout 15 "$SMI" --showmeminfo vram 2>/dev/null)
+  fi
   for p in $(pgrep -u $USER -f ELMoE_launch.py); do
     ls -l /proc/$p/fd 2>/dev/null | grep -q /dev/kfd || continue
     e=$(tr "\0" "\n" < /proc/$p/environ 2>/dev/null)
     rk=$(printf "%s\n" "$e" | sed -n "s/^SLURM_PROCID=//p" | head -1); [ -z "$rk" ] && rk=$(printf "%s\n" "$e" | sed -n "s/^RANK=//p" | head -1); [ -z "$rk" ] && rk="?"
     lr=$(printf "%s\n" "$e" | sed -n "s/^SLURM_LOCALID=//p" | head -1); [ -z "$lr" ] && lr=$(printf "%s\n" "$e" | sed -n "s/^LOCAL_RANK=//p" | head -1); [ -z "$lr" ] && lr="?"
     mem=$(ps -o rss= -p $p 2>/dev/null | awk "{printf \"%.1f\", \$1/1048576}"); [ -z "$mem" ] && mem="?"
-    # HBM% from concise rocm-smi. Each device row is "<idx> ... VRAM% GPU%" -> VRAM% is the
-    # second-to-last field (NF-1), robust to the variable-width middle columns. Match row by GPU index.
-    hbm=$(printf "%s\n" "$RM" | awk -v g="$lr" "\$1==g {v=\$(NF-1); gsub(/%/,\"\",v); print v; exit}")
+    # HBM% from --showmeminfo vram: index-keyed by GPU[<localrank>] and version-stable (bytes, not a
+    # positional concise column that shifts between rocm-smi builds). hbm = used/total*100, matched by GPU idx.
+    tot=$(printf "%s\n" "$RV" | grep -E "GPU\[$lr\]" | grep -i "Total Memory" | grep -oE "[0-9]+" | tail -1)
+    usd=$(printf "%s\n" "$RV" | grep -E "GPU\[$lr\]" | grep -i "Used Memory"  | grep -oE "[0-9]+" | tail -1)
+    hbm=$(awk -v u="$usd" -v t="$tot" "BEGIN{ if(t+0>0) printf \"%d\", (u*100)/t }")
     [ -z "$hbm" ] && hbm="?"
     pw=$(printf "%s\n" "$RP" | grep -E "GPU\[$lr\]" | sed -n "s/.*(W)://p" | grep -oE "[0-9.]+|N/A" | head -1); [ -z "$pw" ] && pw="?"
     d=$(timeout 15 ~/.local/bin/py-spy dump --pid $p --nonblocking 2>/dev/null)
