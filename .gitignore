@@ -47,6 +47,15 @@ examples_xmoe/scripts-frontier/planner_profiling_cache_disable_P2P_dec_13/*
 examples_xmoe/scripts-frontier/temp_ds_json/*
 examples_xmoe/scripts-frontier/temp_slurm/*
 examples_xmoe/scripts-frontier/results/*# auto-generated json files and logs   
+
+examples_elmoe/scripts-frontier/logs/*
+examples_elmoe/scripts-frontier/logs_old/*
+examples_elmoe/scripts-frontier/output/*
+examples_elmoe/scripts-frontier/planner_profiling_cache_disable_P2P_dec_13/*
+examples_elmoe/scripts-frontier/temp_ds_json/*
+examples_elmoe/scripts-frontier/temp_slurm/*
+examples_elmoe/scripts-frontier/results/*# auto-generated json files and logs   
+
 *.json
 *.log
 

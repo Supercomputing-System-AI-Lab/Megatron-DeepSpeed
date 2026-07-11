@@ -2024,8 +2024,8 @@ class ParallelTransformer(MegatronModule):
             return custom_forward
         
         if args.deepspeed and args.deepspeed_activation_checkpointing:
-            print (f'[megatron/model/transformer.py]: enabling deepspeed"s activation checkpointing')
-            print (f'[megatron/model/transformer.py]: uniform activation checkpointing for every {self.checkpoint_num_layers} layers')
+            # print (f'[megatron/model/transformer.py]: enabling deepspeed"s activation checkpointing')
+            # print (f'[megatron/model/transformer.py]: uniform activation checkpointing for every {self.checkpoint_num_layers} layers')
             moe_losses = []
             # Make sure memory is freed.
             tensor_parallel.reset_checkpointed_activations_memory_buffer()
