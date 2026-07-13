@@ -1,0 +1,23 @@
+# hostfile.example — one hostname (or IP) per line, ONE LINE PER NODE.
+#
+#   cp hostfile.example hostfile   and edit for your cluster.
+#
+# Used only when the map key asks for more than 1 node, e.g.
+#     PP_STRATEGY_MAP["4:32"]="4:8"     -> 4 nodes, so 4 lines are required here.
+# The launcher errors out if the line count does not match the node count.
+#
+# The FIRST host becomes the torchrun rendezvous master (MASTER_ADDR).
+# Override the port with:  MASTER_PORT=29500 bash autorun.sh
+#
+# Requirements for multi-node:
+#   * passwordless ssh from the launching host to every host listed here
+#   * a SHARED filesystem — all ranks write rank_*.log into the same JOB_DIR,
+#     and every node must see the same repo path
+#   * ./env.sh present (ssh does not carry your environment)
+#
+# Blank lines and #-comments are ignored.
+
+node01
+node02
+node03
+node04
