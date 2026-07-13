@@ -5,7 +5,11 @@ import os
 import pandas as pd
 from datetime import datetime
 import statistics
-import json 
+import json
+import fcntl
+import shutil
+import tempfile
+import zipfile
 
 def parse_arguments():
     """Parses command-line arguments."""
@@ -232,6 +236,47 @@ def analyze_log(log_file, num_layers, warmup_steps, args):
         "flops_out": flops_out, "tflops_out": tflops_out, "util_out": util_out,
     }
 
+def _read_existing_workbook(file_path):
+    """Return (main_df, loss_df), or (None, None) if the workbook is absent or unreadable.
+
+    A workbook left corrupt by an earlier concurrent write is moved aside instead of
+    raising, so one bad file cannot permanently break every subsequent run.
+    """
+    if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+        return None, None
+    try:
+        with pd.ExcelFile(file_path) as xls:
+            return (pd.read_excel(xls, 'Main_Results'),
+                    pd.read_excel(xls, 'Loss_per_Iteration'))
+    except (zipfile.BadZipFile, ValueError, KeyError, OSError) as e:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        quarantine = f"{file_path}.corrupt-{stamp}"
+        try:
+            shutil.move(file_path, quarantine)
+            note = f"moved it to '{quarantine}'"
+        except OSError:
+            note = "could not move it aside"
+        print(f"Warning: '{file_path}' is unreadable ({type(e).__name__}: {e}); {note}. "
+              f"Starting a fresh workbook.", file=sys.stderr)
+        return None, None
+
+
+def _atomic_write_workbook(file_path, main_df, loss_df):
+    """Write the workbook to a temp file in the same dir, then atomically replace the target."""
+    directory = os.path.dirname(file_path) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".tmp-results-", suffix=".xlsx")
+    os.close(fd)
+    try:
+        with pd.ExcelWriter(tmp_path, engine='openpyxl') as writer:
+            main_df.to_excel(writer, sheet_name='Main_Results', index=False)
+            loss_df.to_excel(writer, sheet_name='Loss_per_Iteration', index=False)
+        os.replace(tmp_path, file_path)   # atomic within the same filesystem
+        tmp_path = None
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
 def write_to_xlsx(data, args):
     """Writes the collected data to a single XLSX file with two sheets."""
     date_str = datetime.now().strftime("%Y-%m-%d")
@@ -302,19 +347,42 @@ def write_to_xlsx(data, args):
         loss_row_dict[f'loss_{i+1}'] = loss
     new_loss_df = pd.DataFrame([loss_row_dict])
 
-    try:
-        with pd.ExcelFile(file_path) as xls:
-            existing_main_df = pd.read_excel(xls, 'Main_Results')
-            existing_loss_df = pd.read_excel(xls, 'Loss_per_Iteration')
-        combined_main_df = pd.concat([existing_main_df, new_main_df], ignore_index=True)
-        combined_loss_df = pd.concat([existing_loss_df, new_loss_df], ignore_index=True)
-    except FileNotFoundError:
-        combined_main_df = new_main_df
-        combined_loss_df = new_loss_df
+    # ------------------------------------------------------------------------
+    # Concurrency-safe append.
+    #
+    # main_results / loss_validate / profiling_cache each launch SEVERAL SLURM
+    # jobs that finish around the same time and all append to this one daily
+    # file. The previous code did an UNLOCKED read-modify-write, and
+    # pd.ExcelWriter TRUNCATES the file before rewriting it — so two jobs
+    # interleaving left a truncated zip ("BadZipFile: Bad magic number for
+    # central directory"), after which every later job crashed too, because only
+    # FileNotFoundError was caught.
+    #
+    # Fix: (1) an exclusive flock serialises concurrent writers; (2) the workbook
+    # is written to a temp file and os.replace()d in, so a reader never observes
+    # a half-written file; (3) an unreadable workbook is quarantined rather than
+    # killing the run.
+    # ------------------------------------------------------------------------
+    # ONE hidden lock file for the whole results dir (not one per workbook), so the
+    # folder does not accumulate a .lock next to every .xlsx. It must live on the
+    # shared filesystem: the concurrent writers are SLURM jobs on DIFFERENT nodes,
+    # so a node-local /tmp lock would give no mutual exclusion at all.
+    lock_path = os.path.join(results_dir, ".xlsx-write.lock")
+    with open(lock_path, "w") as lock_fh:
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        except OSError as e:  # filesystem without flock support — atomic replace still applies
+            print(f"Warning: could not lock '{lock_path}' ({e}); relying on atomic replace.",
+                  file=sys.stderr)
 
-    with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
-        combined_main_df.to_excel(writer, sheet_name='Main_Results', index=False)
-        combined_loss_df.to_excel(writer, sheet_name='Loss_per_Iteration', index=False)
+        existing_main_df, existing_loss_df = _read_existing_workbook(file_path)
+        if existing_main_df is None:
+            combined_main_df, combined_loss_df = new_main_df, new_loss_df
+        else:
+            combined_main_df = pd.concat([existing_main_df, new_main_df], ignore_index=True)
+            combined_loss_df = pd.concat([existing_loss_df, new_loss_df], ignore_index=True)
+
+        _atomic_write_workbook(file_path, combined_main_df, combined_loss_df)
 
     return file_path
 
