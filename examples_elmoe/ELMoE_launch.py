@@ -30,9 +30,25 @@ def split_args():
                         choices=['optimize', 'optimize-membal'])
     parser.add_argument('--planner-profile-dir', type=str,
                         default='./planner_profiling_cache')
-    # parser.add_argument('--planner-memory-limit-gb', type=float, default=62.0)
-    # Zixian: added to prevent unexpected memory surge --> OOM
-    parser.add_argument('--planner-memory-limit-gb', type=float, default=61.5)
+    # --- Planner memory budget (all values are BINARY GiB, matching the planner's
+    # --- MemoryPredictor.GIGA = 1024**3).
+    #
+    # Primary knob: how much to RESERVE on each GPU. The analytic memory model only
+    # accounts for tensors; the reserve covers what it does not model — the HIP/CUDA
+    # context, RCCL communication buffers, hipBLASLt/Triton/aiter scratch, and the
+    # caching allocator's block rounding (reserved >= allocated).
+    #     limit = detect_total_memory_gib() - planner_memory_headroom_gb
+    #
+    # Escape hatch: --planner-memory-limit-gb pins an ABSOLUTE limit and wins if set.
+    # Use it to reproduce a known budget, on heterogeneous clusters (where per-rank
+    # detection could diverge), or if detection fails (then it falls back to 61.5 GiB,
+    # the value that used to be hardcoded here).
+    #
+    # MEASURED: MI250X / MI210 report total_memory = 68702699520 B = 63.984375 GiB
+    # (NOT a round 64). With the 2.5 GiB default that yields a limit of 61.484 GiB,
+    # i.e. 20 MiB tighter than the 61.5 that was previously hardcoded.
+    parser.add_argument('--planner-memory-headroom-gb', type=float, default=2.5)
+    parser.add_argument('--planner-memory-limit-gb', type=float, default=None)
     parser.add_argument('--planner-overhead-ms', type=float, default=55.0)
     parser.add_argument('--planner-optimizer-ratio', type=float, default=0.10)
     parser.add_argument('--planner-max-mbs', type=int, default=8)
@@ -118,10 +134,12 @@ def run_planner(remaining_argv, planner_args):
         num_nodes=profile_num_nodes
     )
 
+    memory_limit_gb = _resolve_memory_limit_gib(planner_args, rank)
+
     planner_cfg = PlannerConfig(
         model_config=model_config,
         target_gbs=gbs,
-        memory_limit_gb=planner_args.planner_memory_limit_gb,
+        memory_limit_gb=memory_limit_gb,
         profile_loader=profile_loader,
         mb_framework_overhead_ms=planner_args.planner_overhead_ms,
         optimizer_step_ratio=planner_args.planner_optimizer_ratio,
@@ -210,6 +228,58 @@ def _override_arg(argv, flag, value):
     except ValueError:
         argv.extend([flag, value])
     return argv
+
+
+_FALLBACK_MEMORY_LIMIT_GIB = 61.5   # the value previously hardcoded here (MI250X: 64 - 2.5)
+
+
+def _resolve_memory_limit_gib(planner_args, rank):
+    """Planner memory limit in BINARY GiB, resolved in priority order:
+
+        1. --planner-memory-limit-gb   (absolute override; wins if given)
+        2. detected total GPU memory - --planner-memory-headroom-gb
+        3. _FALLBACK_MEMORY_LIMIT_GIB  (if detection fails)
+
+    The planner runs on EVERY rank, so this must return the SAME value on all of
+    them. Path 1 is a literal, and path 2 reads *total* memory (a static hardware
+    constant) — both are rank-invariant on homogeneous nodes. Never derive this
+    from free/available memory, which differs per rank and would make ranks compute
+    different partitions.
+    """
+    if planner_args.planner_memory_limit_gb is not None:
+        limit = float(planner_args.planner_memory_limit_gb)
+        if rank == 0:
+            print(f"[planner] memory_limit={limit:.2f} GiB (explicit --planner-memory-limit-gb)")
+        return limit
+
+    # Defensive: a failure to import/detect must never break a run that works today —
+    # it degrades to the fallback limit instead of raising.
+    try:
+        from deepspeed.moe.planner.memory_calculator import detect_total_memory_gib
+        total = detect_total_memory_gib()
+    except Exception as e:
+        if rank == 0:
+            print(f"[planner] WARNING: memory detection unavailable "
+                  f"({type(e).__name__}: {e})")
+        total = None
+    headroom = float(planner_args.planner_memory_headroom_gb)
+
+    if total is None:
+        if rank == 0:
+            print(f"[planner] memory_limit={_FALLBACK_MEMORY_LIMIT_GIB:.2f} GiB "
+                  f"(GPU detection failed; using fallback). "
+                  f"Pass --planner-memory-limit-gb to set it explicitly.")
+        return _FALLBACK_MEMORY_LIMIT_GIB
+
+    limit = total - headroom
+    if limit <= 0:
+        raise ValueError(
+            f"planner memory headroom ({headroom} GiB) >= detected GPU memory "
+            f"({total:.2f} GiB); nothing left to plan with.")
+    if rank == 0:
+        print(f"[planner] device total={total:.2f} GiB  headroom={headroom:.2f} GiB "
+              f"-> memory_limit={limit:.2f} GiB")
+    return limit
 
 
 def _get_global_rank():

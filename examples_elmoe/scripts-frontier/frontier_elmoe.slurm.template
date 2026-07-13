@@ -5,10 +5,14 @@
 #SBATCH -J {{MODEL_SIZE}}-{{RUN_TYPE}}-nbs{{NUM_BATCHES}}
 #SBATCH -o logs/job_%j_pp{{PP_SIZE}}_ep{{EP_PARALLEL_SIZE}}_{{MOE_TYPE}}_ckpt_{{ACTIVATION_CHECKPOINT}}_planner_{{RUN_PLANNER}}/a-xmoe-{{RUN_TYPE}}-%j.o
 #SBATCH -e logs/job_%j_pp{{PP_SIZE}}_ep{{EP_PARALLEL_SIZE}}_{{MOE_TYPE}}_ckpt_{{ACTIVATION_CHECKPOINT}}_planner_{{RUN_PLANNER}}/a-xmoe-{{RUN_TYPE}}-%j.e
-#SBATCH -t 1:00:00
+#SBATCH -t 0:10:00
 #SBATCH -p {{PARTITION}}
 #SBATCH -N {{NODES}}
 #SBATCH -d singleton
+# [TIMEOUT-SAFE ANALYSIS — added] Ask SLURM to send SIGUSR1 to THIS batch shell (B:)
+# 180s before the walltime, so run_analysis() can run before the job is killed.
+# Requires the backgrounded srun + `wait` in the Launch section below.
+#SBATCH --signal=B:USR1@180
 #a SBATCH -q debug
 #a SBATCH -p extended
 #a --switches=1@00:20:00
@@ -503,6 +507,109 @@ echo "[monitor] pid ${MONITOR_PID} -> ${JOB_DIR}/monitor/ (a-monitor.txt summary
 # ================================================== END of Monitor Runs ==================================
 
 
+# ================================================== TIMEOUT-SAFE ANALYSIS (added) =============================================================
+# CHANGE LOG — Approach A: run the log analysis even when the job hits its SLURM walltime.
+#   1. Header: added `#SBATCH --signal=B:USR1@180` (SLURM signals this batch shell 180s before the wall).
+#   2. Refactored the end-of-script analysis block into run_analysis() below (guarded to run at most once).
+#   3. on_timeout() (SIGUSR1 handler) stops training so rank logs flush, then runs run_analysis while time remains.
+#   4. Training srun is now backgrounded and `wait`ed on by PID (Launch section) so this trap can interrupt it.
+#      The monitor (backgrounded above) and its `trap ... EXIT` cleanup are UNCHANGED.
+_ANALYSIS_DONE=0
+run_analysis() {
+    [ "${_ANALYSIS_DONE}" -eq 1 ] && return 0     # run at most once (timeout OR normal completion)
+    _ANALYSIS_DONE=1
+
+    echo "--- Starting Log Analysis ---"
+
+    # 1. Define Paths
+    LAST_RANK=$(( TOTAL_GPUS - 1 ))
+    RANK_LOG_FILE="${JOB_DIR}/rank_${LAST_RANK}.log"
+    RANK_LOG_FILE_2="${JOB_DIR}/rank_0.log"
+    SLURM_LOG_FILE="${JOB_DIR}/a-xmoe-${RUN_TYPE}-${SLURM_JOB_ID}.o"
+
+    # 2. Define the Merged Log Path (Keeping it permanent)
+    MERGED_LOG="${JOB_DIR}/full_run.log"
+
+    # 3. Wait a moment for file system sync
+    sleep 5
+
+    # 4. Create the Merged Log
+    #    First: Put the SLURM output (Config, Memory Stats, Env Vars)
+    if [ -f "${SLURM_LOG_FILE}" ]; then
+        cat "${SLURM_LOG_FILE}" > "${MERGED_LOG}"
+    else
+        echo "Warning: SLURM .o file not found at ${SLURM_LOG_FILE}" > "${MERGED_LOG}"
+    fi
+
+    #    Separator
+    echo -e "\n\n==========================================================\n" >> "${MERGED_LOG}"
+    echo -e "--- RANK ${LAST_RANK} METRICS (LOSS/TFLOPS) BELOW ---\n" >> "${MERGED_LOG}"
+    echo -e "==========================================================\n" >> "${MERGED_LOG}"
+
+    #    Second: Append the Rank Log (Loss, TFLOPS, Timers)
+    if [ -f "${RANK_LOG_FILE_2}" ]; then
+        cat "${RANK_LOG_FILE_2}" >> "${MERGED_LOG}"
+    else
+        echo "Error: Rank log file not found at ${RANK_LOG_FILE_2}" >> "${MERGED_LOG}"
+    fi
+    if [ -f "${RANK_LOG_FILE}" ]; then
+        cat "${RANK_LOG_FILE}" >> "${MERGED_LOG}"
+    else
+        echo "Error: Rank log file not found at ${RANK_LOG_FILE}" >> "${MERGED_LOG}"
+    fi
+
+    echo "Merged log saved to: ${MERGED_LOG}"
+
+    # 5. Run Analysis on the MERGED file
+    #    The script will now find "Peak Memory" (from top) and "lm loss" (from bottom)
+    python ../utils/analyze_log.py \
+            "${MERGED_LOG}" \
+            --iterations $TRAIN_ITERS \
+            --nodes $NODES \
+            --gpus_per_node $gpus_per_node \
+            --pp $PP_SIZE \
+            --ep $EP_PARALLEL_SIZE \
+            --dp $(( TOTAL_GPUS / PP_SIZE / MP_SIZE )) \
+            --tp $MP_SIZE \
+            --gbs $GLOBAL_BATCH_SIZE \
+            --mbs $BATCH_SIZE \
+            --slurm_job_id $SLURM_JOB_ID \
+            --seqlen $SEQ_LEN \
+            --num_layers $NUM_LAYERS \
+            --num_experts $EP_SIZE \
+            --expert_dim $FFN_HIDDEN_SIZE \
+            --topk $topk \
+            --hidden_dim $HIDDEN_SIZE \
+            --moe_type $MOE_TYPE \
+            --model_size $MODEL_SIZE \
+            --activation_checkpointing $ACTIVATION_CHECKPOINT \
+            --checkpoint_interval $CHECKPOINT_NUM_LAYERS \
+            --dynamic_checkpoint $DYNAMIC_CHECKPOINT \
+            --uneven_pp $UNEVEN_PP \
+            --zero $ZERO_STAGE ${ANALYZE_LOG_PROFILING_FLAG} >> "${MERGED_LOG}"
+
+    python ../utils/analyze_memory.py "${MERGED_LOG}" #>> "${MERGED_LOG}"
+
+    echo "Analysis Complete. Full log: ${MERGED_LOG}"
+}
+
+# [TIMEOUT-SAFE ANALYSIS — added] SIGUSR1 handler: fired ~180s before the walltime. Stop the
+# training step so its rank_*.log flush, then run the analysis while time remains.
+on_timeout() {
+    echo "[timeout-guard] SIGUSR1 received ~180s before walltime — stopping training and running analysis early."
+    if [ -n "${TRAIN_PID:-}" ]; then
+        kill -TERM "${TRAIN_PID}" 2>/dev/null || true
+        sleep 10                                  # give ranks a moment to flush rank_*.log
+        wait "${TRAIN_PID}" 2>/dev/null || true
+    fi
+    run_analysis
+    exit 0                                        # the monitor's EXIT trap still runs on exit
+}
+# Separate trap so it does NOT clobber the monitor's `trap ... EXIT` set above.
+trap on_timeout USR1
+# ================================================== END TIMEOUT-SAFE ANALYSIS =============================================================
+
+
 # ================================================== Launch ELMoE Training =============================================================
 # Profiling-cache runs (COLLECT_PROFILING_CACHE=true) record ONLY the per-module timers
 # (WALL_CLOCK_BREAKDOWN=true, set in the Conditional Logic section); analyze_log.py
@@ -533,10 +640,28 @@ if [[ "$planner_mode" != "true" && "$planner_mode" != "true-membal" ]]; then
     planner_mode="false"
 fi
 
+# --- Planner memory reserve, in BINARY GiB -----------------------------------
+# The planner budget is now derived as (detected total GPU memory - headroom)
+# instead of a hardcoded 61.5, so it adapts to the GPU it runs on. The reserve
+# covers what the analytic memory model does NOT account for: the HIP context,
+# RCCL buffers, hipBLASLt/Triton/aiter scratch, and caching-allocator block
+# rounding (reserved >= allocated).
+#
+# MEASURED on MI250X/MI210: total_memory = 68702699520 B = 63.984375 GiB (NOT a
+# round 64). 63.984375 - 2.484375 = 61.500000 exactly — i.e. this reproduces the
+# 61.5 GiB limit that was previously hardcoded, so Frontier plans are UNCHANGED.
+# (A round 2.5 would give 61.484 — 16 MiB tighter — and could in principle flip a
+#  marginal stage to OOM at the largest scales.)
+PLANNER_MEMORY_HEADROOM_GB="${PLANNER_MEMORY_HEADROOM_GB:-2.484375}"
+
 
 echo "Before launching srun python python ../pretrain_gpt_deepspeed.py"
 echo "--- Script started at: $(date '+%F %T') ---"
 
+# [TIMEOUT-SAFE ANALYSIS — changed] Training srun is now BACKGROUNDED (trailing `&`) and we
+# `wait` on its specific PID, so the SIGUSR1 trap (on_timeout) can interrupt the wait. A bare
+# `wait` would ALSO block on the backgrounded monitor (which runs until killed) → hang — hence
+# the explicit "${TRAIN_PID}". The srun command itself is otherwise identical to before.
 srun -N ${NODES} -n ${TOTAL_GPUS} -c6 \
      --ntasks-per-node=${gpus_per_node} \
      --gpus-per-node=${gpus_per_node} \
@@ -546,89 +671,24 @@ srun -N ${NODES} -n ${TOTAL_GPUS} -c6 \
      python ../ELMoE_launch.py \
         --run-planner ${planner_mode} \
         --planner-profile-dir ./planner_profiling_cache \
+        --planner-memory-headroom-gb ${PLANNER_MEMORY_HEADROOM_GB} \
         ${megatron_options} \
         ${data_options} \
         ${deepspeed_options} \
         --master-addr=$MASTER_ADDR \
         --zero-stage {{ZERO}} \
-        > ${JOB_DIR}/rank_\${SLURM_PROCID}.log"
+        > ${JOB_DIR}/rank_\${SLURM_PROCID}.log" &
+TRAIN_PID=$!
+wait "${TRAIN_PID}"     # [added] SIGUSR1 (approaching walltime) interrupts this; normal finish falls through
 # ================================================== END of Launch ELMoE Training =============================================================
 
 
 
 # ================================================== Start Run Analysis =============================================================
-echo "--- Starting Log Analysis ---"
-
-# 1. Define Paths
-LAST_RANK=$(( TOTAL_GPUS - 1 ))
-# JOB_DIR="logs/job_${SLURM_JOB_ID}"
-RANK_LOG_FILE="${JOB_DIR}/rank_${LAST_RANK}.log"
-RANK_LOG_FILE_2="${JOB_DIR}/rank_0.log"
-# SLURM_LOG_FILE="logs/xmoe-${RUN_TYPE}-${SLURM_JOB_ID}.o"
-SLURM_LOG_FILE="${JOB_DIR}/a-xmoe-${RUN_TYPE}-${SLURM_JOB_ID}.o"
-
-# 2. Define the Merged Log Path (Keeping it permanent)
-MERGED_LOG="${JOB_DIR}/full_run.log"
-
-# 3. Wait a moment for file system sync
-sleep 5
-
-# 4. Create the Merged Log
-#    First: Put the SLURM output (Config, Memory Stats, Env Vars)
-if [ -f "${SLURM_LOG_FILE}" ]; then
-    cat "${SLURM_LOG_FILE}" > "${MERGED_LOG}"
-else
-    echo "Warning: SLURM .o file not found at ${SLURM_LOG_FILE}" > "${MERGED_LOG}"
-fi
-
-#    Separator
-echo -e "\n\n==========================================================\n" >> "${MERGED_LOG}"
-echo -e "--- RANK ${LAST_RANK} METRICS (LOSS/TFLOPS) BELOW ---\n" >> "${MERGED_LOG}"
-echo -e "==========================================================\n" >> "${MERGED_LOG}"
-
-#    Second: Append the Rank Log (Loss, TFLOPS, Timers)
-if [ -f "${RANK_LOG_FILE_2}" ]; then
-    cat "${RANK_LOG_FILE_2}" >> "${MERGED_LOG}"
-else
-    echo "Error: Rank log file not found at ${RANK_LOG_FILE_2}" >> "${MERGED_LOG}"
-fi
-if [ -f "${RANK_LOG_FILE}" ]; then
-    cat "${RANK_LOG_FILE}" >> "${MERGED_LOG}"
-else
-    echo "Error: Rank log file not found at ${RANK_LOG_FILE}" >> "${MERGED_LOG}"
-fi
-
-echo "Merged log saved to: ${MERGED_LOG}"
-
-# 5. Run Analysis on the MERGED file
-#    The script will now find "Peak Memory" (from top) and "lm loss" (from bottom)
-python ../utils/analyze_log.py \
-        "${MERGED_LOG}" \
-        --iterations $TRAIN_ITERS \
-        --nodes $NODES \
-        --gpus_per_node $gpus_per_node \
-        --pp $PP_SIZE \
-        --ep $EP_PARALLEL_SIZE \
-        --dp $(( TOTAL_GPUS / PP_SIZE / MP_SIZE )) \
-        --tp $MP_SIZE \
-        --gbs $GLOBAL_BATCH_SIZE \
-        --mbs $BATCH_SIZE \
-        --slurm_job_id $SLURM_JOB_ID \
-        --seqlen $SEQ_LEN \
-        --num_layers $NUM_LAYERS \
-        --num_experts $EP_SIZE \
-        --expert_dim $FFN_HIDDEN_SIZE \
-        --topk $topk \
-        --hidden_dim $HIDDEN_SIZE \
-        --moe_type $MOE_TYPE \
-        --model_size $MODEL_SIZE \
-        --activation_checkpointing $ACTIVATION_CHECKPOINT \
-        --checkpoint_interval $CHECKPOINT_NUM_LAYERS \
-        --dynamic_checkpoint $DYNAMIC_CHECKPOINT \
-        --uneven_pp $UNEVEN_PP \
-        --zero $ZERO_STAGE ${ANALYZE_LOG_PROFILING_FLAG} >> "${MERGED_LOG}"
-
-python ../utils/analyze_memory.py "${MERGED_LOG}" #>> "${MERGED_LOG}"
-
-echo "Analysis Complete. Full log: ${MERGED_LOG}"
+# [TIMEOUT-SAFE ANALYSIS — moved] The analysis logic that used to run inline here now lives in
+# run_analysis() (defined above the training launch) and is invoked from BOTH:
+#   (a) the normal-completion path — this call, reached after `wait "${TRAIN_PID}"`; and
+#   (b) the SIGUSR1 timeout handler on_timeout() — see the trap and `#SBATCH --signal=B:USR1@180`.
+# The _ANALYSIS_DONE guard ensures it executes exactly once.
+run_analysis
 # ================================================== END of Run Analysis =============================================================
