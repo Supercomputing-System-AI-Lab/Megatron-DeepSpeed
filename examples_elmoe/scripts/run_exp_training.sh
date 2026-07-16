@@ -47,11 +47,12 @@ MODE="${1:-}"; [ -z "$MODE" ] && usage
 shift || true
 
 # --- parse flags (and collect the non-flag args for the mode) ---------------
-GPUS=8; GPUS_PER_NODE=8; ARGS=()
+GPUS=8; GPUS_PER_NODE=8; MODEL_SIZE_OPT=""; ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --gpus)          GPUS="$2"; shift 2 ;;
         --gpus-per-node) GPUS_PER_NODE="$2"; shift 2 ;;
+        --model-size)    MODEL_SIZE_OPT="$2"; shift 2 ;;
         *)               ARGS+=("$1"); shift ;;
     esac
 done
@@ -63,6 +64,32 @@ if (( GPUS < 1 )) || (( GPUS % GPUS_PER_NODE != 0 )); then
 fi
 NODES=$(( GPUS / GPUS_PER_NODE ))
 TOTAL_GPUS=$GPUS
+
+# ---------------------------------------------------------------------------
+# Minimum GPUs a model actually fits on. Without this guard a reviewer on an
+# 8-GPU box would launch 63B and sit through a long run only to OOM.
+# ---------------------------------------------------------------------------
+min_gpus_for() {
+    case "$1" in
+        10B|10B_1L)   echo 8   ;;
+        63B|63B_1L)   echo 32  ;;
+        173B|173B_1L) echo 256 ;;
+        537B|537B_1L) echo 480 ;;
+        1T|1T_1L)     echo 960 ;;
+        *)            echo 8   ;;
+    esac
+}
+
+require_gpus_for_model() {
+    local need; need="$(min_gpus_for "$MODEL_SIZE")"
+    if (( TOTAL_GPUS < need )); then
+        echo "ERROR: ${MODEL_SIZE} needs at least ${need} GPUs, but --gpus ${TOTAL_GPUS} was given." >&2
+        echo "       Either give it more GPUs:   --gpus ${need}" >&2
+        echo "       or scale the model down:    --model-size 10B --gpus 8" >&2
+        echo "       (see scripts/README.md — 'Scaling down to a smaller box')" >&2
+        exit 1
+    fi
+}
 
 # ---------------------------------------------------------------------------
 mint_job_id() {
@@ -137,7 +164,9 @@ case "$MODE" in
 # ===========================================================================
 training)
     [ -n "$MODEL" ] || usage
-    COLLECT_PROFILING_CACHE="false"; ZERO=1; TRAIN_ITERS=15; MODEL_SIZE="63B"
+    COLLECT_PROFILING_CACHE="false"; ZERO=1; TRAIN_ITERS=15
+    MODEL_SIZE="${MODEL_SIZE_OPT:-63B}"
+    require_gpus_for_model
     if [[ "${MODEL,,}" == "elmoe" ]]; then
         RUN_TYPE="pp"
         EP_PARALLEL_SIZE=$(( TOTAL_GPUS < 8 ? TOTAL_GPUS : 8 ))
@@ -222,8 +251,14 @@ loss_validate)
 
 # ===========================================================================
 profiling_cache)
+    # Single-layer (_1L) profiling, so it fits on ONE node regardless of the model.
+    # Default 63B_1L — the SAME as scripts-frontier — because main_results trains 63B
+    # with yes_planner and the planner needs a cache for THAT model. Override with
+    # --model-size 10B if you scaled the experiment down.
     RUN_TYPE="pr"; PP_SIZE=1; EP_PARALLEL_SIZE=$(( TOTAL_GPUS / MP_SIZE ))
-    NBS=20; TRAIN_ITERS=30; MODEL_SIZE="10B_1L"; MOE_TYPE="X-MOE"; ZERO=1
+    MODEL_SIZE="${MODEL_SIZE_OPT:-63B}"
+    case "$MODEL_SIZE" in *_1L) ;; *) MODEL_SIZE="${MODEL_SIZE}_1L" ;; esac
+    NBS=20; TRAIN_ITERS=30; MOE_TYPE="X-MOE"; ZERO=1
     CHECKPOINT_NUM_LAYERS=0; ACTIVATION_CHECKPOINT="false"; DYNAMIC_CHECKPOINT="False"
     UNEVEN_PP="False"; RUN_PLANNER="false"; COLLECT_PROFILING_CACHE="true"
     echo "profiling_cache: ${MODEL_SIZE}, ${NODES}n/${TOTAL_GPUS}g, sweeping MBS 1..8 (sequential)"
@@ -232,8 +267,53 @@ profiling_cache)
     done
     ;;
 
+# ===========================================================================
+# MAIN_RESULTS — the 5 headline comparison runs (Experiment 1)
+# ===========================================================================
+#   1. ELMoE SeqGEMM + yes_planner   (dynamic-ckpt, uneven PP, ELM-PP planner)
+#   2. ELMoE SeqGEMM + no_planner    (full activation ckpt, even PP)
+#   3. X-MoE     4. DS-MoE     5. DS-Tutel
+#
+# DS-TED is excluded: at TP=1 it is equivalent to DS-MoE. (Still runnable alone
+# via `training DS-TED`.)
+#
+# Paper scale is 63B on 32 GPUs. Unlike SLURM — where these are 5 independent
+# queued jobs that run in PARALLEL — here they contend for the same GPUs, so they
+# run STRICTLY SEQUENTIALLY (~5 x 30 min).
+#
+# Smaller box? Scale down:  main_results --gpus 8 --model-size 10B
+# (throughput numbers will NOT match the paper, but the full pipeline is exercised.)
+main_results)
+    MS="${MODEL_SIZE_OPT:-63B}"
+    MODEL_SIZE="$MS"; require_gpus_for_model
+
+    echo "=================================================================="
+    echo " main_results: 5 runs | ${MS} | ${NODES} node(s) / ${TOTAL_GPUS} GPUs | SEQUENTIAL"
+    echo "=================================================================="
+
+    declare -a RUNS=(
+        "training ELMoE seqgemm yes_planner"
+        "training ELMoE seqgemm no_planner"
+        "training X-MoE"
+        "training DS-MoE"
+        "training DS-Tutel"
+    )
+    n=${#RUNS[@]}; okc=0; failc=0; i=0
+    for run in "${RUNS[@]}"; do
+        i=$((i+1))
+        echo; echo "----- [${i}/${n}] ${run}  (${MS}, ${TOTAL_GPUS} GPUs) -----"
+        if bash "$0" ${run} --gpus "$GPUS" --gpus-per-node "$GPUS_PER_NODE" --model-size "$MS"; then
+            okc=$((okc+1))
+        else
+            failc=$((failc+1))
+            echo "  [main_results] WARNING: '${run}' failed (continuing)."
+        fi
+    done
+    echo; echo "main_results summary: ${okc}/${n} completed, ${failc} failed."
+    ;;
+
 *)
-    echo "ERROR: unknown mode '$MODE' (expected training, env_validate, loss_validate, profiling_cache)." >&2
+    echo "ERROR: unknown mode '$MODE' (expected training, env_validate, loss_validate, main_results, profiling_cache)." >&2
     usage ;;
 esac
 
