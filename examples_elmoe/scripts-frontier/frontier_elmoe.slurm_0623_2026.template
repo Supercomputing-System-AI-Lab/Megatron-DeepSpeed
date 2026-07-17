@@ -1,0 +1,774 @@
+#!/bin/bash
+
+# --- 1. Templatized SLURM Header ---
+#SBATCH -A gen150
+#SBATCH -J {{MODEL_SIZE}}-{{RUN_TYPE}}-nbs{{NUM_BATCHES}}
+#SBATCH -o logs/job_%j_pp{{PP_SIZE}}_ep{{EP_PARALLEL_SIZE}}_{{MOE_TYPE}}_ckpt_{{ACTIVATION_CHECKPOINT}}_planner_{{RUN_PLANNER}}/a-xmoe-{{RUN_TYPE}}-%j.o
+#SBATCH -e logs/job_%j_pp{{PP_SIZE}}_ep{{EP_PARALLEL_SIZE}}_{{MOE_TYPE}}_ckpt_{{ACTIVATION_CHECKPOINT}}_planner_{{RUN_PLANNER}}/a-xmoe-{{RUN_TYPE}}-%j.e
+#SBATCH -t 0:10:00
+#SBATCH -p {{PARTITION}}
+#SBATCH -N {{NODES}}
+#SBATCH -d singleton
+#SBATCH -q debug
+#a SBATCH -p extended
+#a --switches=1@00:20:00
+#a --contiguous
+####RUN_LOG_DIR="logs/job_${SLURM_JOB_ID}"
+##SBATCH -o logs/xmoe-{{RUN_TYPE}}-%j.o
+##SBATCH -e logs/xmoe-{{RUN_TYPE}}-%j.e
+
+# 01141-01142,02548,02551,02556,02676-02679
+
+# --- 2. Templatized Variable Definitions ---
+BATCH_SIZE={{BATCH_SIZE}}
+NUM_BATCHES={{NUM_BATCHES}}
+PP_SIZE={{PP_SIZE}}
+EP_PARALLEL_SIZE={{EP_PARALLEL_SIZE}}
+MP_SIZE={{MP_SIZE}}
+NODES={{NODES}}
+TOTAL_GPUS={{TOTAL_GPUS}}
+TRAIN_ITERS={{TRAIN_ITERS}}
+MOE_TYPE="{{MOE_TYPE}}"
+MODEL_SIZE="{{MODEL_SIZE}}"
+RUN_TYPE="{{RUN_TYPE}}"
+PARTITION="{{PARTITION}}"
+ACTIVATION_CHECKPOINT="{{ACTIVATION_CHECKPOINT}}"
+CHECKPOINT_NUM_LAYERS="{{CHECKPOINT_NUM_LAYERS}}"
+DYNAMIC_CHECKPOINT="{{DYNAMIC_CHECKPOINT}}"
+UNEVEN_PP="{{UNEVEN_PP}}"
+RUN_PLANNER="{{RUN_PLANNER}}"
+COLLECT_PROFILING_CACHE="{{COLLECT_PROFILING_CACHE}}"
+ZERO_STAGE={{ZERO}}
+
+
+# ACTIVATION_CHECKPOINT="false"
+# ACTIVATION_CHECKPOINT="true"
+
+echo "MICRO_BATCH_SIZE: $BATCH_SIZE"
+echo "NUM_BATCHES: $NUM_BATCHES"
+echo "PP_SIZE: $PP_SIZE"
+echo "EP_SIZE: $EP_PARALLEL_SIZE"
+echo "MP_SIZE: $MP_SIZE"
+echo "NODES: $NODES"
+echo "TOTAL_GPUS: $TOTAL_GPUS"
+echo "TRAIN_ITERS: $TRAIN_ITERS"
+echo "MOE_TYPE: $MOE_TYPE"
+echo "RUN_TYPE: $RUN_TYPE"
+echo "PARTITION: $PARTITION"
+echo "ACTIVATION_CHECKPOINT: $ACTIVATION_CHECKPOINT"
+echo "CHECKPOINT_NUM_LAYERS: $CHECKPOINT_NUM_LAYERS"
+echo "DYNAMIC_CHECKPOINT: $DYNAMIC_CHECKPOINT"
+echo "UNEVEN_PP: $UNEVEN_PP"
+echo "RUN_PLANNER: $RUN_PLANNER"
+echo "COLLECT_PROFILING_CACHE: $COLLECT_PROFILING_CACHE"
+
+# --- Profiling-cache-collection overrides -----------------------------------
+# When COLLECT_PROFILING_CACHE=true, this run populates planner_profiling_cache/
+# via analyze_log.py --profiling. To produce a clean log for that extraction:
+#   (1) PP_SIZE=1 so the existing PP conditionals select WALL_CLOCK_BREAKDOWN=true
+#       and --no-pipeline-parallel (required for per-module timer lines).
+#   (2) TRITON_DISABLE_CACHE=1 so first-call compile timings are observed.
+#   (3) to_profile=False AND profile_memory=False — the planner cache is built from the
+#       per-module TIMERS only (WALL_CLOCK_BREAKDOWN=true). The kineto trace (traces.json)
+#       and the CUDA memory .pickle are irrelevant to it and are forced OFF in the Launch
+#       section regardless of the manual toggles there.
+#   (4) RUN_PLANNER=false — producer path must not also invoke the consumer,
+#       which would try to read a cache that doesn't exist yet.
+#   (5) Skip the Triton cache warmup (contradicts TRITON_DISABLE_CACHE=1).
+#   (6) Pass --profiling to analyze_log.py so write_profile_json() runs.
+if [[ "$COLLECT_PROFILING_CACHE" == "true" ]]; then
+    PP_SIZE=1
+    RUN_PLANNER="false"
+    PROFILING_SKIP_CACHE_WARM=1
+    ANALYZE_LOG_PROFILING_FLAG="--profiling"
+else
+    PROFILING_SKIP_CACHE_WARM=0
+    ANALYZE_LOG_PROFILING_FLAG=""
+fi
+
+which python
+
+
+JOB_DIR="logs/job_${SLURM_JOB_ID}_pp{{PP_SIZE}}_ep{{EP_PARALLEL_SIZE}}_{{MOE_TYPE}}_ckpt_{{ACTIVATION_CHECKPOINT}}_planner_{{RUN_PLANNER}}"
+echo "JOB_DIR: {JOB_DIR}"
+
+export DYNAMIC_CHECKPOINT=$DYNAMIC_CHECKPOINT
+export UNEVEN_PP=$UNEVEN_PP
+
+# ================================================== Darshan Profiling Variables =============================================================
+# MVP per the OLCF tutorial: preload the proper 3.4.7-mpi build, set env + config, and let
+# Darshan write to its DEFAULT central dir: /lustre/orion/darshan/frontier/<Y>/<M>/<D>/ .
+# Find this run's log there by job id:  *_python_id${SLURM_JOB_ID}-*.darshan
+#
+# DO NOT set DARSHAN_LOGFILE: with NONMPI every process writes a log, and a fixed filename
+# makes them clobber each other (that is why a prior run showed exe=mkdir). Default auto-naming
+# gives one uniquely-named log per process, so the training rank is distinct and not overwritten.
+#
+# Build choice: the help-desk's cce-20.0.0 path (wvhy7) is a BROKEN variant -> dead Crusher log
+# path + --disable-lustre. We use the Lustre-enabled, correct-path 3.4.7 build instead (this is
+# what `module load darshan-runtime/3.4.7-mpi` resolves to under the gcc/cray-mpich-9.1.0 PrgEnv).
+source /usr/share/lmod/lmod/init/bash 2>/dev/null || true
+module unload darshan-runtime 2>/dev/null || true
+export LD_PRELOAD="/opt/cray/libfabric/2.3.1/lib64/libfabric.so /sw/frontier/spack-envs/cpe26.03-cpu/opt/__spack_path_placeholder__/__spack_path_placeholder__/__spack_path_placeholder__/__spac/gcc-14.2/darshan-runtime-3.4.7-i6lglufb3nzhpr6gneuq2bjdaonwtv66/lib/libdarshan.so"
+export DARSHAN_ENABLE_NONMPI=1          # REQUIRED for Python (no MPI-link interposition)
+export DARSHAN_MOD_ENABLE="POSIX,STDIO,MPI-IO,LUSTRE,DXT_POSIX"  # LUSTRE now produces data (enable-lustre build)
+export DARSHAN_CONFIG_PATH="${PWD}/darshan.conf"   # absolute: ./ is unreliable on compute-node CWD
+# NOTE: no DARSHAN_LOGFILE on purpose -> auto-named logs in the central Darshan dir.
+
+# ================================================== Model & Data Setup =============================================================
+# export LD_PRELOAD="/usr/lib64/libcrypto.so /usr/lib64/libssh.so.4 /usr/lib64/libssl.so.1.1"
+export TRANSFORMERS_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TORCH_EXTENSIONS_DIR=$PWD/deepspeed
+export HF_HOME=$PWD/hfdata
+export OMP_NUM_THREADS=1
+
+# export CHECKPOINT_PATH=checkpoint/$(date +%Y-%m-%d)_${SLURM_JOB_ID}
+export CHECKPOINT_PATH=checkpoint/2026-07-02_4929581
+
+# export CHECKPOINT_PATH=checkpoint/2026-05-14_4578234_forge_small
+# export CHECKPOINT_PATH=checkpoint/forge_small_dsv2_0.1_warmup
+# export CHECKPOINT_PATH=checkpoint/forge_small_dsv2_0.1_warmup_pp8
+# export CHECKPOINT_PATH=checkpoint/2026-05-31_4748889_forge_small_dsv2_0.1_warmup
+
+# export CHECKPOINT_PATH=checkpoint/shared_exp_swiglu_0701_2026_v2
+export LOAD_CHECKPOINT_PATH=${CHECKPOINT_PATH}     # 1800
+
+# --- Continue training from a previous checkpoint ---------------------------
+# Point at the PARENT dir containing latest_checkpointed_iteration.txt
+# (NOT a global_step* subdir). Comment the explicit export below to fall back
+# to fresh training (load = the new per-job CHECKPOINT_PATH, which is empty).
+# export LOAD_CHECKPOINT_PATH=checkpoint/2026-05-12_4573102_forge_small    # 1800
+# export LOAD_CHECKPOINT_PATH=checkpoint/2026-05-13_4576164_forge_small     # 3600
+
+# FORGE: 
+# # export LOAD_CHECKPOINT_PATH=checkpoint/2026-05-14_4578234_forge_small      # 5700 
+# export LOAD_CHECKPOINT_PATH="${LOAD_CHECKPOINT_PATH:-${CHECKPOINT_PATH}}"
+# export VOCAB_FILE=/lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/examples_elmoe/data/FORGE/all_vocab.json
+# export DATA_PATH=/lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/examples_elmoe/data/FORGE/all_text_document
+
+export VOCAB_FILE=../data/gpt2-vocab.json
+export MERGE_FILE=../data/gpt2-merges.txt
+export DATA_PATH=../data/my-gpt2_text_document
+
+# Llama tokenizer/data
+# export VOCAB_FILE=/lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/examples_elmoe/data/llama31_tokenizer/tokenizer.json
+# export DATA_PATH=/lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/examples_elmoe/data/oscar-llama31_text_document
+
+
+DIR=`pwd`
+mkdir -p logs
+
+# -------------------------------------------------------------------------------------------
+# Get model config
+CONFIG_VARS=$(python3 ../utils/model_registry.py get_vars --model_size "${MODEL_SIZE}")
+if [ $? -ne 0 ]; then
+    echo "Error: Model size '${MODEL_SIZE}' not found in registry."
+    exit 1
+fi
+
+# Evaluate the output to set the Bash variables
+eval "$CONFIG_VARS"
+
+echo "Model Config Loaded for ${MODEL_SIZE}:"
+echo "  HIDDEN_SIZE: $HIDDEN_SIZE"
+echo "  FFN_HIDDEN_SIZE:    $FFN_HIDDEN_SIZE"
+echo "  NUM_LAYERS: $NUM_LAYERS"
+echo "  NUM_ATTN_HEADS: $NUM_ATTN_HEADS"
+echo "  EP_SIZE: $EP_SIZE"
+echo "  topk: $topk"
+echo "  SEQ_LEN: $SEQ_LEN"
+echo "  KV_HEADS: $KV_HEADS"
+# -------------------------------------------------------------------------------------------
+# ================================================== END of Model & Data Setup =============================================================
+
+
+# ================================================== Megatron Setup =============================================================
+GLOBAL_BATCH_SIZE=$(( NUM_BATCHES * BATCH_SIZE * (TOTAL_GPUS / PP_SIZE / MP_SIZE) ))
+echo "GLOBAL_BATCH_SIZE=$GLOBAL_BATCH_SIZE"
+
+# --- Static Training Parameters ---
+# 200M tokens for LR tuning 
+# LR=7.0e-4
+# MIN_LR=7.0e-5
+# TRAIN_TOKENS=200000000          # 200M tokens per pilot
+# WARMUP_TOKENS=50000000          # 50M warmup (~50 steps) — same Adam stabilization as full run
+# LR_DECAY_TOKENS=200000000       # Decay over full pilot, OR set to a very large number to keep LR constant after warmup (preferred — see note below)
+
+# # -----------------------------------------------------------
+# # 10B tokens 
+# # Step Law + DeepSeek-MoE-16B calibrated 
+# LR=1.23e-4
+# MIN_LR=1.23e-5
+# TRAIN_TOKENS=10000000000 
+# WARMUP_TOKENS=200000000         # 200M tokens 
+# LR_DECAY_TOKENS=9800000000      # 9.8B = TRAIN_TOKENS - WARMUP_TOKENS
+# # -----------------------------------------------------------
+
+# -----------------------------------------------------------
+# 10B tokens 
+# DeepSeek-v2-16B 
+LR=4.2e-4
+MIN_LR=4.2e-5
+TRAIN_TOKENS=10000000000 
+WARMUP_TOKENS=1000000000         # 200M tokens 
+LR_DECAY_TOKENS=9000000000      # 9.8B = TRAIN_TOKENS - WARMUP_TOKENS
+# -----------------------------------------------------------
+
+EXIT_DURATION=30000000
+# WARMUP_TOKENS=375000000
+# LR_DECAY_TOKENS=300000000000
+MLC=0.001
+MOE_TRAIN_CAP_FACTOR=1.0
+MOE_EVAL_CAP_FACTOR=1.0
+MOE_MIN_CAP=4
+MOE_DROP_TOKEN="true"
+CL_ENABLED="false"
+CL_START_SEQLEN=80
+CL_AVG_SEQLEN=$(( (CL_START_SEQLEN + SEQ_LEN) / 2 ))
+CL_TOKENS=60
+CL_TOKENS=$((CL_TOKENS * 1000000000))
+CL_STEP=$(( CL_TOKENS / (GLOBAL_BATCH_SIZE * CL_AVG_SEQLEN) ))
+LOG_INTERVAL=1
+EVAL_ITERS=0
+EVAL_INTERVAL=300
+SAVE_INTERVAL=200
+INIT_STD=0.014
+
+# --- Output and Data Configs ---
+current_time=$(date "+%Y.%m.%d-%H.%M.%S")
+host="${HOSTNAME}"
+NAME="gpt-${MODEL_SIZE}B-lr-${LR}-minlr-${MIN_LR}-bs-${GLOBAL_BATCH_SIZE}-gpus-${TOTAL_GPUS}-mp-${MP_SIZE}-pp-${PP_SIZE}-test"
+if [[ $EP_SIZE -gt 1 ]]; then
+    NAME="${NAME}-ep-${EP_SIZE}-mlc-${MLC}-cap-${MOE_TRAIN_CAP_FACTOR}-drop-${MOE_DROP_TOKEN}"
+fi
+if [ "${CL_ENABLED}" = "true" ]; then
+    NAME="${NAME}-cl-${CL_START_SEQLEN}-${CL_STEP}"
+fi
+
+OUTPUT_BASEPATH=$DIR/output
+mkdir -p "${OUTPUT_BASEPATH}/tensorboard/"
+mkdir -p "${OUTPUT_BASEPATH}/checkpoint/"
+mkdir -p "${OUTPUT_BASEPATH}/log/"
+TENSORBOARD_DIR="${OUTPUT_BASEPATH}/tensorboard/${NAME}_${host}_${current_time}"
+mkdir -p ${TENSORBOARD_DIR}
+
+# --- Wandb (online; last-rank only) ---
+# Setup before submitting:
+#   1. Export your API key in your shell (or put it in ~/.netrc):
+#        export WANDB_API_KEY=<your_key_from_https://wandb.ai/authorize>
+#      The export is propagated to compute nodes via srun --export=ALL.
+#   2. Frontier compute nodes reach the internet through the OLCF proxy;
+#      the http(s)_proxy exports below are required for online mode to work.
+# To disable wandb for a single run, set WANDB_DISABLED=true before sbatch.
+export WANDB_MODE="${WANDB_MODE:-online}"
+export WANDB_PROJECT="${WANDB_PROJECT:-DEBUG}"
+# export WANDB_PROJECT="${WANDB_PROJECT:-PRETRAIN}"
+export WANDB_ENTITY="${WANDB_ENTITY:-zixianw4-university-of-illinois-urbana-champaign}"
+export WANDB_DIR="${WANDB_DIR:-${OUTPUT_BASEPATH}/wandb}"
+export WANDB_NAME="${WANDB_NAME:-job${SLURM_JOB_ID}_${NAME}}"
+export WANDB_GROUP="${WANDB_GROUP:-${MODEL_SIZE}_${MOE_TYPE}}"
+
+mkdir -p "${WANDB_DIR}"
+
+if [[ -z "${WANDB_API_KEY:-}" && ! -f "${HOME}/.netrc" \
+      && "${WANDB_MODE}" != "disabled" && "${WANDB_DISABLED:-false}" != "true" ]]; then
+    echo "WARNING: no WANDB_API_KEY and no ~/.netrc found; wandb online init will fail on the last rank."
+    echo "         Either run \`wandb login\` once (writes ~/.netrc) or export WANDB_API_KEY=<key> before sbatch."
+fi
+
+# --- Resume an existing wandb run instead of creating a new one ---
+# Find <RUN_ID> in the URL: https://wandb.ai/<entity>/<project>/runs/<RUN_ID>
+# Read natively by wandb.init() from the env — no Python change needed.
+# Caveat: wandb's internal step counter may have drifted past the Megatron
+# iteration in the original run (because the throughput log block in
+# training.py:~1060 doesn't pass step=). On resume, all log calls below the
+# current wandb step are silently dropped. Easiest fix: leave commented and
+# let the continuation create a fresh run.
+# export WANDB_RUN_ID="47w8t0ct"
+# export WANDB_RESUME="allow"
+
+
+# OLCF outbound HTTP proxy (required on Frontier compute nodes for online wandb).
+export http_proxy="${http_proxy:-http://proxy.ccs.ornl.gov:3128}"
+export https_proxy="${https_proxy:-http://proxy.ccs.ornl.gov:3128}"
+export no_proxy="${no_proxy:-localhost,127.0.0.1,.olcf.ornl.gov,.ccs.ornl.gov,.frontier.olcf.ornl.gov}"
+
+
+# --- Megatron & Deepspeed Options ---
+data_options=" \
+         --tokenizer-type GPT2BPETokenizer \
+         --vocab-file ${VOCAB_FILE} \
+         --merge-file ${MERGE_FILE} \
+         --data-path ${DATA_PATH}"
+
+# # For FORGE Dataset 
+# data_options=" \
+#          --tokenizer-type HFTokenizer \
+#          --vocab-file ${VOCAB_FILE} \
+#          --data-path ${DATA_PATH}"
+
+megatron_options=" \
+        --moe-expert-parallel-size ${EP_PARALLEL_SIZE} \
+        --num-experts ${EP_SIZE} \
+        --moe-loss-coeff ${MLC} \
+        --moe-train-capacity-factor ${MOE_TRAIN_CAP_FACTOR} \
+        --moe-eval-capacity-factor ${MOE_EVAL_CAP_FACTOR} \
+        --moe-min-capacity ${MOE_MIN_CAP} \
+        --override-opt_param-scheduler \
+        --adam-beta1 0.9 \
+        --adam-beta2 0.95 \
+        --tensor-model-parallel-size ${MP_SIZE} \
+        --init-method-std ${INIT_STD} \
+        --lr-decay-tokens ${LR_DECAY_TOKENS} \
+        --lr-warmup-tokens ${WARMUP_TOKENS} \
+        --micro-batch-size ${BATCH_SIZE} \
+        --exit-duration-in-mins ${EXIT_DURATION} \
+        --global-batch-size ${GLOBAL_BATCH_SIZE} \
+        --num-layers ${NUM_LAYERS} \
+        --hidden-size ${HIDDEN_SIZE} \
+        --ffn-hidden-size ${FFN_HIDDEN_SIZE} \
+        --num-attention-heads ${NUM_ATTN_HEADS} \
+        --seq-length ${SEQ_LEN} \
+        --max-position-embeddings ${SEQ_LEN} \
+        --train-tokens ${TRAIN_TOKENS} \
+        --train-iters ${TRAIN_ITERS} \
+        --lr ${LR} \
+        --min-lr ${MIN_LR} \
+        --lr-decay-style cosine \
+        --split 98,2,0 \
+        --log-interval ${LOG_INTERVAL} \
+        --eval-interval ${EVAL_INTERVAL} \
+        --eval-iters ${EVAL_ITERS} \
+        --save-interval ${SAVE_INTERVAL} \
+        --weight-decay 0.1 \
+        --clip-grad 1.0 \
+        --hysteresis 2 \
+        --num-workers 0 \
+        --bf16 \
+        --tensorboard-queue-size 1 \
+        --log-timers-to-tensorboard \
+        --log-batch-size-to-tensorboard \
+        --log-validation-ppl-to-tensorboard \
+        --tensorboard-dir ${TENSORBOARD_DIR} \
+        --moe-train-capacity-factor 1.25 \
+	    --expert-interval 1 \
+	    --topk $topk \
+        --use-flash-attn-v2 \
+        --adam-eps 1e-8 \
+        --seed 1000 \
+        --save ${CHECKPOINT_PATH} \
+        --load ${LOAD_CHECKPOINT_PATH} \
+        --save-interval ${SAVE_INTERVAL} \
+	--use-rotary-position-embeddings"
+    # --using-torchrun \
+        # --inference \
+
+        
+        
+# --- Conditional Logic ---
+# Set DeepSpeed flags and other settings based on whether this is a PP run.
+if [[ ${PP_SIZE} -gt 1 ]]; then
+    WALL_CLOCK_BREAKDOWN="false"
+    export WALL_CLOCK_BREAKDOWN="false"
+else
+    
+    # If enabling profiling caches 
+    if [[ "$COLLECT_PROFILING_CACHE" == "true" ]]; then
+        WALL_CLOCK_BREAKDOWN="true"
+        export WALL_CLOCK_BREAKDOWN="true"
+    else 
+        WALL_CLOCK_BREAKDOWN="false"
+        export WALL_CLOCK_BREAKDOWN="false"
+        # WALL_CLOCK_BREAKDOWN="true"
+        # export WALL_CLOCK_BREAKDOWN="true"
+    fi 
+fi
+
+if [[ "${MOE_TYPE}" == "X-MOE" ]]; then
+    # System/kernel flags only -- these are a property of the MOE_TYPE, not the model.
+    megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --no-bias-gelu-fusion"
+
+    # Architecture is owned by model_registry.py. Entries that declare arch fields (norm,
+    # bias, swiglu, shared, first_k_dense, ...) emit them via ARCH_FLAGS below and need
+    # nothing here. Entries that declare none fall back to the historical X-MOE default
+    # so previously working configs keep launching identically.
+    #
+    # To stop hand-editing this file per run, add the fields to the registry entry, e.g.
+    #   "10B":    {..., "shared": 2, "swiglu": True},   # 2 shared, top-6
+    #   "10B_k7": {..., "shared": 1, "swiglu": True},   # 1 shared, top-7
+    #   "10B_k8": {..., "shared": 0, "swiglu": True},   # 0 shared, top-8
+    # Once an entry declares them, the branch below is skipped for that model.
+    if [ -z "${ARCH_FLAGS}" ]; then
+        megatron_options="${megatron_options} --num-shared-experts 2 --swiglu"
+    fi
+    # megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-rbd"
+elif [[ "${MOE_TYPE}" == "ELMOE-3D" ]]; then
+    megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --no-bias-gelu-fusion"
+
+elif [[ "${MOE_TYPE}" == "ELMOE-GroupedGEMM-triton" ]]; then
+    megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-groupedGEMM --use-triton --no-bias-gelu-fusion"
+    export USE_TRITON_GROUPGEMM="True"
+
+elif [[ "${MOE_TYPE}" == "ELMOE-GroupedGEMM-primus" ]]; then
+    export USE_AITER_GROUPGEMM=True 
+    megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-groupedGEMM --no-bias-gelu-fusion --disable-bias-linear"
+
+elif [[ "${MOE_TYPE}" == "TED-MOE" ]]; then
+    megatron_options="${megatron_options} --enable-expert-tensor-parallelism"
+
+elif [[ "${MOE_TYPE}" == "TUTEL-MOE" ]]; then
+    megatron_options="${megatron_options} --use-tutel"
+
+elif [[ "${MOE_TYPE}" == "DENSE" ]]; then
+    megatron_options="${megatron_options} --num-key-value-heads ${KV_HEADS} --swiglu  --normalization rmsnorm --disable-bias-linear --no-bias-gelu-fusion  --untie-embeddings-and-output-weights"
+fi
+# Turn off to 0, on to 1
+export LAYER_TIMING=0
+export LAYER_TIMING_TARGETS=0
+
+if [ "${ACTIVATION_CHECKPOINT}" = "true" ]; then
+    megatron_options="${megatron_options} --checkpoint-activations"
+    megatron_options="${megatron_options} --checkpoint-num-layers $CHECKPOINT_NUM_LAYERS"
+fi
+if [[ $EP_SIZE -gt 1 ]]; then
+    megatron_options="${megatron_options} --create-moe-param-group"
+fi
+if [ "${MOE_DROP_TOKEN}" = "false" ]; then
+    megatron_options="${megatron_options} --disable-moe-token-dropping"
+fi
+
+# Architecture flags declared by the model_registry entry (norm, bias, swiglu, shared
+# experts, first_k_dense, ...). Models that declare none emit ARCH_FLAGS="", leaving
+# this line a no-op, so existing runs are unaffected. Appended last so a registry
+# entry wins over the MOE_TYPE defaults hardcoded above.
+if [ -n "${ARCH_FLAGS}" ]; then
+    megatron_options="${megatron_options} ${ARCH_FLAGS}"
+    echo "  ARCH_FLAGS: ${ARCH_FLAGS}"
+fi
+# ================================================== END of Megatron Setup =============================================================
+
+
+# ================================================== DeepSpeed Setup =============================================================
+# WALL_CLOCK_BREAKDOWN="false"
+template_json="../ds_config_gpt_TEMPLATE.json"
+# config_json="ds_config_gpt_Zero0_${NAME}.json"
+config_dir="temp_ds_json"
+config_json="${config_dir}/ds_config_gpt_Zero0_${NAME}.json"
+# Create temp_ds_json directory if it doesn't exist
+mkdir -p "${config_dir}"
+
+sed "s/CONFIG_BATCH_SIZE/${GLOBAL_BATCH_SIZE}/" ${template_json} \
+    | sed "s/CONFIG_MBSIZE/${BATCH_SIZE}/" \
+    | sed "s/LOG_INTERVAL/${LOG_INTERVAL}/" \
+    | sed "s/ZERO_STAGE/{{ZERO}}/" \
+    | sed "s/PRESCALE_GRAD/false/" \
+    | sed "s/CONFIG_FP16_ENABLED/false/" \
+    | sed "s/CONFIG_BF16_ENABLED/true/" \
+    | sed "s/CONFIG_CL_ENABLED/${CL_ENABLED}/" \
+    | sed "s/CONFIG_CL_MIN/${CL_START_SEQLEN}/" \
+    | sed "s/CONFIG_CL_MAX/${SEQ_LEN}/" \
+    | sed "s/CONFIG_CL_DURATION/${CL_STEP}/" \
+    | sed "s/WALL_CLOCK_BREAKDOWN/${WALL_CLOCK_BREAKDOWN}/" \
+    > ${config_json}
+
+deepspeed_options=" --deepspeed --deepspeed_config ${config_json}"
+if [[ $PP_SIZE -gt 1 ]]; then
+    deepspeed_options=" ${deepspeed_options} --pipeline-model-parallel-size ${PP_SIZE}"
+else
+    deepspeed_options=" ${deepspeed_options} --no-pipeline-parallel"
+fi
+
+if [ "${ACTIVATION_CHECKPOINT}" = "true" ]; then
+    deepspeed_options="${deepspeed_options} --deepspeed-activation-checkpointing"
+fi
+# ================================================== END of DeepSpeed Setup =============================================================
+
+
+# ================================================== Setup Moving Cache to prevent IO =============================================================
+# # export TRITON_DISABLE_CACHE=1
+# # export TRITON_CACHE_DIR="/lustre/orion/gen150/scratch/zixianw4/.triton/cache/"
+# TMP_TRITON_DIR="/tmp/triton_cache_${SLURM_JOB_ID}"
+# TRITON_CACHE_DIR="/tmp/triton_cache_${SLURM_JOB_ID}"
+# mkdir -p ${TRITON_CACHE_DIR}
+PERSISTENT_TRITON_CACHE="/lustre/orion/gen150/scratch/zixianw4/.triton/cache"
+TMP_TRITON_DIR="/tmp/triton_cache_${SLURM_JOB_ID}"
+export TRITON_CACHE_DIR="${TMP_TRITON_DIR}"
+
+if [[ "${PROFILING_SKIP_CACHE_WARM}" != "1" ]]; then
+    echo "--- Warming Triton cache on all nodes at: $(date '+%F %T') ---"
+    srun -N ${NODES} -n ${NODES} --ntasks-per-node=1 \
+        bash cache_setup.sh ${PERSISTENT_TRITON_CACHE} ${TMP_TRITON_DIR}
+    echo "--- Cache warm done at: $(date '+%F %T') ---"
+else
+    echo "--- Profiling-cache-collection run: skipping Triton cache warm (TRITON_DISABLE_CACHE=1) ---"
+fi
+# ================================================== END of Setup Moving Cache =============================================================
+
+
+# ================================================== Frontier Global Env Var Setup =============================================================
+# --- Execution Logic ---
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+# Try to mitigate triton groupgemm's effect for 4 arenas per thread instead of default 8. 
+# export MALLOC_ARENA_MAX=4
+
+
+export RANK=$SLURM_PROCID
+export WORLD_SIZE=$SLURM_NTASKS
+export LOCAL_RANK=$SLURM_LOCALID
+
+
+export HIGH_SPEED_INTERFACE="hsn0"
+export FI_MR_CACHE_MONITOR=kdreg2     # Required to avoid a deadlock.
+# export FI_CXI_DEFAULT_CQ_SIZE=131072  # Ask the network stack to allocate additional space to process message completions.
+# export FI_CXI_DEFAULT_TX_SIZE=2048    # Ask the network stack to allocate additional space to hold pending outgoing messages.
+export FI_CXI_DEFAULT_CQ_SIZE=524288
+export FI_CXI_DEFAULT_TX_SIZE=16384
+# export FI_CXI_DEFAULT_CQ_SIZE=1048576
+# export FI_CXI_DEFAULT_TX_SIZE=32768
+export FI_CXI_RX_MATCH_MODE=hybrid    # Allow the network stack to transition to software mode if necessary.
+
+# export NCCL_NET_GDR_LEVEL=3           # Typically improves performance, but remove this setting if you encounter a hang/crash.
+# export NCCL_CROSS_NIC=0               # On large systems, this NCCL setting has been found to improve performance
+export NCCL_SOCKET_IFNAME=hsn0        # NCCL/RCCL will use the high speed network to coordinate startup.
+# export GLOO_SOCKET_IFNAME=hsn0
+
+# This tells the GLOO backend to prepare for a huge number of incoming connections.
+# It sets the listen() backlog to a high value.
+# export GLOO_TCP_IFACE_LISTEN_BACKLOG=4096
+
+# --- Robust Master Address Discovery ---
+readarray -t arr < <(scontrol show hostnames $SLURM_NODELIST)
+master_node=${arr[0]}
+export MASTER_ADDR=$(ssh $master_node "ip -4 addr show ${HIGH_SPEED_INTERFACE} | grep 'inet' | awk '{print \$2}' | cut -d/ -f1 | head -n1")
+if [[ -z "${MASTER_ADDR}" ]]; then
+    echo "FATAL: Could not determine MASTER_ADDR for interface '${HIGH_SPEED_INTERFACE}' on master node '${master_node}'."
+    exit 1
+fi
+export MASTER_PORT=29500
+
+echo "--- Frontier Distributed Training Setup ---"
+echo "MASTER_NODE: ${master_node}"
+echo "MASTER_ADDR: ${MASTER_ADDR} (using interface: ${NCCL_SOCKET_IFNAME})"
+echo "-----------------------------------------"
+
+
+# --- Other Script Variables ---
+current_time=$(date +%Y-%m-%d_%H-%M-%S)
+# export OMP_NUM_THREADS=2
+# export TRITON_PTXAS_NUM_WORKERS=4
+export TRITON_PTXAS_NUM_WORKERS=1
+export OMP_NUM_THREADS=1
+export NCCL_TIMEOUT=1200
+export NCCL_TIMEOUT_MS=1200000
+export TORCH_NCCL_BLOCKING_WAIT=1
+
+# help exit the program if nccl hang 
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_ASYNC_ERROR_HANDLING=1
+
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+
+export NCCL_DEBUG=INFO
+# export NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH
+# export NCCL_NET=ofi               # FAILS the run if OFI plugin can't load (vs silent fallback)
+# export NCCL_NET_PLUGIN=ofi        # belt-and-suspenders for older RCCL builds
+
+# export NCCL_P2P_DISABLE=1
+# ================================================== END of Frontier Global Env Var Setup Up =============================================================
+
+
+# ================================================== Nodes Connection Check =============================================================
+# --- Final srun Launch Command ---
+gpus_per_node=$(( TOTAL_GPUS / NODES ))
+LOG_FILE="logs/n${TOTAL_GPUS}-gbs${GLOBAL_BATCH_SIZE}-${MOE_TYPE}-${RUN_TYPE}.log"
+
+echo "--- Running Environment Diagnostic ---"
+echo "--- Script started at: $(date '+%F %T') ---"
+srun -N ${NODES} -n ${TOTAL_GPUS} -c6 --ntasks-per-node=${gpus_per_node} --gpus-per-node=${gpus_per_node} \
+    bash -c ' \
+        if [[ $SLURM_PROCID -eq 0 ]]; then \
+            echo "--- Environment on Rank 0 ---"; \
+            env | grep -E "MASTER_ADDR|OMPI_MCA|NCCL_SOCKET_IFNAME|FI_"; \
+            echo "-----------------------------"; \
+        fi \
+    '
+
+echo "--- Cache warm done at: $(date '+%F %T') ---"
+
+# # ---- ADD THIS BLOCK HERE ----
+# echo "--- Pre-compiling Triton kernels (1 per node) at: $(date '+%F %T') ---"
+# srun -N ${NODES} -n ${NODES} --ntasks-per-node=1 --gpus-per-node=1 \
+#     bash -c "
+#     export TRITON_CACHE_DIR=${TMP_TRITON_DIR}
+#     python -c \"
+# import torch
+# from megatron.moe.exp_triton_groupgemm import k2_forward, k2_backward_dx, k2_backward_dw, get_num_sms
+# d = torch.randn(1, 7168, device='cuda', dtype=torch.bfloat16)
+# w = torch.randn(1, 2560, 7168, device='cuda', dtype=torch.bfloat16)
+# m = torch.ones(1, dtype=torch.int32, device='cuda')
+# o = torch.empty(1, 2560, device='cuda', dtype=torch.bfloat16)
+# S = get_num_sms()
+# k2_forward[(S,)](d, w, m, o, 2560, 7168, 1, S, 7168, 1, 2560*7168, 2560, 1, 2560, 1, num_warps=4, num_stages=1)
+# k2_backward_dx[(S,)](o, w, m, d, 7168, 2560, 1, S, 2560, 1, 2560*7168, 2560, 1, 7168, 1, num_warps=4, num_stages=1)
+# k2_backward_dw[(S,)](d, o, m, w, 2560, 7168, 1, S, 7168, 1, 2560, 1, 2560*7168, 2560, 1, num_warps=4, num_stages=1)
+# torch.cuda.synchronize()
+# import os; print(f'[{os.uname().nodename}] Triton K2 compiled OK')
+# \"
+# "
+# echo "--- Pre-compilation done at: $(date '+%F %T') ---"
+# # ---- END OF BLOCK ----
+
+# export to_profile="False"
+# export PYTHONDONTWRITEBYTECODE=1
+# ================================================== END of Nodes Connection Check =============================================================
+
+# ================================================== Monitor Runs ==================================
+# Async pipeline-stall monitor (body lives in monitor_run.sh, same dir). Backgrounded so it never
+# blocks the training srun. Writes into ${JOB_DIR}/monitor/ :
+#   a-monitor.txt   — SUMMARY: per-interval state histogram across ALL ranks + frozen/odd counts +
+#                     unsamplable ranks + culprit native stack (read this first; scales to 960 GPUs).
+#   <hostname>.txt  — per-node detail (one row per rank: STATUS RANK GPU PID TRACE).
+#   monitor.tsv     — one row per (interval,rank) for grep/plot.
+# Needs ~/.local/bin/py-spy on $HOME (shared across nodes).
+# Adaptive cadence: every 1 min for the first 5 min (catch first-iteration hangs), then every 3 min.
+MON_FAST=120; MON_SLOW=240; MON_WINDOW=600; MON_TRACE_FRAMES=20
+bash "${DIR:-.}/monitor_run.sh" "${JOB_DIR}" "${MON_FAST}" "${MON_SLOW}" "${MON_WINDOW}" "${MON_TRACE_FRAMES}" &
+MONITOR_PID=$!
+trap 'kill ${MONITOR_PID} 2>/dev/null' EXIT
+echo "[monitor] pid ${MONITOR_PID} -> ${JOB_DIR}/monitor/ (a-monitor.txt summary + per-node files; ${MON_FAST}s for first ${MON_WINDOW}s, then ${MON_SLOW}s)"
+# ================================================== END of Monitor Runs ==================================
+
+
+# ================================================== Launch ELMoE Training =============================================================
+# Profiling-cache runs (COLLECT_PROFILING_CACHE=true) record ONLY the per-module timers
+# (WALL_CLOCK_BREAKDOWN=true, set in the Conditional Logic section); analyze_log.py
+# --profiling turns those into planner_profiling_cache/. Force the kineto trace
+# (traces.json) and the CUDA memory snapshot (.pickle) OFF for that path regardless of the
+# manual toggles below — they are unrelated to the timing cache and only add IO/overhead.
+# For NORMAL runs (COLLECT_PROFILING_CACHE=false) uncomment the toggles below to capture them.
+if [[ "$COLLECT_PROFILING_CACHE" == "true" ]]; then
+    export to_profile="False"
+    export profile_memory="False"
+else
+    export to_profile="False"
+    export profile_memory="False"
+    # export to_profile="True"
+    # export profile_memory="True"
+fi
+export mem_snapshot_ranks="all"          # which ranks dump a memory .pickle: "all", "0", or "0,8,16,..."
+# export mem_snapshot_after_steps="3"    # dump after N warm steps (default 3; needs train_iters > N)
+
+
+export profile_dir="${JOB_DIR}/torch_profile"
+
+# Darshan per-rank logs land here (DARSHAN_LOGFILE set per-rank in the srun below).
+mkdir -p "${JOB_DIR}/darshan"
+
+planner_mode="{{RUN_PLANNER}}"
+
+# Validate planner mode — default to false if unrecognized
+if [[ "$planner_mode" != "true" && "$planner_mode" != "true-membal" ]]; then
+    planner_mode="false"
+fi
+
+
+echo "Before launching srun python python ../pretrain_gpt_deepspeed.py"
+echo "--- Script started at: $(date '+%F %T') ---"
+
+srun -N ${NODES} -n ${TOTAL_GPUS} -c6 \
+     --ntasks-per-node=${gpus_per_node} \
+     --gpus-per-node=${gpus_per_node} \
+     --kill-on-bad-exit=1 \
+     --export=ALL,FI_MR_CACHE_MONITOR,FI_CXI_DEFAULT_CQ_SIZE,FI_CXI_RX_MATCH_MODE,NCCL_DEBUG,UNEVEN_PP,TRITON_CACHE_DIR,TRITON_DISABLE_CACHE \
+     bash -c "
+     python ../ELMoE_launch.py \
+        --run-planner ${planner_mode} \
+        --planner-profile-dir ./planner_profiling_cache \
+        ${megatron_options} \
+        ${data_options} \
+        ${deepspeed_options} \
+        --master-addr=$MASTER_ADDR \
+        --zero-stage {{ZERO}} \
+        > ${JOB_DIR}/rank_\${SLURM_PROCID}.log"
+# ================================================== END of Launch ELMoE Training =============================================================
+
+
+
+# ================================================== Start Run Analysis =============================================================
+echo "--- Starting Log Analysis ---"
+
+# 1. Define Paths
+LAST_RANK=$(( TOTAL_GPUS - 1 ))
+# JOB_DIR="logs/job_${SLURM_JOB_ID}"
+RANK_LOG_FILE="${JOB_DIR}/rank_${LAST_RANK}.log"
+RANK_LOG_FILE_2="${JOB_DIR}/rank_0.log"
+# SLURM_LOG_FILE="logs/xmoe-${RUN_TYPE}-${SLURM_JOB_ID}.o"
+SLURM_LOG_FILE="${JOB_DIR}/a-xmoe-${RUN_TYPE}-${SLURM_JOB_ID}.o"
+
+# 2. Define the Merged Log Path (Keeping it permanent)
+MERGED_LOG="${JOB_DIR}/full_run.log"
+
+# 3. Wait a moment for file system sync
+sleep 5
+
+# 4. Create the Merged Log
+#    First: Put the SLURM output (Config, Memory Stats, Env Vars)
+if [ -f "${SLURM_LOG_FILE}" ]; then
+    cat "${SLURM_LOG_FILE}" > "${MERGED_LOG}"
+else
+    echo "Warning: SLURM .o file not found at ${SLURM_LOG_FILE}" > "${MERGED_LOG}"
+fi
+
+#    Separator
+echo -e "\n\n==========================================================\n" >> "${MERGED_LOG}"
+echo -e "--- RANK ${LAST_RANK} METRICS (LOSS/TFLOPS) BELOW ---\n" >> "${MERGED_LOG}"
+echo -e "==========================================================\n" >> "${MERGED_LOG}"
+
+#    Second: Append the Rank Log (Loss, TFLOPS, Timers)
+if [ -f "${RANK_LOG_FILE_2}" ]; then
+    cat "${RANK_LOG_FILE_2}" >> "${MERGED_LOG}"
+else
+    echo "Error: Rank log file not found at ${RANK_LOG_FILE_2}" >> "${MERGED_LOG}"
+fi
+if [ -f "${RANK_LOG_FILE}" ]; then
+    cat "${RANK_LOG_FILE}" >> "${MERGED_LOG}"
+else
+    echo "Error: Rank log file not found at ${RANK_LOG_FILE}" >> "${MERGED_LOG}"
+fi
+
+echo "Merged log saved to: ${MERGED_LOG}"
+
+# 5. Run Analysis on the MERGED file
+#    The script will now find "Peak Memory" (from top) and "lm loss" (from bottom)
+python ../utils/analyze_log.py \
+        "${MERGED_LOG}" \
+        --iterations $TRAIN_ITERS \
+        --nodes $NODES \
+        --gpus_per_node $gpus_per_node \
+        --pp $PP_SIZE \
+        --ep $EP_PARALLEL_SIZE \
+        --dp $(( TOTAL_GPUS / PP_SIZE / MP_SIZE )) \
+        --tp $MP_SIZE \
+        --gbs $GLOBAL_BATCH_SIZE \
+        --mbs $BATCH_SIZE \
+        --slurm_job_id $SLURM_JOB_ID \
+        --seqlen $SEQ_LEN \
+        --num_layers $NUM_LAYERS \
+        --num_experts $EP_SIZE \
+        --expert_dim $FFN_HIDDEN_SIZE \
+        --topk $topk \
+        --hidden_dim $HIDDEN_SIZE \
+        --moe_type $MOE_TYPE \
+        --model_size $MODEL_SIZE \
+        --activation_checkpointing $ACTIVATION_CHECKPOINT \
+        --checkpoint_interval $CHECKPOINT_NUM_LAYERS \
+        --dynamic_checkpoint $DYNAMIC_CHECKPOINT \
+        --uneven_pp $UNEVEN_PP \
+        --zero $ZERO_STAGE ${ANALYZE_LOG_PROFILING_FLAG} >> "${MERGED_LOG}"
+
+python ../utils/analyze_memory.py "${MERGED_LOG}" #>> "${MERGED_LOG}"
+
+echo "Analysis Complete. Full log: ${MERGED_LOG}"
+# ================================================== END of Run Analysis =============================================================
