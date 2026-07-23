@@ -206,6 +206,11 @@ def get_args():
                        help='Path to the BPE merge file (if necessary).')
     group.add_argument('--append-eod', action='store_true',
                        help='Append an <eod> token to the end of a document.')
+    group.add_argument('--eod-token', type=str, default=None,
+                       help='End-of-document token string, for HFTokenizer whose EOD is not '
+                       'one of the built-in probes (<|endoftext|>, <|end_of_text|>). '
+                       'DeepSeek needs "<｜end▁of▁sentence｜>". Must match the training run. '
+                       'Default None keeps the probe behavior.')
     group.add_argument('--lang', type=str, default='english',
                        help='Language to use for NLTK-powered sentence splitting.')
     group = parser.add_argument_group(title='output data')

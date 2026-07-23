@@ -594,6 +594,21 @@ def _add_network_size_args(parser):
                            help='number of experts list, MoE related.')
     group.add_argument('--num-shared-experts', type=int, nargs='+', default=[0,],
                            help='number of experts list, MoE related.')
+    group.add_argument('--first-k-dense-replace', type=int, default=0,
+                           help='Use a dense MLP instead of MoE for the first K layers '
+                           '(DeepSeek first_k_dense_replace). 0 keeps every layer MoE.')
+    group.add_argument('--softmax-before-topk', action='store_true',
+                           help='Take top-k over softmax probabilities instead of raw logits, '
+                           'so the routed combine weight is a probability (DeepSeek/HF '
+                           'semantics: scores=softmax(logits); topk(scores)). Default (off) '
+                           'keeps the X-MoE behavior of weighting experts by raw logits. '
+                           'Required to load HF MoE checkpoints; changes routed weighting, so '
+                           'do not flip it on an existing run. Only affects the uneven-all2all '
+                           '(TopKGatev2) path.')
+    group.add_argument('--dense-ffn-hidden-size', type=int, default=None,
+                           help='FFN hidden size for the dense layers selected by '
+                           '--first-k-dense-replace. Defaults to --ffn-hidden-size. DeepSeek '
+                           'makes these wider (intermediate_size) than moe_intermediate_size.')
     group.add_argument('--mlp-type', type=str, default='standard',
                            help='Only applicable when num-experts > 1, accepts [standard, residual]')
     group.add_argument('--topk', type=int, default=1,
@@ -1250,6 +1265,11 @@ def _add_data_args(parser):
 
     group.add_argument('--vocab-size', type=int, default=None,
                        help='Size of vocab before EOD or padding.')
+    group.add_argument('--eod-token', type=str, default=None,
+                       help='End-of-document token string, for tokenizers whose EOD is not one '
+                       'of the built-in probes (HFTokenizer tries <|endoftext|> and '
+                       '<|end_of_text|>). DeepSeek needs "<｜end▁of▁sentence｜>". Default None '
+                       'keeps the existing probe behavior.')
     group.add_argument('--vocab-file', type=str, default=None,
                        help='Path to the vocab file.')
     group.add_argument('--merge-file', type=str, default=None,

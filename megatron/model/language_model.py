@@ -676,8 +676,19 @@ class TransformerLanguageModel(MegatronModule):
             # moving them to the top level dictionary
             # If components other than encoder may contain MoE states, need to add
             # the same logic
+            # ===== IMPLEMENTING SHARED EXPERT =====
+            #   Changed: the save-side expert-vs-non-expert classifier.
+            #   BEFORE:  if 'expert' in key and 'moe.gate.wg.weight' not in key:
+            #   WHY:     the loose substring 'expert' ALSO matched 'shared_experts', so the
+            #            shared expert was moved into moe_state_dict with a MANGLED name
+            #            (self._encoder_key + key == 'encoder' + 'layers.N...' -> 'encoderlayers.N...'),
+            #            which later crashes the 'encoder'-stripping loop on load. Shared
+            #            experts are replicated (non-expert): they must stay in
+            #            encoder_state_dict and be saved as a normal encoder param. Match ONLY
+            #            the precise routed marker so shared_experts falls through.
+            # ===== END SHARED EXPERT =====
             for key in list(encoder_state_dict.keys()):
-                if 'expert' in key and 'moe.gate.wg.weight' not in key:
+                if 'deepspeed_moe.experts.deepspeed_experts.' in key:
                     moe_state_dict[self._encoder_key+key] = encoder_state_dict.pop(key)
             state_dict_[self._encoder_key] = encoder_state_dict
 

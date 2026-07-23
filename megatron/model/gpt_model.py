@@ -208,8 +208,19 @@ class GPTModel(MegatronModule):
                 state_dict[self._word_embeddings_for_head_key], strict=strict)
         # Gather MoE states and move under language model
         moe_state_dict = {}
+        # ===== IMPLEMENTING SHARED EXPERT =====
+        #   Changed: the load-side expert-vs-non-expert classifier.
+        #   BEFORE:  if 'expert' in key and 'moe.gate.wg.weight' not in key:
+        #   WHY:     the loose substring 'expert' ALSO matches 'shared_experts', so the
+        #            shared expert was moved into moe_state_dict and then routed through the
+        #            'encoder'-stripping loop in language_model.load_state_dict, which pops
+        #            key parts until it finds 'encoder' -> for the (mangled) shared key it
+        #            never matches and raises IndexError. Shared experts are replicated
+        #            (non-expert) and must load like a normal encoder param, NOT via
+        #            moe_state_dict. Match ONLY the precise routed marker.
+        # ===== END SHARED EXPERT =====
         for key in list(state_dict.keys()):
-            if 'expert' in key and 'moe.gate.wg.weight' not in key:
+            if 'deepspeed_moe.experts.deepspeed_experts.' in key:
                 moe_state_dict[key] = state_dict.pop(key)
         if self._language_model_key in state_dict:
             state_dict = state_dict[self._language_model_key]

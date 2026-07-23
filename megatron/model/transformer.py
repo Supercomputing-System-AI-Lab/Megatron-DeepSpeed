@@ -1079,7 +1079,16 @@ class ParallelTransformerLayer(MegatronModule):
         else:
             if self.num_experts <= 1: # dense, not MoE
                 print (f'[transformer.py] Using dense MLP \n'*10)
-                self.mlp = ParallelMLP(config)
+                # DeepSeek's first_k_dense_replace layers use the wider `intermediate_size`,
+                # not the per-expert moe_intermediate_size that --ffn-hidden-size carries.
+                # None (default) => width unchanged for existing dense/expert-interval runs.
+                if args.dense_ffn_hidden_size is not None:
+                    import copy as _copy
+                    _dense_cfg = _copy.copy(config)
+                    _dense_cfg.ffn_hidden_size = args.dense_ffn_hidden_size
+                    self.mlp = ParallelMLP(_dense_cfg)
+                else:
+                    self.mlp = ParallelMLP(config)
             else: # DeepSpeed's MoE
                 enable_expert_tensor_parallelism = args.enable_expert_tensor_parallelism
                 assert not (enable_expert_tensor_parallelism and args.enable_expert_sequence_parallelism)
@@ -1141,7 +1150,8 @@ class ParallelTransformerLayer(MegatronModule):
                                     use_triton=args.use_triton,
                                     rbd_mesh_size=args.rbd_mesh_size,
                                     num_shared_experts=_n_shared,        # IMPLEMENTING SHARED EXPERT: Added
-                                    shared_expert=_shared_expert_mlp)    # IMPLEMENTING SHARED EXPERT: Added
+                                    shared_expert=_shared_expert_mlp,    # IMPLEMENTING SHARED EXPERT: Added
+                                    softmax_before_topk=args.softmax_before_topk)
 
         # Set bias+dropout+add fusion grad_enable execution handler.
         TORCH_MAJOR = int(torch.__version__.split('.')[0])
@@ -1986,6 +1996,11 @@ class ParallelTransformer(MegatronModule):
                     n_e = num_experts[(layer_num-1) // args.expert_interval]
                 else:
                     n_e = 1
+                # layer_num is 1-indexed, so `<=` makes --first-k-dense-replace K
+                # match DeepSeek's first_k_dense_replace (layers [0, K) dense).
+                # n_e == 1 falls through to the existing dense ParallelMLP branch.
+                if layer_num <= args.first_k_dense_replace:
+                    n_e = 1
                 self.layers.append(build_layer(layer_num, n_e))
             self.layers = torch.nn.ModuleList(self.layers)
 
@@ -2044,8 +2059,8 @@ class ParallelTransformer(MegatronModule):
             return custom_forward
         
         if args.deepspeed and args.deepspeed_activation_checkpointing:
-            print (f'[megatron/model/transformer.py]: enabling deepspeed"s activation checkpointing')
-            print (f'[megatron/model/transformer.py]: uniform activation checkpointing for every {self.checkpoint_num_layers} layers')
+            # print (f'[megatron/model/transformer.py]: enabling deepspeed"s activation checkpointing')
+            # print (f'[megatron/model/transformer.py]: uniform activation checkpointing for every {self.checkpoint_num_layers} layers')
             moe_losses = []
             # Make sure memory is freed.
             tensor_parallel.reset_checkpointed_activations_memory_buffer()

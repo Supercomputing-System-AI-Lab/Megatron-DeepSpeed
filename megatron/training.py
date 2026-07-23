@@ -58,7 +58,7 @@ try:
     import wandb
 except (ImportError, ModuleNotFoundError):
     wandb = None
-
+from torch.profiler import profile, record_function, ProfilerActivity, schedule
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
