@@ -32,7 +32,9 @@ def build_tokenizer(args):
         tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file)
     elif args.tokenizer_type == 'HFTokenizer':
         assert args.vocab_file is not None
-        tokenizer = _HFTokenizer(args.vocab_file)
+        # --eod-token lets a model name its own EOD when it is not one of the built-in
+        # probes. None => probe as before.
+        tokenizer = _HFTokenizer(args.vocab_file, eod_token=getattr(args, 'eod_token', None))
     elif args.tokenizer_type == 'SentencePieceTokenizer':
         assert args.tokenizer_model is not None
         tokenizer = _SentencePieceTokenizer(args.tokenizer_model, vocab_extra_ids=args.vocab_extra_ids)
