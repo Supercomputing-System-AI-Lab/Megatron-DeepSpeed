@@ -20,8 +20,23 @@ class RotaryEmbedding(nn.Module):
             raise RuntimeError("einops is required for Rotary Embedding")
 
     def forward(self, max_seq_len, offset=0):
-        seq = torch.arange(max_seq_len, device=self.inv_freq.device) + offset
-        freqs = einsum('i , j -> i j', seq.type_as(self.inv_freq), self.inv_freq)
+        print (f'[rotary_pos_embedding.py] at forward, {self.inv_freq.dtype=}')
+        # BEFORE
+        # seq = torch.arange(max_seq_len, device=self.inv_freq.device) + offset
+        # print (f'[rotary_pos_embedding.py] at forward, {seq.dtype=}')
+        # freqs = einsum('i , j -> i j', seq.type_as(self.inv_freq), self.inv_freq)
+        # print (f'[rotary_pos_embedding.py] at forward, {freqs.dtype=}')
+        
+        # AFTER
+        # Positions AND inv_freq MUST stay float32. Under --bf16 the model cast makes
+        # self.inv_freq bf16, and `seq.type_as(self.inv_freq)` would then quantize the token
+        # positions to bf16 -- which is exact only up to 256 (2^8), so positions >= 257 round
+        # (257->256, 259->260, ...) and the rotary angle is corrupted, worsening with position
+        # and compounding across layers. HF keeps float32 positions (cached at init), which is why
+        # HF matches at all positions. Force float32 here; apply_rotary_pos_emb casts cos/sin down
+        # to the tensor dtype at the end (same as HF), so no other dtype changes are needed.
+        seq = torch.arange(max_seq_len, device=self.inv_freq.device, dtype=torch.float32) + offset
+        freqs = einsum('i , j -> i j', seq, self.inv_freq.float())
         # first part even vector components, second part odd vector components,
         #  2 * dim in dimension size
         emb = torch.cat((freqs, freqs), dim=-1)
