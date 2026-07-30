@@ -20,7 +20,6 @@ class RotaryEmbedding(nn.Module):
             raise RuntimeError("einops is required for Rotary Embedding")
 
     def forward(self, max_seq_len, offset=0):
-        print (f'[rotary_pos_embedding.py] at forward, {self.inv_freq.dtype=}')
         # BEFORE
         # seq = torch.arange(max_seq_len, device=self.inv_freq.device) + offset
         # print (f'[rotary_pos_embedding.py] at forward, {seq.dtype=}')
