@@ -25,12 +25,17 @@
 # Cadence: FAST_INTERVAL for the first FAST_WINDOW sec, then SLOW_INTERVAL.
 #
 # Requires: ~/.local/bin/py-spy on $HOME (shared across nodes); SLURM_NODELIST + SLURM_JOB_ID.
+# Env: MON_PROC_MATCH sets which process's GPU ranks to sample (default ELMoE_launch.py;
+#      eval passes evaluate_v04.py). Everything else is the same across training and eval.
 
 JOB_DIR="${1:?usage: monitor_run.sh <JOB_DIR>}"
 FAST_INTERVAL="${2:-60}"
 SLOW_INTERVAL="${3:-180}"
 FAST_WINDOW="${4:-300}"
 TRACE_FRAMES="${5:-20}"   # stack frames kept per rank in TRACE (deepest first)
+# Process whose GPU ranks we sample. Default = training launcher; eval sets
+# MON_PROC_MATCH=evaluate_v04.py so the same monitor works for the eval srun.
+PROC_MATCH="${MON_PROC_MATCH:-ELMoE_launch.py}"
 
 MONDIR="${JOB_DIR}/monitor"
 SUMMARY="${JOB_DIR}/a-monitor.txt"   # top-level for quick access (per-node files & tsv stay in monitor/)
@@ -66,6 +71,7 @@ categorize() {
 # TRACE_FRAMES is injected by the ssh caller (prepended assignment); default kept here for safety.
 REMOTE='
   : "${TRACE_FRAMES:=14}"
+  : "${PROC_MATCH:=ELMoE_launch.py}"
   # Pick a rocm-smi that MATCHES the node driver: the one on PATH (loaded module) if any, else the
   # site default symlink, else the NEWEST installed (sort -V). NOT "head -1", which picks the oldest
   # (rocm-5.6.0) lexicographically and mis-reads MI250X GCDs under a newer driver -> "?" everywhere.
@@ -79,7 +85,7 @@ REMOTE='
     RP=$(timeout 15 "$SMI" --showpower 2>/dev/null)
     RV=$(timeout 15 "$SMI" --showmeminfo vram 2>/dev/null)
   fi
-  for p in $(pgrep -u $USER -f ELMoE_launch.py); do
+  for p in $(pgrep -u $USER -f "$PROC_MATCH"); do
     ls -l /proc/$p/fd 2>/dev/null | grep -q /dev/kfd || continue
     e=$(tr "\0" "\n" < /proc/$p/environ 2>/dev/null)
     rk=$(printf "%s\n" "$e" | sed -n "s/^SLURM_PROCID=//p" | head -1); [ -z "$rk" ] && rk=$(printf "%s\n" "$e" | sed -n "s/^RANK=//p" | head -1); [ -z "$rk" ] && rk="?"
@@ -124,7 +130,7 @@ while true; do
     i=0; declare -A NODEFILE NODEIDX
     for n in ${NODES}; do
         NODEFILE[$n]="${TMPROOT}/node.${i}"; NODEIDX[$n]=$i
-        ( ${SSH} "${n}" "TRACE_FRAMES=${TRACE_FRAMES}; ${REMOTE}" > "${NODEFILE[$n]}" 2>/dev/null ) &
+        ( ${SSH} "${n}" "TRACE_FRAMES=${TRACE_FRAMES}; PROC_MATCH='${PROC_MATCH}'; ${REMOTE}" > "${NODEFILE[$n]}" 2>/dev/null ) &
         i=$((i+1))
     done
     wait
@@ -228,9 +234,9 @@ while true; do
 
     if [ -n "${culprit}" ]; then
         printf '\n  ---- full native stack: %s ----\n\n' "${culprit}" >> "${SUMMARY}"
-        ${SSH} "${culprit}" 'p=$(pgrep -u $USER -f ELMoE_launch.py | while read pid; do
+        ${SSH} "${culprit}" "PROC_MATCH='${PROC_MATCH}'; "'p=$(pgrep -u $USER -f "$PROC_MATCH" | while read pid; do
                   ~/.local/bin/py-spy dump --pid $pid 2>/dev/null | grep -q train_batch && { echo $pid; break; }
-                done); timeout 20 ~/.local/bin/py-spy dump --pid $p --native 2>/dev/null' 2>/dev/null \
+                done); [ -z "$p" ] && p=$(pgrep -u $USER -f "$PROC_MATCH" | head -1); timeout 20 ~/.local/bin/py-spy dump --pid $p --native 2>/dev/null' 2>/dev/null \
             | grep -E "Thread|_exec_|moe_v2|a2a_single|drop_|kernels\.py|engine\.py|transformer\.py|training\.py|do_bench|autotuner|synchronize|barrier|all_to_all|recv|send|\.py:[0-9]" \
             | cut -c1-200 | sed 's/^/      /' >> "${SUMMARY}"
     fi
