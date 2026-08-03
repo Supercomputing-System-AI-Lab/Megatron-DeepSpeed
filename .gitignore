@@ -56,7 +56,7 @@ examples_elmoe/scripts-frontier/temp_ds_json/*
 examples_elmoe/scripts-frontier/temp_slurm/*
 examples_elmoe/scripts-frontier/results/*# auto-generated json files and logs   
 
-*.json
+# *.json
 *.log
 
 # fused_kernels hip files
