@@ -17,8 +17,17 @@
 #   ./run_exp_training.sh training <BASELINE>     [--gpus N]
 #   ./run_exp_training.sh profiling_cache ELMoE   [--gpus N]
 #
-#   --gpus N    total GPU budget (default: 8). Must be a multiple of --gpus-per-node.
+#   --gpus N    total GPU budget (default: 32). Must be a multiple of --gpus-per-node.
 #   --gpus-per-node G   (default: 8)
+#
+#   --model-size {50B|63B|10B}   (default 63B) scale for training /
+#       profiling_cache / main_results. 50B and 63B share h=5120 / 128 experts /
+#       topk 6 / seq 4096 and differ only in depth (24 vs 32 layers):
+#           63B  paper scale; needs ~64GB HBM per GPU, 32 GPUs
+#           50B  the same model 8 layers shallower — use this on 40GB-HBM GPUs
+#           10B  small-box escape hatch: runs the whole pipeline on 8 GPUs, but
+#                the throughput numbers will NOT match the paper
+#       env_validate and loss_validate are unaffected: both are fixed at 10B.
 #
 #   VARIANT (ELMoE, default SeqGEMM): SeqGEMM | PrimusGroupGEMM | TritonGroupGEMM
 #   PLANNER (ELMoE, default yes_planner): yes_planner | no_planner
@@ -38,7 +47,16 @@ MP_SIZE=1
 GLOBAL_BATCH=1024      # for `training` modes (same rule as Frontier: NBS = ceil(GB/EP))
 GBS_LOSS=320           # loss_validate: fixed global batch so the curves are comparable
 
-usage() { sed -n '11,30p' "$0" | sed 's/^#//; s/^ //'; exit 1; }
+# Model scale for training / profiling_cache / main_results (override: --model-size).
+# 63B = 32 layers (paper scale); 50B = the same model at 24 layers, which is what
+# fits on a 40GB-HBM GPU; 10B is the 8-GPU escape hatch. All three resolve in
+# ../utils/model_registry.py. The planner cache key ignores depth, so ONE
+# profiling_cache run serves both 50B and 63B.
+MODEL_SIZE_DEFAULT="63B"
+MODEL_SIZE_CHOICES="50B 63B 10B"
+DEFAULT_GPUS=32        # paper topology is 32 GPUs; --gpus 8 for a single-node box
+
+usage() { sed -n '13,39p' "$0" | sed 's/^#//; s/^ //'; exit 1; }
 
 [ -f "$TEMPLATE_FILE" ] || { echo "ERROR: '$TEMPLATE_FILE' not found (run from scripts/)." >&2; exit 1; }
 mkdir -p "$TEMP_DIR" logs
@@ -47,16 +65,36 @@ MODE="${1:-}"; [ -z "$MODE" ] && usage
 shift || true
 
 # --- parse flags (and collect the non-flag args for the mode) ---------------
-GPUS=8; GPUS_PER_NODE=8; MODEL_SIZE_OPT=""; ARGS=()
+GPUS=$DEFAULT_GPUS; GPUS_PER_NODE=8; MODEL_SIZE_OPT=""; ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --gpus)          GPUS="$2"; shift 2 ;;
         --gpus-per-node) GPUS_PER_NODE="$2"; shift 2 ;;
         --model-size)    MODEL_SIZE_OPT="$2"; shift 2 ;;
+        --model-size=*)  MODEL_SIZE_OPT="${1#*=}"; shift ;;
         *)               ARGS+=("$1"); shift ;;
     esac
 done
 MODEL="${ARGS[0]:-}"
+
+MODEL_SIZE_OPT="${MODEL_SIZE_OPT:-$MODEL_SIZE_DEFAULT}"
+case " ${MODEL_SIZE_CHOICES} " in
+    *" ${MODEL_SIZE_OPT} "*) ;;
+    *) echo "ERROR: --model-size must be one of: ${MODEL_SIZE_CHOICES} (got '${MODEL_SIZE_OPT}')." >&2; exit 1 ;;
+esac
+
+# Emitted once per invocation. main_results re-invokes this script per run, so the
+# exported flag keeps the child processes from repeating it five times.
+warn_model_size() {
+    [ "$MODEL_SIZE_OPT" = "63B" ] || return 0
+    [ "${ELMOE_SIZE_WARNED:-}" = "1" ] && return 0
+    echo "WARNING: 63B model is running. For systems with 40GB HBM per GPU, please use 50B model instead to avoid OOM." >&2
+    export ELMOE_SIZE_WARNED=1
+}
+# env_validate and loss_validate are fixed at 10B, so the size warning does not apply.
+case "$MODE" in
+    training|profiling_cache|main_results) warn_model_size ;;
+esac
 
 if (( GPUS < 1 )) || (( GPUS % GPUS_PER_NODE != 0 )); then
     echo "ERROR: --gpus ${GPUS} must be a positive multiple of --gpus-per-node ${GPUS_PER_NODE}." >&2
@@ -72,6 +110,7 @@ TOTAL_GPUS=$GPUS
 min_gpus_for() {
     case "$1" in
         10B|10B_1L)   echo 8   ;;
+        50B|50B_1L)   echo 32  ;;
         63B|63B_1L)   echo 32  ;;
         173B|173B_1L) echo 256 ;;
         537B|537B_1L) echo 480 ;;
@@ -165,7 +204,7 @@ case "$MODE" in
 training)
     [ -n "$MODEL" ] || usage
     COLLECT_PROFILING_CACHE="false"; ZERO=1; TRAIN_ITERS=15
-    MODEL_SIZE="${MODEL_SIZE_OPT:-63B}"
+    MODEL_SIZE="$MODEL_SIZE_OPT"
     require_gpus_for_model
     if [[ "${MODEL,,}" == "elmoe" ]]; then
         RUN_TYPE="pp"
@@ -254,9 +293,15 @@ profiling_cache)
     # Single-layer (_1L) profiling, so it fits on ONE node regardless of the model.
     # Default 63B_1L — the SAME as scripts-frontier — because main_results trains 63B
     # with yes_planner and the planner needs a cache for THAT model. Override with
-    # --model-size 10B if you scaled the experiment down.
-    RUN_TYPE="pr"; PP_SIZE=1; EP_PARALLEL_SIZE=$(( TOTAL_GPUS / MP_SIZE ))
-    MODEL_SIZE="${MODEL_SIZE_OPT:-63B}"
+    # --model-size 50B (40GB HBM) or 10B (scaled-down box).
+    #
+    # PINNED TO ONE NODE, like scripts-frontier. The cache filename encodes the
+    # node/GPU count (N1_n8_...), and `training` always looks up the key for its
+    # EP group, which is EP=8 => one node. Profiling on --gpus 32 would write
+    # N4_n32_... and the training-side check would never find it.
+    RUN_TYPE="pr"; PP_SIZE=1
+    NODES=1; TOTAL_GPUS=$GPUS_PER_NODE; EP_PARALLEL_SIZE=$(( TOTAL_GPUS / MP_SIZE ))
+    MODEL_SIZE="$MODEL_SIZE_OPT"
     case "$MODEL_SIZE" in *_1L) ;; *) MODEL_SIZE="${MODEL_SIZE}_1L" ;; esac
     NBS=20; TRAIN_ITERS=30; MOE_TYPE="X-MOE"; ZERO=1
     CHECKPOINT_NUM_LAYERS=0; ACTIVATION_CHECKPOINT="false"; DYNAMIC_CHECKPOINT="False"
@@ -284,7 +329,7 @@ profiling_cache)
 # Smaller box? Scale down:  main_results --gpus 8 --model-size 10B
 # (throughput numbers will NOT match the paper, but the full pipeline is exercised.)
 main_results)
-    MS="${MODEL_SIZE_OPT:-63B}"
+    MS="$MODEL_SIZE_OPT"
     MODEL_SIZE="$MS"; require_gpus_for_model
 
     echo "=================================================================="

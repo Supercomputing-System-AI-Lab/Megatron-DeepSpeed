@@ -1,0 +1,10 @@
+{
+    "avg_1st_a2a_per_layer": 6.182,
+    "avg_experts_per_layer": 38.028,
+    "avg_2nd_a2a_per_layer": 6.21,
+    "avg_qkv_gemm": 23.41975,
+    "avg_attn_gemm": 11.352,
+    "avg_out_gemm": 7.53525,
+    "fwd_gemm_time_per_layer": 80.335,
+    "fwd_comm_time_per_layer": 12.392
+}
