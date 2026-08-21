@@ -48,10 +48,22 @@ set -uo pipefail
 TEMPLATE_FILE="elmoe.sh.template"
 TEMP_DIR="temp_sh"
 MP_SIZE=1
-# Overridable so a smoke run does not need the file edited and reverted:
-#     GLOBAL_BATCH=128 ./run_exp_training.sh training ELMoE no_planner
-# 1024 is the AE/paper value. NBS = ceil(GLOBAL_BATCH / EP), same rule as Frontier.
-GLOBAL_BATCH="${GLOBAL_BATCH:-1024}"
+# GLOBAL_BATCH for `training` / `main_results`. NBS = ceil(GLOBAL_BATCH / EP), same rule
+# as Frontier.
+#
+# DEFAULT IS 128, NOT THE PAPER'S 1024. This is a deliberate small-box guard: at 1024 a
+# baseline leg (EP = TOTAL_GPUS, so its all-to-all crosses the network) takes hours on a
+# TCP interconnect, and main_results runs five legs back to back.
+#
+# THE TRADE-OFF, MEASURED (21B, 2 nodes, PP2-EP8, otherwise identical):
+#     GBS  128 -> 52.78 TFLOPs
+#     GBS 1024 -> 65.23 TFLOPs
+# There is ~1.5 s of fixed per-iteration cost (optimizer step + ZeRO-1 gradient
+# all-reduce) that does not shrink with the batch: 16% of an iteration at 128, but only
+# 2.4% at 1024. So 128 UNDERSTATES throughput by roughly 20% and must not be compared
+# against published numbers. For paper-scale results:
+#     GLOBAL_BATCH=1024 ./run_exp_training.sh main_results --model-size 63B --gpus 32
+GLOBAL_BATCH="${GLOBAL_BATCH:-128}"
 # loss_validate knobs. Defaults are the AE values (GBS 320 x 1000 steps); both are
 # overridable so the pipeline can be smoke-tested in minutes instead of days:
 #     LOSS_ITERS=10 GBS_LOSS=64 ./run_exp_training.sh loss_validate
@@ -119,6 +131,19 @@ case " ${MODEL_SIZE_CHOICES} " in
     *) echo "ERROR: --model-size must be one of: ${MODEL_SIZE_CHOICES} (got '${MODEL_SIZE_OPT}')." >&2; exit 1 ;;
 esac
 
+# Emitted once per invocation (same fire-once trick as warn_model_size: main_results
+# re-invokes this script per leg and must not repeat the banner five times).
+warn_global_batch() {
+    [ "$GLOBAL_BATCH" -lt 1024 ] || return 0
+    [ "${ELMOE_GBS_WARNED:-}" = "1" ] && return 0
+    export ELMOE_GBS_WARNED=1
+    echo "WARNING: GLOBAL_BATCH=${GLOBAL_BATCH}, below the paper value of 1024." >&2
+    echo "         Throughput/TFLOPs will be UNDERSTATED (~20% at 128 vs 1024 on 2 nodes)," >&2
+    echo "         because the fixed per-iteration cost is amortised over fewer micro-batches." >&2
+    echo "         Use these numbers to verify the pipeline runs, NOT to compare against" >&2
+    echo "         published results. For paper scale:  GLOBAL_BATCH=1024 $0 ..." >&2
+}
+
 # Emitted once per invocation. main_results re-invokes this script per run, so the
 # exported flag keeps the child processes from repeating it five times.
 warn_model_size() {
@@ -130,6 +155,9 @@ warn_model_size() {
 # env_validate and loss_validate are fixed at 10B, so the size warning does not apply.
 case "$MODE" in
     training|profiling_cache|main_results) warn_model_size ;;
+esac
+case "$MODE" in
+    training|main_results) warn_global_batch ;;   # throughput modes only
 esac
 
 # Mode-specific GPU default: only when the user did not say --gpus.
