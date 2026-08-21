@@ -34,7 +34,15 @@ declare -A PP_BATCH_MAP
 # ================================== 10B ELMoE (single node, 8 GPUs) ==================================
 # PP2-EP4
 PP_STRATEGY_MAP["1:8"]="2:4"
-PP_BATCH_MAP["1:8"]=" 4:20:15:ELMOE-3D:10B:no-ckpt:0:even:no-planner "
+PP_STRATEGY_MAP["2:16"]="2:8"
+# PP_BATCH_MAP["1:8"]=" 4:20:15:ELMOE-3D:10B:no-ckpt:0:even:no-planner "
+# 40GB A100: MBS 4 + no-ckpt OOMs (~20GB of activations on top of ~10GB fixed).
+# MBS 1 + activation checkpointing -> ~15GB. See x-moe-docs/aws-multinode-guide.md App. C.
+PP_BATCH_MAP["1:8"]=" 1:2:15:ELMOE-3D:10B:ckpt:1:even:no-planner "
+# PP_BATCH_MAP["2:16"]=" 1:2:15:ELMOE-3D:10B:ckpt:1:even:no-planner "
+# PP_BATCH_MAP["2:16"]=" 1:128:15:ELMOE-3D:21B:ckpt:1:even:no-planner "
+# PP_BATCH_MAP["2:16"]=" 1:128:15:ELMOE-3D:21B:no-ckpt:0:even:no-planner "
+# PP_BATCH_MAP["2:16"]=" 1:128:15:ELMOE-3D:21B:dynamic-ckpt:1:uneven:yes-planner "
 
 # ================================== 63B ELMoE (4 nodes, 32 GPUs) ==================================
 # PP4-EP8

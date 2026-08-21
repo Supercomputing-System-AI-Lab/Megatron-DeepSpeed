@@ -5,6 +5,9 @@ import sys
 # This matches exactly what was in your SLURM template
 MODEL_SPECS = {
     "10B":    {"h": 2048, "ffn": 1408, "heads": 16, "ep": 64,  "k": 6, "s": 2048, "layers": 24},
+    # "21B":    {"h": 5120, "ffn": 1536, "heads": 40, "ep": 128, "k": 6, "s": 4096, "layers": 10},
+    "21B":    {"h": 5120, "ffn": 1536, "heads": 40, "ep": 128, "k": 6, "s": 4096, "layers": 10},
+    "25B":    {"h": 5120, "ffn": 1536, "heads": 40, "ep": 128, "k": 6, "s": 4096, "layers": 12},
     "50B":    {"h": 5120, "ffn": 1536, "heads": 40, "ep": 128, "k": 6, "s": 4096, "layers": 24},
     "63B":    {"h": 5120, "ffn": 1536, "heads": 40, "ep": 128, "k": 6, "s": 4096, "layers": 32},
     "173B":   {"h": 7168, "ffn": 2048, "heads": 56, "ep": 256, "k": 8, "s": 4096, "layers": 24},
@@ -20,6 +23,12 @@ MODEL_SPECS = {
     
     # Planner/Profiling specific (1 Layer variants)
     "10B_1L": {"h": 2048, "ffn": 1408, "heads": 16, "ep": 64,  "k": 6, "s": 2048, "layers": 1},
+    # 21B/25B share the 50B/63B shape (h5120, ffn1536, 128 experts, topk6, seq4096) and
+    # differ only in depth. profiling_cache appends _1L to the requested size, so these
+    # must exist or `profiling_cache --model-size 21B` dies with "not found in registry".
+    # The planner cache key ignores depth, so all four resolve to the SAME cache file.
+    "21B_1L": {"h": 5120, "ffn": 1536, "heads": 40, "ep": 128, "k": 6, "s": 4096, "layers": 1},
+    "25B_1L": {"h": 5120, "ffn": 1536, "heads": 40, "ep": 128, "k": 6, "s": 4096, "layers": 1},
     "50B_1L": {"h": 5120, "ffn": 1536, "heads": 40, "ep": 128, "k": 6, "s": 4096, "layers": 1},
     "63B_1L": {"h": 5120, "ffn": 1536, "heads": 40, "ep": 128, "k": 6, "s": 4096, "layers": 1},
     "173B_1L":{"h": 7168, "ffn": 2048, "heads": 56, "ep": 256, "k": 8, "s": 4096, "layers": 1},

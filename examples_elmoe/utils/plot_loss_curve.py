@@ -34,6 +34,22 @@ FRAMEWORKS = {
 }
 
 
+def _read_gbs(log_path):
+    """Pull the actual global batch size out of a merged log (driver echoes it)."""
+    try:
+        with open(log_path, "r", errors="replace") as fh:
+            for line in fh:
+                m = re.search(r"GLOBAL_BATCH_SIZE=(\d+)", line)
+                if m:
+                    return m.group(1)
+                m = re.search(r"global batch size:\s*(\d+)", line)
+                if m:
+                    return m.group(1)
+    except OSError:
+        pass
+    return None
+
+
 def parse_losses(log_path):
     """Return {iteration: lm_loss} from a merged/rank log.
 
@@ -49,8 +65,44 @@ def parse_losses(log_path):
     return losses
 
 
+def _rank_logs_newest_last(job_dir):
+    """rank_*.log for a job, ordered by RANK NUMBER (not lexically: rank_9 < rank_15)."""
+    out = []
+    for f in glob.glob(os.path.join(job_dir, "rank_*.log")):
+        m = re.search(r"rank_(\d+)\.log$", f)
+        if m:
+            out.append((int(m.group(1)), f))
+    return [f for _, f in sorted(out)]
+
+
+def _candidate_logs(job_dir):
+    """Logs worth trying for this job, best first.
+
+    full_run.log is best (the merged log). Failing that, prefer the LAST rank:
+    with PP>1 Megatron emits the `iteration ... lm loss:` lines only on the final
+    pipeline stage, so rank_0.log is empty of losses and falling back to it -- as
+    this function used to -- can never succeed for a pipeline-parallel run.
+    """
+    cands = []
+    full = os.path.join(job_dir, "full_run.log")
+    if os.path.isfile(full):
+        cands.append(full)
+    ranks = _rank_logs_newest_last(job_dir)
+    if ranks:
+        cands.append(ranks[-1])     # last pipeline stage
+        if ranks[0] != ranks[-1]:
+            cands.append(ranks[0])
+    return cands
+
+
 def find_log(job_root, tag):
-    """Newest loss_validate (RUN_TYPE='lv') job dir whose name carries `tag`."""
+    """Newest loss_validate (RUN_TYPE='lv') job for `tag` THAT ACTUALLY HAS LOSSES.
+
+    Picking purely by mtime used to hand back the newest job dir even when the run
+    had crashed or been killed before emitting a single iteration -- so one aborted
+    run masked every good one behind it. Every candidate is now parsed first and
+    skipped unless it yields loss lines.
+    """
     candidates = []
     for job_dir in glob.glob(os.path.join(job_root, "job_*")):
         if not os.path.isdir(job_dir):
@@ -60,14 +112,16 @@ def find_log(job_root, tag):
             continue
         if f"_{tag}_" not in os.path.basename(job_dir):
             continue
-        for name in ("full_run.log", "rank_0.log"):
-            log = os.path.join(job_dir, name)
-            if os.path.isfile(log):
+        for log in _candidate_logs(job_dir):
+            if parse_losses(log):
                 candidates.append((os.path.getmtime(log), log))
                 break
+        else:
+            print(f"  (skipping {os.path.basename(job_dir)}: no loss lines — "
+                  f"crashed or killed before the first iteration?)")
     if not candidates:
         return None
-    return max(candidates)[1]  # newest by mtime
+    return max(candidates)[1]  # newest by mtime, among those with real data
 
 
 def main():
@@ -93,6 +147,19 @@ def main():
                 f"or pass --{key} <path/full_run.log>."
             )
         print(f"{meta['label']:6s} log: {paths[key]}")
+
+    # The two legs must come from the SAME loss_validate invocation to be comparable:
+    # the curve depends on the global batch, and auto-discovery picks each framework's
+    # newest job independently -- so a re-run of one leg alone silently pairs runs with
+    # different GBS (or different node counts). Compare and refuse to be quiet about it.
+    gbs_seen = {k: _read_gbs(paths[k]) for k in FRAMEWORKS}
+    if len({v for v in gbs_seen.values() if v}) > 1:
+        # Built with plain concatenation, not nested-quote f-strings: those only parse
+        # on Python 3.12+, and this util also gets run under the system interpreter.
+        detail = ", ".join(FRAMEWORKS[k]["label"] + "=" + str(v) for k, v in gbs_seen.items())
+        print("\nWARNING: the two runs used DIFFERENT global batch sizes (" + detail + ")."
+              "\n         These curves are NOT comparable. Re-run both legs together, or pass"
+              "\n         --elmoe/--xmoe explicitly to select a matched pair.\n")
 
     # ---- parse --------------------------------------------------------------
     series = {}
@@ -131,7 +198,11 @@ def main():
 
     ax.set_xlabel("Training step")
     ax.set_ylabel("LM loss")
-    ax.set_title(f"Training loss: ELMoE vs X-MoE (10B, GBS=320, {len(steps)} common steps)")
+    # Read GBS from the log rather than hardcoding it: run_exp_training.sh takes
+    # GBS_LOSS from the environment (GBS_LOSS=64 for a smoke run), so a literal 320
+    # silently mislabels every non-default plot.
+    gbs = _read_gbs(paths["elmoe"]) or "?"   # paths[], not args[] -- args is None when auto-discovered
+    ax.set_title(f"Training loss: ELMoE vs X-MoE (10B, GBS={gbs}, {len(steps)} common steps)")
     ax.legend()
     ax.grid(alpha=0.3, linewidth=0.5)
     ax.spines["top"].set_visible(False)

@@ -17,16 +17,20 @@
 #   ./run_exp_training.sh training <BASELINE>     [--gpus N]
 #   ./run_exp_training.sh profiling_cache ELMoE   [--gpus N]
 #
-#   --gpus N    total GPU budget (default: 32). Must be a multiple of --gpus-per-node.
+#   --gpus N    total GPU budget (default: 16; loss_validate defaults to 8 = one node).
+#               Must be a multiple of --gpus-per-node.
 #   --gpus-per-node G   (default: 8)
 #
-#   --model-size {50B|63B|10B}   (default 63B) scale for training /
+#   --model-size {10B|21B|25B|50B|63B}   (default 21B) scale for training /
 #       profiling_cache / main_results. 50B and 63B share h=5120 / 128 experts /
 #       topk 6 / seq 4096 and differ only in depth (24 vs 32 layers):
 #           63B  paper scale; needs ~64GB HBM per GPU, 32 GPUs
 #           50B  the same model 8 layers shallower — use this on 40GB-HBM GPUs
-#           10B  small-box escape hatch: runs the whole pipeline on 8 GPUs, but
-#                the throughput numbers will NOT match the paper
+#           25B  same family, 12 layers
+#           21B  DEFAULT. Same family (h5120 / 128 experts / topk6 / seq4096) at 10
+#                layers. Fits 2x8 40GB-HBM nodes. Throughput will NOT match the paper.
+#           10B  smallest escape hatch: whole pipeline on 8 GPUs, different shape
+#                (h2048 / 64 experts / seq2048), so not comparable to the 63B family
 #       env_validate and loss_validate are unaffected: both are fixed at 10B.
 #
 #   VARIANT (ELMoE, default SeqGEMM): SeqGEMM | PrimusGroupGEMM | TritonGroupGEMM
@@ -44,17 +48,49 @@ set -uo pipefail
 TEMPLATE_FILE="elmoe.sh.template"
 TEMP_DIR="temp_sh"
 MP_SIZE=1
-GLOBAL_BATCH=1024      # for `training` modes (same rule as Frontier: NBS = ceil(GB/EP))
-GBS_LOSS=320           # loss_validate: fixed global batch so the curves are comparable
+# Overridable so a smoke run does not need the file edited and reverted:
+#     GLOBAL_BATCH=128 ./run_exp_training.sh training ELMoE no_planner
+# 1024 is the AE/paper value. NBS = ceil(GLOBAL_BATCH / EP), same rule as Frontier.
+GLOBAL_BATCH="${GLOBAL_BATCH:-1024}"
+# loss_validate knobs. Defaults are the AE values (GBS 320 x 1000 steps); both are
+# overridable so the pipeline can be smoke-tested in minutes instead of days:
+#     LOSS_ITERS=10 GBS_LOSS=64 ./run_exp_training.sh loss_validate
+# GBS_LOSS must stay divisible by mbs*DP for BOTH frameworks or the run aborts.
+# Defaults below are tuned for 40GB-HBM GPUs (A100-40GB / p4d). The upstream AE values
+# were 320 x 1000 steps at mbs=4 with no checkpointing, which needs ~64GB and OOMs here.
+# Raising them back is a pure env override, e.g. for a 64GB site:
+#     GBS_LOSS=320 LOSS_ITERS=1000 LOSS_MBS=4 LOSS_CKPT=false ./run_exp_training.sh loss_validate
+GBS_LOSS="${GBS_LOSS:-80}"     # fixed global batch so the two curves are comparable
+LOSS_ITERS="${LOSS_ITERS:-100}"
+# mbs and activation checkpointing for loss_validate. The AE values (mbs=4, no ckpt)
+# assume ~64GB HBM; on a 40GB card they OOM outright -- and single-node is WORSE than
+# multi-node here, because halving the node count halves EP, which DOUBLES the experts
+# held per GPU.
+#
+# Lowering these does NOT change the loss curve. Activation checkpointing recomputes
+# activations rather than storing them (numerically identical), and gradient
+# accumulation at a FIXED global batch is mathematically equivalent regardless of how
+# the batch is split into micro-batches. NBS is recomputed from GBS_LOSS/(mbs*DP), so
+# the effective global batch -- the only thing the comparison depends on -- is unchanged.
+LOSS_MBS="${LOSS_MBS:-1}"
+LOSS_CKPT="${LOSS_CKPT:-true}"    # "false" to disable activation checkpointing
+# loss_validate runs on ONE node unless --gpus is given explicitly. Its X-MoE leg sets
+# EP = TOTAL_GPUS, so on 2 nodes every expert all-to-all crosses the network: measured
+# 113 s/iter over TCP vs 6 s/iter single-node, where EP stays inside NVLink. Same curve,
+# ~20x the wall clock. The ELMoE leg is unaffected in kind (EP is capped per node).
+LOSS_GPUS="${LOSS_GPUS:-8}"
 
 # Model scale for training / profiling_cache / main_results (override: --model-size).
 # 63B = 32 layers (paper scale); 50B = the same model at 24 layers, which is what
 # fits on a 40GB-HBM GPU; 10B is the 8-GPU escape hatch. All three resolve in
 # ../utils/model_registry.py. The planner cache key ignores depth, so ONE
 # profiling_cache run serves both 50B and 63B.
-MODEL_SIZE_DEFAULT="63B"
-MODEL_SIZE_CHOICES="50B 63B 10B"
-DEFAULT_GPUS=32        # paper topology is 32 GPUs; --gpus 8 for a single-node box
+# NOTE ON DEFAULTS: these are deliberately SMALL-BOX defaults (21B on 16 GPUs), not
+# the paper topology. The paper scale is 63B on 32 GPUs -- reproduce it explicitly:
+#     ./run_exp_training.sh training ELMoE --model-size 63B --gpus 32
+MODEL_SIZE_DEFAULT="21B"
+MODEL_SIZE_CHOICES="10B 21B 25B 50B 63B"
+DEFAULT_GPUS=16        # 2x8-GPU nodes; --gpus 32 --model-size 63B for paper topology
 
 usage() { sed -n '13,39p' "$0" | sed 's/^#//; s/^ //'; exit 1; }
 
@@ -65,10 +101,10 @@ MODE="${1:-}"; [ -z "$MODE" ] && usage
 shift || true
 
 # --- parse flags (and collect the non-flag args for the mode) ---------------
-GPUS=$DEFAULT_GPUS; GPUS_PER_NODE=8; MODEL_SIZE_OPT=""; ARGS=()
+GPUS=$DEFAULT_GPUS; GPUS_PER_NODE=8; MODEL_SIZE_OPT=""; GPUS_EXPLICIT=0; ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
-        --gpus)          GPUS="$2"; shift 2 ;;
+        --gpus)          GPUS="$2"; GPUS_EXPLICIT=1; shift 2 ;;
         --gpus-per-node) GPUS_PER_NODE="$2"; shift 2 ;;
         --model-size)    MODEL_SIZE_OPT="$2"; shift 2 ;;
         --model-size=*)  MODEL_SIZE_OPT="${1#*=}"; shift ;;
@@ -96,6 +132,11 @@ case "$MODE" in
     training|profiling_cache|main_results) warn_model_size ;;
 esac
 
+# Mode-specific GPU default: only when the user did not say --gpus.
+if [ "$MODE" = "loss_validate" ] && [ "$GPUS_EXPLICIT" -eq 0 ]; then
+    GPUS="$LOSS_GPUS"
+fi
+
 if (( GPUS < 1 )) || (( GPUS % GPUS_PER_NODE != 0 )); then
     echo "ERROR: --gpus ${GPUS} must be a positive multiple of --gpus-per-node ${GPUS_PER_NODE}." >&2
     exit 1
@@ -110,6 +151,8 @@ TOTAL_GPUS=$GPUS
 min_gpus_for() {
     case "$1" in
         10B|10B_1L)   echo 8   ;;
+        21B|21B_1L)   echo 16  ;;
+        25B|25B_1L)   echo 16  ;;
         50B|50B_1L)   echo 32  ;;
         63B|63B_1L)   echo 32  ;;
         173B|173B_1L) echo 256 ;;
@@ -260,14 +303,15 @@ env_validate)
 
 # ===========================================================================
 loss_validate)
-    RUN_TYPE="lv"; TRAIN_ITERS=1000; MODEL_SIZE="10B"; ZERO=1
+    RUN_TYPE="lv"; TRAIN_ITERS="${LOSS_ITERS}"; MODEL_SIZE="10B"; ZERO=1
     COLLECT_PROFILING_CACHE="false"
-    ACTIVATION_CHECKPOINT="false"; CHECKPOINT_NUM_LAYERS=0
+    if [ "$LOSS_CKPT" = "true" ]; then ACTIVATION_CHECKPOINT="true"; CHECKPOINT_NUM_LAYERS=1
+    else                                ACTIVATION_CHECKPOINT="false"; CHECKPOINT_NUM_LAYERS=0; fi
     DYNAMIC_CHECKPOINT="False"; UNEVEN_PP="False"; RUN_PLANNER="false"
-    echo "loss_validate: ${NODES}n/${TOTAL_GPUS}g | 10B | GBS=${GBS_LOSS} | ${TRAIN_ITERS} steps"
+    echo "loss_validate: ${NODES}n/${TOTAL_GPUS}g | 10B | GBS=${GBS_LOSS} | ${TRAIN_ITERS} steps | mbs=${LOSS_MBS} ckpt=${LOSS_CKPT}"
 
     # (a) ELMoE-3D : mbs=4. 8 GPUs -> EP4-PP2; >8 -> EP8, PP = GPUS/8.
-    MOE_TYPE="ELMOE-3D"; BS=4
+    MOE_TYPE="ELMOE-3D"; BS="$LOSS_MBS"
     if (( TOTAL_GPUS == 8 )); then EP_PARALLEL_SIZE=4; PP_SIZE=2
     else EP_PARALLEL_SIZE=8; PP_SIZE=$(( TOTAL_GPUS / 8 )); fi
     DP=$(( TOTAL_GPUS / PP_SIZE / MP_SIZE ))
@@ -279,7 +323,7 @@ loss_validate)
     # (b) X-MoE : PP=1, EP=all. mbs = largest of {4,2,1} keeping nbs integral.
     MOE_TYPE="X-MOE"; PP_SIZE=1; EP_PARALLEL_SIZE=$TOTAL_GPUS
     DP=$(( TOTAL_GPUS / PP_SIZE / MP_SIZE )); BS=0
-    for c in 4 2 1; do (( GBS_LOSS % (c * DP) == 0 )) && { BS=$c; break; }; done
+    for c in $(seq "$LOSS_MBS" -1 1); do (( GBS_LOSS % (c * DP) == 0 )) && { BS=$c; break; }; done
     (( BS != 0 )) || { echo "ERROR: X-MoE: no mbs in {4,2,1} divides GBS=${GBS_LOSS} at DP=${DP}." >&2; exit 1; }
     NBS=$(( GBS_LOSS / (BS * DP) ))
     echo "  (b) X-MoE     EP${EP_PARALLEL_SIZE}-PP${PP_SIZE} mbs=${BS} nbs=${NBS} dp=${DP} -> GBS=$(( BS*NBS*DP ))"
@@ -291,7 +335,9 @@ loss_validate)
 # ===========================================================================
 profiling_cache)
     # Single-layer (_1L) profiling, so it fits on ONE node regardless of the model.
-    # Default 63B_1L — the SAME as scripts-frontier — because main_results trains 63B
+    # Uses <MODEL_SIZE_OPT>_1L (so 21B_1L by default). The planner cache key encodes
+    # hidden/experts/ffn/topk/seqlen but NOT depth, so 21B_1L, 50B_1L and 63B_1L all
+    # resolve to the SAME cache file -- one sweep serves the whole family.
     # with yes_planner and the planner needs a cache for THAT model. Override with
     # --model-size 50B (40GB HBM) or 10B (scaled-down box).
     #
