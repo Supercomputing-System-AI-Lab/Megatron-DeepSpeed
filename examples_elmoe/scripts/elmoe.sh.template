@@ -59,6 +59,26 @@ ELMOE_ENV_FILE="${ELMOE_ENV_FILE:-$PWD/env.sh}"
 HOSTFILE="${HOSTFILE:-$PWD/hostfile}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 
+# Source it in the DRIVER too, not just in node_launch.sh on each node.
+#
+# WHY: the driver shell itself runs python and py-spy — run_analysis() calls
+# ../utils/analyze_*.py, and the monitor block probes for py-spy. Under SLURM the
+# driver inherited a module-loaded environment so this never came up; off-scheduler,
+# `bash autorun.sh` from a fresh shell leaves the driver with no conda env. The ranks
+# still train correctly (node_launch.sh sources this file), so the run "succeeds"
+# while the monitor silently skips and the analysis dies with:
+#     line NNN: python: command not found
+# Sourcing here is idempotent — conda activate on an already-active prefix just
+# re-runs its activate.d hooks — and node_launch.sh still sources it per node, which
+# is what matters for ssh'd hosts that share none of this shell's environment.
+if [ -f "${ELMOE_ENV_FILE}" ]; then
+    echo "[driver] sourcing ${ELMOE_ENV_FILE}"
+    source "${ELMOE_ENV_FILE}"
+else
+    echo "[driver] WARNING: no ${ELMOE_ENV_FILE} — driver-side python/py-spy may be missing." >&2
+    echo "[driver]          Copy env.sh.example to env.sh. Required for multi-node." >&2
+fi
+
 # Planner memory reserve, in BINARY GiB. The planner sets its budget to
 #   (detected total GPU memory) - PLANNER_MEMORY_HEADROOM_GB
 # so it adapts to whatever GPU this runs on. The reserve covers what the analytic
@@ -69,7 +89,7 @@ MASTER_PORT="${MASTER_PORT:-29500}"
 # path targets UNKNOWN hardware where allocator behaviour has not been calibrated.
 # Lower it once you have validated predicted-vs-actual memory on your machine
 # (analyze_memory.py prints that table after every run).
-PLANNER_MEMORY_HEADROOM_GB="${PLANNER_MEMORY_HEADROOM_GB:-3.5}"
+PLANNER_MEMORY_HEADROOM_GB="${PLANNER_MEMORY_HEADROOM_GB:-1.5}"
 
 echo "MICRO_BATCH_SIZE: $BATCH_SIZE"
 echo "NUM_BATCHES: $NUM_BATCHES"
@@ -357,6 +377,24 @@ export NCCL_ASYNC_ERROR_HANDLING=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export NCCL_DEBUG=INFO
 
+# Every global var above that must ALSO reach a remote node.
+#
+# THE BUG THIS FIXES: for NODES=1 the launcher runs `bash node_launch.sh`, which
+# inherits this shell -- so all of these are present. For NODES>1 it runs
+# `ssh <host> "bash node_launch.sh"`, and **ssh carries no environment**. Only the
+# four vars node_launch.sh exports explicitly survived; the rest were silently
+# dropped on EVERY node. Multi-node runs therefore executed with different settings
+# than single-node ones -- no expandable_segments (so more fragmentation and
+# earlier OOM), no NCCL_DEBUG (so no diagnostics when it failed), no NCCL timeouts,
+# and no CUDA_DEVICE_MAX_CONNECTIONS -- while appearing to be the same config.
+# Keeping ONE list here and generating the exports from it stops the two drifting.
+ELMOE_PROPAGATE_VARS=(
+    CUDA_DEVICE_MAX_CONNECTIONS TRITON_PTXAS_NUM_WORKERS OMP_NUM_THREADS
+    NCCL_TIMEOUT NCCL_TIMEOUT_MS TORCH_NCCL_BLOCKING_WAIT
+    TORCH_NCCL_ASYNC_ERROR_HANDLING NCCL_ASYNC_ERROR_HANDLING
+    PYTORCH_CUDA_ALLOC_CONF NCCL_DEBUG
+)
+
 gpus_per_node=$(( TOTAL_GPUS / NODES ))
 
 # --- Host list & master address (hostfile replaces scontrol/SLURM_NODELIST) ---
@@ -461,12 +499,65 @@ run_analysis() {
             --dynamic_checkpoint $DYNAMIC_CHECKPOINT \
             --uneven_pp $UNEVEN_PP \
             --zero $ZERO_STAGE ${ANALYZE_LOG_PROFILING_FLAG} >> "${MERGED_LOG}"
+    _LOG_RC=$?
 
     python ../utils/analyze_memory.py "${MERGED_LOG}"
+    _MEM_RC=$?
 
-    echo "Analysis Complete. Full log: ${MERGED_LOG}"
+    # Report per-step status instead of an unconditional "Analysis Complete".
+    #
+    # WHY: analyze_log.py's stdout is redirected into ${MERGED_LOG}, so when it dies
+    # the only trace is a stderr traceback buried in the driver .o -- while this
+    # function still cheerfully printed "Analysis Complete". A missing `pandas` or
+    # `openpyxl` therefore silently discarded the ENTIRE throughput/TFLOPs analysis
+    # of a run that had otherwise succeeded, and the loss was only noticed by a human
+    # wondering why the numbers were missing. Never claim success we did not verify.
+    if [ "${_LOG_RC}" -ne 0 ]; then
+        echo "ERROR: analyze_log.py FAILED (rc=${_LOG_RC}) — throughput/TFLOPs analysis is MISSING." >&2
+        echo "       Its traceback is in ${SLURM_LOG_FILE} (stdout went to the merged log)." >&2
+        echo "       Usually a missing dep:  pip install pandas openpyxl" >&2
+        echo "       Re-run analysis WITHOUT retraining:" >&2
+        echo "         python ../utils/rerun_analysis.py ${SLURM_LOG_FILE}" >&2
+    fi
+    [ "${_MEM_RC}" -ne 0 ] && \
+        echo "ERROR: analyze_memory.py FAILED (rc=${_MEM_RC}) — per-stage memory table is MISSING." >&2
+
+    if [ "${_LOG_RC}" -eq 0 ] && [ "${_MEM_RC}" -eq 0 ]; then
+        echo "Analysis Complete. Full log: ${MERGED_LOG}"
+    else
+        echo "Analysis INCOMPLETE (see errors above). Partial log: ${MERGED_LOG}"
+    fi
 }
 # ================================================== END of Analysis ==================================
+
+
+# ================================================== Monitor Run (py-spy) ==================================
+# Async pipeline-stall monitor (body lives in monitor_run.sh, same dir) — the torchrun counterpart
+# of the SLURM template's monitor block. Backgrounded so it never blocks training. Writes:
+#   ${JOB_DIR}/a-monitor.txt   — SUMMARY: per-interval state histogram across ALL ranks + LIVE x/world
+#                                liveness + frozen/odd counts + culprit native stack. Read this first.
+#   ${JOB_DIR}/monitor/node{i}.txt — per-node detail (STATUS RANK GPU PID WATTS HBM% RAM_GB TRACE)
+#   ${JOB_DIR}/monitor/monitor.tsv — one row per (interval,rank) for grep/plot
+# Needs py-spy on PATH or ~/.local/bin/py-spy, on EVERY node (`pip install py-spy`), and
+# /proc/sys/kernel/yama/ptrace_scope = 0. Skipped with a warning when absent — never fatal.
+# Disable with:  ELMOE_MONITOR=0 bash autorun.sh
+ELMOE_MONITOR="${ELMOE_MONITOR:-1}"
+MON_FAST="${MON_FAST:-60}"; MON_SLOW="${MON_SLOW:-180}"; MON_WINDOW="${MON_WINDOW:-300}"; MON_TRACE_FRAMES="${MON_TRACE_FRAMES:-20}"
+MONITOR_PID=""
+if [[ "${ELMOE_MONITOR}" == "1" ]]; then
+    if [[ ! -f "${DIR}/monitor_run.sh" ]]; then
+        echo "[monitor] monitor_run.sh not found in ${DIR} — skipping."
+    elif ! command -v py-spy >/dev/null 2>&1 && [ ! -x "${HOME}/.local/bin/py-spy" ]; then
+        echo "[monitor] py-spy not found — skipping. Enable with: pip install py-spy"
+    else
+        JOB_ID="${JOB_ID}" NODES="${NODES}" TOTAL_GPUS="${TOTAL_GPUS}" HOSTFILE="${HOSTFILE}" \
+            bash "${DIR}/monitor_run.sh" "${JOB_DIR}" "${MON_FAST}" "${MON_SLOW}" "${MON_WINDOW}" "${MON_TRACE_FRAMES}" &
+        MONITOR_PID=$!
+        trap 'kill ${MONITOR_PID} 2>/dev/null' EXIT
+        echo "[monitor] pid ${MONITOR_PID} -> ${JOB_DIR}/a-monitor.txt (+ monitor/); ${MON_FAST}s for first ${MON_WINDOW}s, then ${MON_SLOW}s"
+    fi
+fi
+# ================================================== END of Monitor Run ==================================
 
 
 # ================================================== Launch ELMoE Training (torchrun) =============================================================
@@ -512,10 +603,17 @@ else
 fi
 
 NODE_LAUNCH="${JOB_DIR}/node_launch.sh"
-cat > "${NODE_LAUNCH}" <<EOF
-#!/bin/bash
-cd "${DIR}" || exit 1
-if [ -f "${ELMOE_ENV_FILE}" ]; then source "${ELMOE_ENV_FILE}"; fi
+{
+    echo '#!/bin/bash'
+    echo "cd \"${DIR}\" || exit 1"
+    echo "# Driver globals, re-exported because ssh carries no environment."
+    echo "# Emitted BEFORE env.sh so a site file can still override them."
+    for _v in "${ELMOE_PROPAGATE_VARS[@]}"; do
+        [ -n "${!_v+x}" ] && printf 'export %s=%q\n' "$_v" "${!_v}"
+    done
+    echo "if [ -f \"${ELMOE_ENV_FILE}\" ]; then source \"${ELMOE_ENV_FILE}\"; fi"
+} > "${NODE_LAUNCH}"
+cat >> "${NODE_LAUNCH}" <<EOF
 # Topology for ELMoE_launch.py's planner (torchrun does not set these).
 export SLURM_NTASKS=${TOTAL_GPUS}
 export SLURM_NNODES=${NODES}
