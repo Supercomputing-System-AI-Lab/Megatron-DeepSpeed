@@ -1,6 +1,6 @@
-# ELMoE Training Examples
+# X-MoE-4D Training Examples
 
-End-to-end launch pipeline for training ELMoE / X-MoE models on Frontier
+End-to-end launch pipeline for training X-MoE-4D / X-MoE models on Frontier
 (AMD MI250X) and on portable Triton-only deployments (incl. NVIDIA). All
 submissions are driven from one script — [`scripts-frontier/autorun_frontier.sh`](scripts-frontier/autorun_frontier.sh)
 — which fans out SLURM jobs from a small set of associative maps. To
@@ -24,17 +24,17 @@ All experiments live as (commented) entries inside
 To reproduce one, **uncomment the relevant lines** and run:
 
 ```bash
-cd Megatron-DeepSpeed-X-MoE/examples_elmoe/scripts-frontier
+cd Megatron-DeepSpeed-X-MoE/examples_xmoe_4d/scripts-frontier
 bash autorun_frontier.sh
 ```
 
 The script walks three maps and submits one `sbatch` per configuration.
-As shipped, a single demo is active — **63B ELMoE on 64 GPUs with ELM-PP
+As shipped, a single demo is active — **63B X-MoE-4D on 64 GPUs with ELM-PP
 planner + dynamic layer-wise activation checkpointing**:
 
 ```bash
 PP_STRATEGY_MAP["8:64"]="4:8"
-PP_BATCH_MAP["8:64"]=" 1:256:15:ELMOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner "
+PP_BATCH_MAP["8:64"]=" 1:256:15:X-MOE-4D:63B:dynamic-ckpt:1:uneven:yes-planner "
 ```
 
 All other entries are commented templates you can selectively enable.
@@ -54,7 +54,7 @@ JSON is missing. Populate the cache first by enabling the matching
 
 | Goal | What to uncomment | Notes |
 |---|---|---|
-| ELMoE 63B baseline run (the demo as shipped) | the two `8:64` lines above | Requires 63B profile cache present. |
+| X-MoE-4D 63B baseline run (the demo as shipped) | the two `8:64` lines above | Requires 63B profile cache present. |
 | Populate the profile cache for a new model | one entry in `PROFILE_MAP["1:8:1"]` | Runs mbs = 1..10 on a single 8-GPU node; writes JSONs used by the planner. |
 | Baseline comparison (X-MoE, DeepSpeed-MoE, Tutel, TED) | one entry in `EP_BATCH_MAP` | Flat EP, no planner, no uneven PP. |
 
@@ -67,7 +67,7 @@ resource shape; each value is a colon-delimited run spec. Space-separated
 run specs within a single map value submit multiple jobs against the same
 node budget.
 
-### 2.1 `PP_STRATEGY_MAP` and `PP_BATCH_MAP` — ELMoE PP-centric runs
+### 2.1 `PP_STRATEGY_MAP` and `PP_BATCH_MAP` — X-MoE-4D PP-centric runs
 
 ```
 PP_STRATEGY_MAP["<NODES>:<TOTAL_GPUS>"] = "<PP_SIZE>:<EP_PARALLEL_SIZE>"
@@ -76,7 +76,7 @@ PP_BATCH_MAP["<NODES>:<TOTAL_GPUS>"]    = "<mbs>:<nbs>:<iters>:<moe_type>:<model
 
 | Token | Values |
 |---|---|
-| `moe_type` | `ELMOE-3D` (SeqGEMM), `ELMOE-GroupedGEMM-primus` (CK grouped-GEMM, AMD-only), `ELMOE-GroupedGEMM-triton` (Triton grouped-GEMM, portable to NVIDIA) |
+| `moe_type` | `X-MOE-4D` (SeqGEMM), `X-MOE-4D-GroupedGEMM-primus` (CK grouped-GEMM, AMD-only), `X-MOE-4D-GroupedGEMM-triton` (Triton grouped-GEMM, portable to NVIDIA) |
 | `model_size` | `10B`, `63B`, `173B`, `537B`, `1T` (see [`utils/model_registry.py`](utils/model_registry.py) for full config) |
 | `ckpt` | `no-ckpt` (off), `ckpt` (every layer), `dynamic-ckpt` (planner-chosen per-layer placement) |
 | `pp_partition` | `even` (uniform layers/stage), `uneven` (planner-chosen per-stage layer count) |
@@ -113,24 +113,24 @@ loop iterates `mbs = 1..10` for each entry.
 autorun_frontier.sh              (generates one SLURM script per run spec)
         |
         v
-frontier_elmoe.slurm.template    (unified template: env setup, Triton
-        |                         cache warm, DeepSpeed config rendering)
-        |   srun python ../ELMoE_launch.py ...
+frontier_xmoe_4d.slurm.template   (unified template: env setup, Triton
+        |                          cache warm, DeepSpeed config rendering)
+        |   srun python ../ELM_PP_launch.py ...
         v
-ELMoE_launch.py                  (thin wrapper: optionally runs the planner,
-        |                         then hands off a modified argv)
+ELM_PP_launch.py                  (thin wrapper: optionally runs the planner,
+        |                          then hands off a modified argv)
         |   runpy.run_module("pretrain_gpt_deepspeed")
         v
-pretrain_gpt_deepspeed.py        (standard Megatron-DeepSpeed pretrain)
+pretrain_gpt_deepspeed.py         (standard Megatron-DeepSpeed pretrain)
 ```
 
-### 3.1 `frontier_elmoe.slurm.template`
+### 3.1 `frontier_xmoe_4d.slurm.template`
 
 A single unified template for both production and profiling-cache
 runs. Two placeholders gate the mode:
 
 - `{{RUN_PLANNER}}` — `true` / `true-membal` / `false`. Passed straight
-  through to `ELMoE_launch.py --run-planner`.
+  through to `ELM_PP_launch.py --run-planner`.
 - `{{COLLECT_PROFILING_CACHE}}` — `true` / `false`. When `true`, the
   template forces `PP_SIZE=1`, enables `WALL_CLOCK_BREAKDOWN=true`
   (needed to emit per-module timer lines), forces `RUN_PLANNER=false`
@@ -140,7 +140,7 @@ runs. Two placeholders gate the mode:
 Everything else — Megatron/DeepSpeed arg rendering, MoE-type branches,
 ZeRO config, per-rank log routing — is shared between the two modes.
 
-### 3.2 `ELMoE_launch.py`
+### 3.2 `ELM_PP_launch.py`
 
 The wrapper peels off planner-only flags (`--run-planner`,
 `--planner-mode`, `--planner-profile-dir`, `--planner-memory-limit-gb`,
@@ -211,7 +211,7 @@ Pipeline:
    `true-membal`) and `{{COLLECT_PROFILING_CACHE}}=false`.
 2. Before submitting, autorun computes the expected cache filename and
    **skips the job** if the JSON is missing. No crash, no partial run.
-3. `ELMoE_launch.py` loads the JSON, runs the selected optimizer mode
+3. `ELM_PP_launch.py` loads the JSON, runs the selected optimizer mode
    (`optimize` or `optimize-membal`), and injects the resulting
    `--uneven-pp-partition` and `--dynamic-checkpoint-partition` into argv.
 4. `pretrain_gpt_deepspeed.py` boots with the planner-chosen layout.

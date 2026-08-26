@@ -399,9 +399,9 @@ megatron_options=" \
 # Conditionally append flags based on the MoE type
 if [[ "${MOE_TYPE}" == "X-MOE" ]]; then
     megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft"
-elif [[ "${MOE_TYPE}" == "X-MOE-GroupedGEMM-triton" ]]; then
+elif [[ "${MOE_TYPE}" == "X-MOE-4D-GroupedGEMM-triton" ]]; then
     megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-groupedGEMM --use-triton"
-elif [[ "${MOE_TYPE}" == "X-MOE-GroupedGEMM-primus" ]]; then
+elif [[ "${MOE_TYPE}" == "X-MOE-4D-GroupedGEMM-primus" ]]; then
     megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-groupedGEMM"
 fi
 

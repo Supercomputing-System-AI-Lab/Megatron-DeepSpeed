@@ -4,7 +4,7 @@
 #
 # Same four maps, same colon-delimited config strings, same sed-fill of the
 # template. The ONLY differences:
-#   * TEMPLATE_FILE  -> elmoe.sh.template   (torchrun, not sbatch)
+#   * TEMPLATE_FILE  -> xmoe_4d.sh.template   (torchrun, not sbatch)
 #   * no PARTITION / no walltime            (there is no scheduler)
 #   * runs are executed SEQUENTIALLY with `bash` instead of queued with `sbatch`
 #     — on a non-SLURM box every run contends for the SAME GPUs, so they cannot
@@ -27,28 +27,28 @@ echo "Starting experiment launch (torchrun / non-SLURM)..."
 
 MP_SIZE=1
 
-# ELMoE PP-centric runs
+# X-MoE-4D PP-centric runs
 declare -A PP_STRATEGY_MAP
 declare -A PP_BATCH_MAP
 
-# ================================== 10B ELMoE (single node, 8 GPUs) ==================================
+# ================================== 10B X-MoE-4D (single node, 8 GPUs) ==================================
 # PP2-EP4
 PP_STRATEGY_MAP["1:8"]="2:4"
 PP_STRATEGY_MAP["2:16"]="2:8"
-# PP_BATCH_MAP["1:8"]=" 4:20:15:ELMOE-3D:10B:no-ckpt:0:even:no-planner "
+# PP_BATCH_MAP["1:8"]=" 4:20:15:X-MOE-4D:10B:no-ckpt:0:even:no-planner "
 # 40GB A100: MBS 4 + no-ckpt OOMs (~20GB of activations on top of ~10GB fixed).
 # MBS 1 + activation checkpointing -> ~15GB. See x-moe-docs/aws-multinode-guide.md App. C.
-PP_BATCH_MAP["1:8"]=" 1:2:15:ELMOE-3D:10B:ckpt:1:even:no-planner "
-# PP_BATCH_MAP["2:16"]=" 1:2:15:ELMOE-3D:10B:ckpt:1:even:no-planner "
-# PP_BATCH_MAP["2:16"]=" 1:128:15:ELMOE-3D:21B:ckpt:1:even:no-planner "
-# PP_BATCH_MAP["2:16"]=" 1:128:15:ELMOE-3D:21B:no-ckpt:0:even:no-planner "
-# PP_BATCH_MAP["2:16"]=" 1:128:15:ELMOE-3D:21B:dynamic-ckpt:1:uneven:yes-planner "
+PP_BATCH_MAP["1:8"]=" 1:2:15:X-MOE-4D:10B:ckpt:1:even:no-planner "
+# PP_BATCH_MAP["2:16"]=" 1:2:15:X-MOE-4D:10B:ckpt:1:even:no-planner "
+# PP_BATCH_MAP["2:16"]=" 1:128:15:X-MOE-4D:21B:ckpt:1:even:no-planner "
+# PP_BATCH_MAP["2:16"]=" 1:128:15:X-MOE-4D:21B:no-ckpt:0:even:no-planner "
+# PP_BATCH_MAP["2:16"]=" 1:128:15:X-MOE-4D:21B:dynamic-ckpt:1:uneven:yes-planner "
 
-# ================================== 63B ELMoE (4 nodes, 32 GPUs) ==================================
+# ================================== 63B X-MoE-4D (4 nodes, 32 GPUs) ==================================
 # PP4-EP8
 # PP_STRATEGY_MAP["4:32"]="4:8"
-# PP_BATCH_MAP["4:32"]=" 1:128:15:ELMOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner "
-# PP_BATCH_MAP["4:32"]=" 1:128:15:ELMOE-GroupedGEMM-primus:63B:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["4:32"]=" 1:128:15:X-MOE-4D:63B:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["4:32"]=" 1:128:15:X-MOE-4D-GroupedGEMM-primus:63B:dynamic-ckpt:1:uneven:yes-planner "
 
 
 # EP-centric baselines
@@ -68,7 +68,7 @@ declare -A PROFILE_MAP
 ##########################################################################
 # --- SCRIPT LOGIC (no need to edit below) ---
 ##########################################################################
-TEMPLATE_FILE="elmoe.sh.template"
+TEMPLATE_FILE="xmoe_4d.sh.template"
 TEMP_DIR="temp_sh"
 
 if [ ! -f "$TEMPLATE_FILE" ]; then

@@ -374,7 +374,7 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                                              num_dp=mpu.get_data_parallel_world_size())
         print (f'[megatron/model/gpt_model.py] activation_checkpoint_interval={interval}, and {args.checkpoint_num_layers=}')
         
-        # Read ELMoE partition configs from args (set by ELMoE_launch.py via env→args)
+        # Read X-MoE-4D partition configs from args (set by ELM_PP_launch.py via env→args)
         custom_pp_partition = getattr(args, 'uneven_pp_partition', None)
         checkpoint_partition = getattr(args, 'dynamic_checkpoint_partition', None)
         

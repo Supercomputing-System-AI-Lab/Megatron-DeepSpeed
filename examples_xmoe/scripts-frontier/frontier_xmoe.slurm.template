@@ -228,14 +228,14 @@ fi
 if [[ "${MOE_TYPE}" == "X-MOE" ]]; then
     megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft"
     # megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-rbd"
-elif [[ "${MOE_TYPE}" == "X-MOE-3D" ]]; then
+elif [[ "${MOE_TYPE}" == "X-MOE-4D" ]]; then
     megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft"
 
-elif [[ "${MOE_TYPE}" == "X-MOE-GroupedGEMM-triton" ]]; then
+elif [[ "${MOE_TYPE}" == "X-MOE-4D-GroupedGEMM-triton" ]]; then
     megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-groupedGEMM --use-triton"
     export USE_TRITON_GROUPGEMM="True"
 
-elif [[ "${MOE_TYPE}" == "X-MOE-GroupedGEMM-primus" ]]; then
+elif [[ "${MOE_TYPE}" == "X-MOE-4D-GroupedGEMM-primus" ]]; then
     export USE_AITER_GROUPGEMM=True 
     megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-groupedGEMM --no-bias-gelu-fusion --disable-bias-linear"
 
@@ -429,7 +429,7 @@ echo "--- Cache warm done at: $(date '+%F %T') ---"
 
 
 
-# ================================================== Launch ELMoE Training =============================================================
+# ================================================== Launch X-MoE-4D Training =============================================================
 export to_profile="False"
 export profile_memory="False"
 # export to_profile="True"
@@ -445,7 +445,7 @@ fi
 
 
 
-echo "Before launching srun python python ../pretrain_gpt_deepspeed.py"
+echo "Before launching srun python ../ELM_PP_launch.py"
 echo "--- Script started at: $(date '+%F %T') ---"
 
 srun -N ${NODES} -n ${TOTAL_GPUS} -c6 \
@@ -455,7 +455,7 @@ srun -N ${NODES} -n ${TOTAL_GPUS} -c6 \
      --export=ALL,FI_MR_CACHE_MONITOR,FI_CXI_DEFAULT_CQ_SIZE,FI_CXI_RX_MATCH_MODE,NCCL_DEBUG,UNEVEN_PP,TRITON_CACHE_DIR,TRITON_DISABLE_CACHE \
      bash -c "
 
-     python ../ELMoE_launch.py \
+     python ../ELM_PP_launch.py \
         --run-planner ${planner_mode} \
         --planner-profile-dir ./planner_profiling_cache \
         ${megatron_options} \
@@ -464,7 +464,7 @@ srun -N ${NODES} -n ${TOTAL_GPUS} -c6 \
         --master-addr=$MASTER_ADDR \
         --zero-stage {{ZERO}} \
         > ${JOB_DIR}/rank_\${SLURM_PROCID}.log"
-# ================================================== END of Launch ELMoE Training =============================================================
+# ================================================== END of Launch X-MoE-4D Training =============================================================
 
 
 

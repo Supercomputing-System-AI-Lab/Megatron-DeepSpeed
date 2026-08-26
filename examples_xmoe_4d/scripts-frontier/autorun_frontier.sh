@@ -3,7 +3,7 @@
 echo "Starting experiment submission process..."
 
 
-# ************************************ ELMoE Launch Instructions ************************************
+# ************************************ X-MoE-4D Launch Instructions ************************************
 # 1. Specify the PP-EP configurations and #nodes & #GPUs per run using PP_STRATEGY_MAP, 
 #       DP (default ZeRO-1) will be auto-determined based on GPU counts 
 # 2. Each run command is composed of the following structure and is seperated by colon :
@@ -11,9 +11,9 @@ echo "Starting experiment submission process..."
 #       number_of_micro_batches (per-device-per-iteration) : 
 #       number of training iterations : 
 #       run model type :
-#               ELMoE-3D --> SeqGEMM
-#               ELMOE-GroupedGEMM-primus --> CK GroupGEMM
-#               ELMOE-GroupedGEMM-primus --> Triton GroupGEMM
+#               X-MoE-4D --> SeqGEMM
+#               X-MOE-4D-GroupedGEMM-primus --> CK GroupGEMM
+#               X-MOE-4D-GroupedGEMM-primus --> Triton GroupGEMM
 #       Model sizes (see ../utils/model_registry.py for more configurations):
 #               10B Small
 #               63B Medium 
@@ -23,7 +23,7 @@ echo "Starting experiment submission process..."
 #       Checkpointing strategy : Checkpoint-interval :
 #               no-ckpt:0:      --> no activation checkpoint 
 #               ckpt:1:         --> activation checkpoint for every layer 
-#               dynamic-ckpt:1: --> ELMoE's planner based layer-wise act. ckpt. partition 
+#               dynamic-ckpt:1: --> X-MoE-4D's planner based layer-wise act. ckpt. partition 
 #       Planner strategy : 
 #               no-planner:         --> no planner 
 #               yes-planner:        --> Minimax Pipeline Planner 
@@ -35,7 +35,7 @@ echo "Starting experiment submission process..."
 
 # Set the Tensor Parallelism size (usually constant)
 MP_SIZE=1
-# ELMoE PP centric approach 
+# X-MoE-4D PP centric approach 
 declare -A PP_STRATEGY_MAP
 
 PP_STRATEGY_MAP["36:288"]="12:8" 
@@ -44,82 +44,82 @@ PP_STRATEGY_MAP["144:1152"]="12:8"
 PP_STRATEGY_MAP["288:2304"]="12:8" 
 
 declare -A PP_BATCH_MAP
-# ================================== 10B ELMoE ==================================
+# ================================== 10B X-MoE-4D ==================================
 # ==================== 8 GPUs ===================
 # # PP2-EP4-DP1
 PP_STRATEGY_MAP["1:8"]="4:2" # **
 PP_STRATEGY_MAP["2:16"]="2:8" # **
-# PP_BATCH_MAP["1:8"]=" 4:10:15:ELMOE-3D:10B:no-ckpt:0:even:no-planner  "
-# PP_BATCH_MAP["2:16"]=" 4:10:15:ELMOE-3D:10B:no-ckpt:0:even:no-planner  "
+# PP_BATCH_MAP["1:8"]=" 4:10:15:X-MOE-4D:10B:no-ckpt:0:even:no-planner  "
+# PP_BATCH_MAP["2:16"]=" 4:10:15:X-MOE-4D:10B:no-ckpt:0:even:no-planner  "
 
 
-# ================================== 63B ELMoE ==================================
+# ================================== 63B X-MoE-4D ==================================
 # ==================== 32 GPUs ===================
 # PP4-EP8-DP1
 # PP_STRATEGY_MAP["4:32"]="4:8" # **
-# PP_BATCH_MAP["8:64"]=" 1:256:15:ELMOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner  1:256:15:ELMOE-GroupedGEMM-primus:63B:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["8:64"]=" 1:256:15:X-MOE-4D:63B:dynamic-ckpt:1:uneven:yes-planner  1:256:15:X-MOE-4D-GroupedGEMM-primus:63B:dynamic-ckpt:1:uneven:yes-planner "
 
 # ==================== 64 GPUs ===================
 # PP4-EP8-DP2
 # PP_STRATEGY_MAP["8:64"]="4:8" # **
-# ELMoE configurations: 
-# PP_BATCH_MAP["8:64"]=" 1:256:15:ELMOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner  1:256:15:ELMOE-GroupedGEMM-primus:63B:dynamic-ckpt:1:uneven:yes-planner "
-# PP_BATCH_MAP["8:64"]=" 1:256:15:ELMOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner  "
-# PP_BATCH_MAP["8:64"]=" 1:256:15:ELMOE-GroupedGEMM-primus:63B:dynamic-ckpt:1:uneven:yes-planner "
-# PP_BATCH_MAP["8:64"]=" 1:256:15:ELMOE-GroupedGEMM-primus:63B:dynamic-ckpt:1:uneven:yes-planner  " # **
+# X-MoE-4D configurations: 
+# PP_BATCH_MAP["8:64"]=" 1:256:15:X-MOE-4D:63B:dynamic-ckpt:1:uneven:yes-planner  1:256:15:X-MOE-4D-GroupedGEMM-primus:63B:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["8:64"]=" 1:256:15:X-MOE-4D:63B:dynamic-ckpt:1:uneven:yes-planner  "
+# PP_BATCH_MAP["8:64"]=" 1:256:15:X-MOE-4D-GroupedGEMM-primus:63B:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["8:64"]=" 1:256:15:X-MOE-4D-GroupedGEMM-primus:63B:dynamic-ckpt:1:uneven:yes-planner  " # **
 
 
 # launch all three together, separated by space: 
-# PP_BATCH_MAP["8:64"]=" 1:256:15:ELMOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner  1:256:15:ELMOE-GroupedGEMM-primus:63B:dynamic-ckpt:1:uneven:yes-planner  1:256:15:ELMOE-GroupedGEMM-triton:63B:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["8:64"]=" 1:256:15:X-MOE-4D:63B:dynamic-ckpt:1:uneven:yes-planner  1:256:15:X-MOE-4D-GroupedGEMM-primus:63B:dynamic-ckpt:1:uneven:yes-planner  1:256:15:X-MOE-4D-GroupedGEMM-triton:63B:dynamic-ckpt:1:uneven:yes-planner "
 
 # Without planner and even partition: 
 # w/ act. ckpt:
-# PP_BATCH_MAP["8:64"]=" 1:256:15:ELMOE-3D:63B:no-ckpt:0:even:no-planner "
+# PP_BATCH_MAP["8:64"]=" 1:256:15:X-MOE-4D:63B:no-ckpt:0:even:no-planner "
 # w/o act. ckpt:
-# PP_BATCH_MAP["8:64"]=" 1:256:15:ELMOE-3D:63B:ckpt:1:even:no-planner "
+# PP_BATCH_MAP["8:64"]=" 1:256:15:X-MOE-4D:63B:ckpt:1:even:no-planner "
 # ==================== 32 GPUs ===================
 # PP4-EP8-DP1
 # PP_STRATEGY_MAP["4:32"]="4:8" # **
-# PP_BATCH_MAP["4:32"]=" 1:256:15:ELMOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner "
-# PP_BATCH_MAP["4:32"]=" 1:256:15:ELMOE-GroupedGEMM-primus:63B:dynamic-ckpt:1:uneven:yes-planner  " # **
+# PP_BATCH_MAP["4:32"]=" 1:256:15:X-MOE-4D:63B:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["4:32"]=" 1:256:15:X-MOE-4D-GroupedGEMM-primus:63B:dynamic-ckpt:1:uneven:yes-planner  " # **
 
 
 
 
-# ================================== 1T ELMoE ==================================
+# ================================== 1T X-MoE-4D ==================================
 # ==================== 960 GPUs ===================
 # PP60-EP8-DP2 
 # PP_STRATEGY_MAP["120:960"]="60:8" # **
-# PP_BATCH_MAP["120:960"]="1:256:15:ELMOE-GroupedGEMM-primus:1T:dynamic-ckpt:1:uneven:yes-planner " # **
-# PP_BATCH_MAP["120:960"]="1:256:15:ELMOE-3D:1T:dynamic-ckpt:1:uneven:yes-planner " # **
+# PP_BATCH_MAP["120:960"]="1:256:15:X-MOE-4D-GroupedGEMM-primus:1T:dynamic-ckpt:1:uneven:yes-planner " # **
+# PP_BATCH_MAP["120:960"]="1:256:15:X-MOE-4D:1T:dynamic-ckpt:1:uneven:yes-planner " # **
 # ==================== 480 GPUs ===================
 # PP60-EP8-DP1 
 # PP_STRATEGY_MAP["60:480"]="60:8" # **
-# PP_BATCH_MAP["60:480"]="1:256:15:ELMOE-3D:1T:dynamic-ckpt:1:uneven:yes-planner " # **
+# PP_BATCH_MAP["60:480"]="1:256:15:X-MOE-4D:1T:dynamic-ckpt:1:uneven:yes-planner " # **
 
 
 
-# ================================== 173B ELMoE ==================================
+# ================================== 173B X-MoE-4D ==================================
 # ==================== 256 GPUs ===================
 # PP8-EP8-DP4 
 # PP_STRATEGY_MAP["32:256"]="8:8" # **
-# PP_BATCH_MAP["32:256"]="1:256:15:ELMOE-3D:173B:dynamic-ckpt:1:uneven:yes-planner " # **
-# PP_BATCH_MAP["32:256"]="1:256:15:ELMOE-GroupedGEMM-primus:173B:dynamic-ckpt:1:uneven:yes-planner " # **
-# PP_BATCH_MAP["32:256"]="1:256:15:ELMOE-GroupedGEMM-triton:173B:dynamic-ckpt:1:uneven:yes-planner " # **
+# PP_BATCH_MAP["32:256"]="1:256:15:X-MOE-4D:173B:dynamic-ckpt:1:uneven:yes-planner " # **
+# PP_BATCH_MAP["32:256"]="1:256:15:X-MOE-4D-GroupedGEMM-primus:173B:dynamic-ckpt:1:uneven:yes-planner " # **
+# PP_BATCH_MAP["32:256"]="1:256:15:X-MOE-4D-GroupedGEMM-triton:173B:dynamic-ckpt:1:uneven:yes-planner " # **
 
 
 
 
-# ================================== 537B ELMoE ==================================
+# ================================== 537B X-MoE-4D ==================================
 # ==================== 480 GPUs ===================
 # PP30-EP8-DP2 
 # PP_STRATEGY_MAP["60:480"]="30:8" # **
 # # Activation Checkpointing 
-# PP_BATCH_MAP["60:480"]="   1:256:15:ELMOE-GroupedGEMM-primus:537B:ckpt:1:even:no-planner    " # **
-# # ELMoE ELM-PP with planner and layer-wise activation partition
-# PP_BATCH_MAP["60:480"]="   1:256:15:ELMOE-GroupedGEMM-primus:537B:dynamic-ckpt:1:uneven:yes-planner    " # **
+# PP_BATCH_MAP["60:480"]="   1:256:15:X-MOE-4D-GroupedGEMM-primus:537B:ckpt:1:even:no-planner    " # **
+# # X-MoE-4D ELM-PP with planner and layer-wise activation partition
+# PP_BATCH_MAP["60:480"]="   1:256:15:X-MOE-4D-GroupedGEMM-primus:537B:dynamic-ckpt:1:uneven:yes-planner    " # **
 # # Memory balanced partition (no throughput consideration)
-# PP_BATCH_MAP["60:480"]="   1:256:15:ELMOE-GroupedGEMM-primus:537B:ckpt:1:uneven:yes-planner-membal   " # **
+# PP_BATCH_MAP["60:480"]="   1:256:15:X-MOE-4D-GroupedGEMM-primus:537B:ckpt:1:uneven:yes-planner-membal   " # **
 
 
 
@@ -216,7 +216,7 @@ declare -A EP_BATCH_MAP
 #       micro_batch_size (per-device) : 
 #       number_of_micro_batches (per-device-per-iteration) : 
 #       number of training iterations : 
-#       run model type (ELMoE grounded on X-MoE implementation) :
+#       run model type (X-MoE-4D grounded on X-MoE implementation) :
 #               X-MoE 
 #       Model sizes (single layer) (see ../utils/model_registry.py for more configurations):
 #               10B_1L Small
@@ -245,7 +245,7 @@ declare -A PROFILE_MAP
 ##########################################################################
 # --- 2. SCRIPT LOGIC (No need to edit below) ---
 ##########################################################################
-TEMPLATE_FILE="frontier_elmoe.slurm.template"
+TEMPLATE_FILE="frontier_xmoe_4d.slurm.template"
 
 if [ ! -f "$TEMPLATE_FILE" ]; then
     echo "ERROR: The template file '$TEMPLATE_FILE' was not found."
@@ -471,7 +471,7 @@ for node_key in "${!PROFILE_MAP[@]}"; do
     PARTITION="batch"
     # MP_SIZE=2
     # TEMPLATE_PLANNER_FILE="planner.slurm.template"
-    TEMPLATE_PLANNER_FILE="frontier_elmoe.slurm.template"
+    TEMPLATE_PLANNER_FILE="frontier_xmoe_4d.slurm.template"
     
     echo "Found EP configurations for ${NODES} nodes, ${TOTAL_GPUS} GPUs..."
 

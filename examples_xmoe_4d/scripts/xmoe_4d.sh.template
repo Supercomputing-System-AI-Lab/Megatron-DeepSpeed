@@ -1,7 +1,7 @@
 #!/bin/bash
 ###############################################################################
-# elmoe.sh.template — non-SLURM (torchrun) counterpart of
-#                     scripts-frontier/frontier_elmoe.slurm.template
+# xmoe_4d.sh.template — non-SLURM (torchrun) counterpart of
+#                     scripts-frontier/frontier_xmoe_4d.slurm.template
 #
 # Rendered by autorun.sh / run_exp_training.sh (same placeholder sed-fill),
 # then executed with `bash` instead of submitted with `sbatch`.
@@ -12,7 +12,7 @@
 #   2. JOB_ID replaces $SLURM_JOB_ID. It MUST be all digits — utils/analyze_memory.py
 #      matches `job_(\d+)` and then globs `*<job_id>.o`, and utils/rerun_analysis.sh
 #      greps `job_[0-9]+`. A non-numeric id silently breaks the memory analysis.
-#   3. We EXPORT SLURM_NTASKS / SLURM_NNODES. ELMoE_launch.py reads its planner
+#   3. We EXPORT SLURM_NTASKS / SLURM_NNODES. ELM_PP_launch.py reads its planner
 #      topology from them; torchrun does not set them. This is why NO shared file
 #      needed modifying (see also #4).
 #   4. We must NEVER export SLURM_PROCID / SLURM_LOCALID. pretrain_gpt_deepspeed.py
@@ -55,7 +55,7 @@ COLLECT_PROFILING_CACHE="{{COLLECT_PROFILING_CACHE}}"
 ZERO_STAGE={{ZERO}}
 
 # Site config (see env.sh.example). HOSTFILE is only consulted when NODES > 1.
-ELMOE_ENV_FILE="${ELMOE_ENV_FILE:-$PWD/env.sh}"
+XMOE4D_ENV_FILE="${XMOE4D_ENV_FILE:-$PWD/env.sh}"
 HOSTFILE="${HOSTFILE:-$PWD/hostfile}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 
@@ -71,11 +71,11 @@ MASTER_PORT="${MASTER_PORT:-29500}"
 # Sourcing here is idempotent — conda activate on an already-active prefix just
 # re-runs its activate.d hooks — and node_launch.sh still sources it per node, which
 # is what matters for ssh'd hosts that share none of this shell's environment.
-if [ -f "${ELMOE_ENV_FILE}" ]; then
-    echo "[driver] sourcing ${ELMOE_ENV_FILE}"
-    source "${ELMOE_ENV_FILE}"
+if [ -f "${XMOE4D_ENV_FILE}" ]; then
+    echo "[driver] sourcing ${XMOE4D_ENV_FILE}"
+    source "${XMOE4D_ENV_FILE}"
 else
-    echo "[driver] WARNING: no ${ELMOE_ENV_FILE} — driver-side python/py-spy may be missing." >&2
+    echo "[driver] WARNING: no ${XMOE4D_ENV_FILE} — driver-side python/py-spy may be missing." >&2
     echo "[driver]          Copy env.sh.example to env.sh. Required for multi-node." >&2
 fi
 
@@ -285,14 +285,14 @@ fi
 
 if [[ "${MOE_TYPE}" == "X-MOE" ]]; then
     megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --no-bias-gelu-fusion"
-elif [[ "${MOE_TYPE}" == "ELMOE-3D" ]]; then
+elif [[ "${MOE_TYPE}" == "X-MOE-4D" ]]; then
     megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --no-bias-gelu-fusion"
 
-elif [[ "${MOE_TYPE}" == "ELMOE-GroupedGEMM-triton" ]]; then
+elif [[ "${MOE_TYPE}" == "X-MOE-4D-GroupedGEMM-triton" ]]; then
     megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-groupedGEMM --use-triton --no-bias-gelu-fusion"
     export USE_TRITON_GROUPGEMM="True"
 
-elif [[ "${MOE_TYPE}" == "ELMOE-GroupedGEMM-primus" ]]; then
+elif [[ "${MOE_TYPE}" == "X-MOE-4D-GroupedGEMM-primus" ]]; then
     export USE_AITER_GROUPGEMM=True
     megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --use-groupedGEMM --no-bias-gelu-fusion --disable-bias-linear"
 
@@ -358,7 +358,7 @@ fi
 # ================================================== Global Env Var Setup =============================================================
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-# ELMoE_launch.py reads its planner topology from these. torchrun does not set
+# ELM_PP_launch.py reads its planner topology from these. torchrun does not set
 # them, so we provide them explicitly. This is what lets the non-SLURM path work
 # WITHOUT modifying any shared file.
 # NEVER export SLURM_PROCID / SLURM_LOCALID here — see porting note #4 above.
@@ -388,7 +388,7 @@ export NCCL_DEBUG=INFO
 # earlier OOM), no NCCL_DEBUG (so no diagnostics when it failed), no NCCL timeouts,
 # and no CUDA_DEVICE_MAX_CONNECTIONS -- while appearing to be the same config.
 # Keeping ONE list here and generating the exports from it stops the two drifting.
-ELMOE_PROPAGATE_VARS=(
+XMOE4D_PROPAGATE_VARS=(
     CUDA_DEVICE_MAX_CONNECTIONS TRITON_PTXAS_NUM_WORKERS OMP_NUM_THREADS
     NCCL_TIMEOUT NCCL_TIMEOUT_MS TORCH_NCCL_BLOCKING_WAIT
     TORCH_NCCL_ASYNC_ERROR_HANDLING NCCL_ASYNC_ERROR_HANDLING
@@ -540,11 +540,11 @@ run_analysis() {
 #   ${JOB_DIR}/monitor/monitor.tsv — one row per (interval,rank) for grep/plot
 # Needs py-spy on PATH or ~/.local/bin/py-spy, on EVERY node (`pip install py-spy`), and
 # /proc/sys/kernel/yama/ptrace_scope = 0. Skipped with a warning when absent — never fatal.
-# Disable with:  ELMOE_MONITOR=0 bash autorun.sh
-ELMOE_MONITOR="${ELMOE_MONITOR:-1}"
+# Disable with:  XMOE4D_MONITOR=0 bash autorun.sh
+XMOE4D_MONITOR="${XMOE4D_MONITOR:-1}"
 MON_FAST="${MON_FAST:-60}"; MON_SLOW="${MON_SLOW:-180}"; MON_WINDOW="${MON_WINDOW:-300}"; MON_TRACE_FRAMES="${MON_TRACE_FRAMES:-20}"
 MONITOR_PID=""
-if [[ "${ELMOE_MONITOR}" == "1" ]]; then
+if [[ "${XMOE4D_MONITOR}" == "1" ]]; then
     if [[ ! -f "${DIR}/monitor_run.sh" ]]; then
         echo "[monitor] monitor_run.sh not found in ${DIR} — skipping."
     elif ! command -v py-spy >/dev/null 2>&1 && [ ! -x "${HOME}/.local/bin/py-spy" ]; then
@@ -560,7 +560,7 @@ fi
 # ================================================== END of Monitor Run ==================================
 
 
-# ================================================== Launch ELMoE Training (torchrun) =============================================================
+# ================================================== Launch X-MoE-4D Training (torchrun) =============================================================
 if [[ "$COLLECT_PROFILING_CACHE" == "true" ]]; then
     export to_profile="False"
     export profile_memory="False"
@@ -580,7 +580,7 @@ fi
 RANK_CMD="${JOB_DIR}/rank_cmd.sh"
 cat > "${RANK_CMD}" <<EOF
 #!/bin/bash
-exec python ../ELMoE_launch.py \\
+exec python ../ELM_PP_launch.py \\
     --run-planner ${planner_mode} \\
     --planner-profile-dir ./planner_profiling_cache \\
     --planner-memory-headroom-gb ${PLANNER_MEMORY_HEADROOM_GB} \\
@@ -608,13 +608,13 @@ NODE_LAUNCH="${JOB_DIR}/node_launch.sh"
     echo "cd \"${DIR}\" || exit 1"
     echo "# Driver globals, re-exported because ssh carries no environment."
     echo "# Emitted BEFORE env.sh so a site file can still override them."
-    for _v in "${ELMOE_PROPAGATE_VARS[@]}"; do
+    for _v in "${XMOE4D_PROPAGATE_VARS[@]}"; do
         [ -n "${!_v+x}" ] && printf 'export %s=%q\n' "$_v" "${!_v}"
     done
-    echo "if [ -f \"${ELMOE_ENV_FILE}\" ]; then source \"${ELMOE_ENV_FILE}\"; fi"
+    echo "if [ -f \"${XMOE4D_ENV_FILE}\" ]; then source \"${XMOE4D_ENV_FILE}\"; fi"
 } > "${NODE_LAUNCH}"
 cat >> "${NODE_LAUNCH}" <<EOF
-# Topology for ELMoE_launch.py's planner (torchrun does not set these).
+# Topology for ELM_PP_launch.py's planner (torchrun does not set these).
 export SLURM_NTASKS=${TOTAL_GPUS}
 export SLURM_NNODES=${NODES}
 export MASTER_ADDR="${MASTER_ADDR}"

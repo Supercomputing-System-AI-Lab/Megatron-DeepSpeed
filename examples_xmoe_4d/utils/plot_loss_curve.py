@@ -2,7 +2,7 @@
 """
 plot_loss_curve.py — training-loss comparison for `run_exp_training.sh loss_validate`.
 
-Reads the merged logs of the two loss_validate runs (ELMoE-3D and X-MoE), clips both
+Reads the merged logs of the two loss_validate runs (X-MoE-4D and X-MoE), clips both
 curves to the LEAST COMMON number of steps so the comparison is apples-to-apples, and
 writes a PNG (plus a CSV of the plotted data).
 
@@ -14,7 +14,7 @@ Auto-discovery: loss_validate jobs are the ones whose job dir contains an
 `a-xmoe-lv-*.o` file (RUN_TYPE="lv"). The newest such job is picked per framework.
 Override with explicit logs:
 
-    python3 ../utils/plot_loss_curve.py --elmoe <path/full_run.log> --xmoe <path/full_run.log>
+    python3 ../utils/plot_loss_curve.py --xmoe4d <path/full_run.log> --xmoe <path/full_run.log>
 """
 
 import argparse
@@ -29,7 +29,7 @@ import sys
 ITER_LOSS_RE = re.compile(r"iteration\s+(\d+)\s*/\s*\d+\s*\|.*?lm loss:\s*([0-9.eE+-]+)")
 
 FRAMEWORKS = {
-    "elmoe": {"tag": "ELMOE-3D", "label": "ELMoE", "color": "#1f77b4"},
+    "xmoe4d": {"tag": "X-MOE-4D", "label": "X-MoE-4D", "color": "#1f77b4"},
     "xmoe": {"tag": "X-MOE", "label": "X-MoE", "color": "#d62728"},
 }
 
@@ -110,6 +110,11 @@ def find_log(job_root, tag):
         # loss_validate runs are the ones with an a-xmoe-lv-*.o inside
         if not glob.glob(os.path.join(job_dir, "a-xmoe-lv-*.o")):
             continue
+        # Underscore-delimited on BOTH sides on purpose. The job dir is
+        # job_<id>_pp<PP>_ep<EP>_<MOE_TYPE>_ckpt_..., and the two tags are
+        # "X-MOE-4D" and "X-MOE" -- one a strict prefix of the other. The
+        # trailing "_" is what keeps _X-MOE_ from matching _X-MOE-4D_, so do
+        # not relax this to a bare `tag in basename`.
         if f"_{tag}_" not in os.path.basename(job_dir):
             continue
         for log in _candidate_logs(job_dir):
@@ -127,7 +132,7 @@ def find_log(job_root, tag):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--elmoe", help="path to the ELMoE run's full_run.log")
+    ap.add_argument("--xmoe4d", help="path to the X-MoE-4D run's full_run.log")
     ap.add_argument("--xmoe", help="path to the X-MoE run's full_run.log")
     ap.add_argument("--logs-dir", default="logs", help="where the job_* dirs live (default: logs)")
     ap.add_argument("--outdir", default="results", help="output folder (default: results)")
@@ -135,7 +140,7 @@ def main():
     args = ap.parse_args()
 
     # ---- locate the two logs ------------------------------------------------
-    paths = {"elmoe": args.elmoe, "xmoe": args.xmoe}
+    paths = {"xmoe4d": args.xmoe4d, "xmoe": args.xmoe}
     for key, meta in FRAMEWORKS.items():
         if paths[key] is None:
             paths[key] = find_log(args.logs_dir, meta["tag"])
@@ -159,7 +164,7 @@ def main():
         detail = ", ".join(FRAMEWORKS[k]["label"] + "=" + str(v) for k, v in gbs_seen.items())
         print("\nWARNING: the two runs used DIFFERENT global batch sizes (" + detail + ")."
               "\n         These curves are NOT comparable. Re-run both legs together, or pass"
-              "\n         --elmoe/--xmoe explicitly to select a matched pair.\n")
+              "\n         --xmoe4d/--xmoe explicitly to select a matched pair.\n")
 
     # ---- parse --------------------------------------------------------------
     series = {}
@@ -171,7 +176,7 @@ def main():
         print(f"{meta['label']:6s} steps parsed: {len(losses)} (max iteration {max(losses)})")
 
     # ---- clip to the LEAST COMMON steps -------------------------------------
-    common = sorted(set(series["elmoe"]) & set(series["xmoe"]))
+    common = sorted(set(series["xmoe4d"]) & set(series["xmoe"]))
     if not common:
         sys.exit("ERROR: the two runs share no common iteration numbers.")
     last = common[-1]
@@ -201,8 +206,8 @@ def main():
     # Read GBS from the log rather than hardcoding it: run_exp_training.sh takes
     # GBS_LOSS from the environment (GBS_LOSS=64 for a smoke run), so a literal 320
     # silently mislabels every non-default plot.
-    gbs = _read_gbs(paths["elmoe"]) or "?"   # paths[], not args[] -- args is None when auto-discovered
-    ax.set_title(f"Training loss: ELMoE vs X-MoE (10B, GBS={gbs}, {len(steps)} common steps)")
+    gbs = _read_gbs(paths["xmoe4d"]) or "?"   # paths[], not args[] -- args is None when auto-discovered
+    ax.set_title(f"Training loss: X-MoE-4D vs X-MoE (10B, GBS={gbs}, {len(steps)} common steps)")
     ax.legend()
     ax.grid(alpha=0.3, linewidth=0.5)
     ax.spines["top"].set_visible(False)
@@ -212,13 +217,13 @@ def main():
 
     with open(csv_path, "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["step", "elmoe_lm_loss", "xmoe_lm_loss"])
+        w.writerow(["step", "xmoe_4d_lm_loss", "xmoe_lm_loss"])
         for i in steps:
-            w.writerow([i, series["elmoe"][i], series["xmoe"][i]])
+            w.writerow([i, series["xmoe4d"][i], series["xmoe"][i]])
 
     # final losses at the common horizon — the number you actually quote
-    fe, fx = series["elmoe"][steps[-1]], series["xmoe"][steps[-1]]
-    print(f"\nfinal lm loss @ step {steps[-1]}:  ELMoE={fe:.6f}   X-MoE={fx:.6f}   (diff {fe - fx:+.6f})")
+    fe, fx = series["xmoe4d"][steps[-1]], series["xmoe"][steps[-1]]
+    print(f"\nfinal lm loss @ step {steps[-1]}:  X-MoE-4D={fe:.6f}   X-MoE={fx:.6f}   (diff {fe - fx:+.6f})")
     print(f"saved: {png}")
     print(f"saved: {csv_path}")
 

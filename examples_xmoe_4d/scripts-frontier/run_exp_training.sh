@@ -2,7 +2,7 @@
 ###############################################################################
 # run_exp_training.sh — one-command reviewer reproduction launcher
 #
-# A thin, self-contained dispatcher around frontier_elmoe.slurm.template.
+# A thin, self-contained dispatcher around frontier_xmoe_4d.slurm.template.
 # It bakes in ONE fixed topology (63B / 32 GPUs, PP4-EP8-DP1) — the same
 # configuration used in autorun_frontier.sh — and lifts the model variant and
 # planner choice out of the hand-edited PP_BATCH_MAP/EP_BATCH_MAP strings into
@@ -13,9 +13,9 @@
 #
 # ---------------------------------------------------------------------------
 # USAGE
-#   ./run_exp_training.sh training ELMoE [VARIANT] [PLANNER]
+#   ./run_exp_training.sh training X-MoE-4D [VARIANT] [PLANNER]
 #   ./run_exp_training.sh training <BASELINE>
-#   ./run_exp_training.sh profiling_cache ELMoE
+#   ./run_exp_training.sh profiling_cache X-MoE-4D
 #   ./run_exp_training.sh env_validate                    # env warmup, no args
 #   ./run_exp_training.sh main_results                    # launch all 5 headline runs
 #   ./run_exp_training.sh loss_validate [NGPUS]           # convergence check (2 runs; default 8 GPUs)
@@ -28,12 +28,12 @@
 #           50B  the same model 8 layers shallower — use this on 40GB-HBM GPUs
 #       env_validate and loss_validate are unaffected: both are fixed at 10B.
 #
-#   VARIANT  (ELMoE only, default SeqGEMM):
-#       SeqGEMM            -> ELMOE-3D                    (sequential GEMM)
-#       PrimusGroupGEMM    -> ELMOE-GroupedGEMM-primus    (CK grouped GEMM)
-#       TritonGroupGEMM    -> ELMOE-GroupedGEMM-triton    (Triton grouped GEMM)
+#   VARIANT  (X-MoE-4D only, default SeqGEMM):
+#       SeqGEMM            -> X-MOE-4D                       (sequential GEMM)
+#       PrimusGroupGEMM    -> X-MOE-4D-GroupedGEMM-primus    (CK grouped GEMM)
+#       TritonGroupGEMM    -> X-MOE-4D-GroupedGEMM-triton    (Triton grouped GEMM)
 #
-#   PLANNER  (ELMoE only, default yes_planner):
+#   PLANNER  (X-MoE-4D only, default yes_planner):
 #       yes_planner        -> dynamic-ckpt : uneven PP : Minimax planner
 #       no_planner         ->         ckpt :   even PP : no planner
 #
@@ -43,31 +43,31 @@
 #
 # EXAMPLES
 #   ./run_exp_training.sh env_validate                    # env warmup: X-MoE 10B, 1 node, 10 iters (~30 min)
-#   ./run_exp_training.sh main_results                    # 5 runs: ELMoE (yes/no planner) + X-MoE/DS-MoE/DS-Tutel
-#   ./run_exp_training.sh main_results --model-size 50B    # same 5 runs, 24-layer model (40GB HBM)
-#   ./run_exp_training.sh training ELMoE --model-size 50B  # single 50B run
-#   ./run_exp_training.sh loss_validate 16                # 2 runs: ELMoE-3D + X-MoE, 10B, GBS=320, 1000 steps, 32 GPUs
-#   ./run_exp_training.sh profiling_cache ELMoE            # build planner cache first
-#   ./run_exp_training.sh training ELMoE                   # SeqGEMM + yes_planner
-#   ./run_exp_training.sh training ELMoE PrimusGroupGEMM   # CK grouped GEMM + yes_planner
-#   ./run_exp_training.sh training ELMoE no_planner        # SeqGEMM + no_planner
-#   ./run_exp_training.sh training ELMoE TritonGroupGEMM no_planner
+#   ./run_exp_training.sh main_results                    # 5 runs: X-MoE-4D (yes/no planner) + X-MoE/DS-MoE/DS-Tutel
+#   ./run_exp_training.sh main_results --model-size 50B      # same 5 runs, 24-layer model (40GB HBM)
+#   ./run_exp_training.sh training X-MoE-4D --model-size 50B # single 50B run
+#   ./run_exp_training.sh loss_validate 16                # 2 runs: X-MoE-4D + X-MoE, 10B, GBS=320, 1000 steps, 32 GPUs
+#   ./run_exp_training.sh profiling_cache X-MoE-4D           # build planner cache first
+#   ./run_exp_training.sh training X-MoE-4D                  # SeqGEMM + yes_planner
+#   ./run_exp_training.sh training X-MoE-4D PrimusGroupGEMM  # CK grouped GEMM + yes_planner
+#   ./run_exp_training.sh training X-MoE-4D no_planner       # SeqGEMM + no_planner
+#   ./run_exp_training.sh training X-MoE-4D TritonGroupGEMM no_planner
 #   ./run_exp_training.sh training DS-MoE
 #
 # BATCH SIZE: all training runs share the global batch set by GLOBAL_BATCH below
 #       (1024). NBS (micro-batches per device per iteration) is derived per run as
-#       ceil(GLOBAL_BATCH / EP_PARALLEL_SIZE): ELMoE (EP=8) -> 128,
+#       ceil(GLOBAL_BATCH / EP_PARALLEL_SIZE): X-MoE-4D (EP=8) -> 128,
 #       baselines (EP=32) -> 32.
 #
-# NOTE: ELMoE with yes_planner requires the planner profiling cache. Run
-#       `./run_exp_training.sh profiling_cache ELMoE` once before the first
+# NOTE: X-MoE-4D with yes_planner requires the planner profiling cache. Run
+#       `./run_exp_training.sh profiling_cache X-MoE-4D` once before the first
 #       yes_planner training run. The cache key does not encode depth, so a cache
 #       built for either size is valid for both 50B and 63B.
 ###############################################################################
 
 set -euo pipefail
 
-TEMPLATE_FILE="frontier_elmoe.slurm.template"
+TEMPLATE_FILE="frontier_xmoe_4d.slurm.template"
 TEMP_DIR="temp_slurm"
 MP_SIZE=1
 PARTITION="batch"
@@ -91,12 +91,22 @@ WALLTIME_VALIDATE="0:30:00"       # env warmup run — long enough to compile ca
 WALLTIME_LOSS_VALIDATE="1:00:00"  # convergence check
 
 # loss_validate: fixed global batch across every GPU budget, so the loss curves
-# of ELMoE and X-MoE are directly comparable.
+# of X-MoE-4D and X-MoE are directly comparable.
 GBS_LOSS=320
 
 usage() {
     sed -n '15,65p' "$0" | sed 's/^#//; s/^ //'
     exit 1
+}
+
+# Accepted command-line spellings of the 4D model. Matched case-insensitively, so
+# X-MoE-4D / x-moe-4d / XMoE-4D / xmoe4d all work. Defined once so the `training`
+# and `profiling_cache` guards can never drift apart.
+is_xmoe_4d() {
+    case "${1,,}" in
+        x-moe-4d|xmoe-4d|xmoe4d) return 0 ;;
+        *)                       return 1 ;;
+    esac
 }
 
 if [ ! -f "$TEMPLATE_FILE" ]; then
@@ -107,7 +117,7 @@ mkdir -p "$TEMP_DIR"
 
 # ---------------------------------------------------------------------------
 # Pull --model-size out of the argument list wherever it appears, so the
-# positional grammar below (MODE, MODEL, then the ELMoE option words) is
+# positional grammar below (MODE, MODEL, then the X-MoE-4D option words) is
 # unchanged and every existing invocation keeps working.
 # ---------------------------------------------------------------------------
 MODEL_SIZE_SEL=""
@@ -131,9 +141,9 @@ esac
 # exported flag keeps the child processes from repeating it five times.
 warn_model_size() {
     [ "$MODEL_SIZE_SEL" = "63B" ] || return 0
-    [ "${ELMOE_SIZE_WARNED:-}" = "1" ] && return 0
+    [ "${XMOE4D_SIZE_WARNED:-}" = "1" ] && return 0
     echo "WARNING: 63B model is running. For systems with 40GB HBM per GPU, please use 50B model instead to avoid OOM." >&2
-    export ELMOE_SIZE_WARNED=1
+    export XMOE4D_SIZE_WARNED=1
 }
 
 MODE="${1:-}"
@@ -212,8 +222,8 @@ case "$MODE" in
 # TRAINING
 # ===========================================================================
 training)
-    if [[ "${MODEL,,}" == "elmoe" ]]; then
-        # ---- ELMoE : PP path (63B, 32 GPUs, PP4-EP8-DP1) -----------------
+    if is_xmoe_4d "$MODEL"; then
+        # ---- X-MoE-4D : PP path (63B, 32 GPUs, PP4-EP8-DP1) -----------------
         RUN_TYPE="pp"
         NODES=4; TOTAL_GPUS=32; PP_SIZE=4; EP_PARALLEL_SIZE=8
         # NBS = ceil(GLOBAL_BATCH / EP=8)
@@ -221,17 +231,17 @@ training)
         COLLECT_PROFILING_CACHE="false"
 
         # Defaults: SeqGEMM + yes_planner
-        MOE_TYPE="ELMOE-3D"
+        MOE_TYPE="X-MOE-4D"
         PLANNER_CHOICE="yes_planner"
 
         for arg in "$@"; do
             case "${arg,,}" in
-                seqgemm)         MOE_TYPE="ELMOE-3D" ;;
-                primusgroupgemm) MOE_TYPE="ELMOE-GroupedGEMM-primus" ;;
-                tritongroupgemm) MOE_TYPE="ELMOE-GroupedGEMM-triton" ;;
+                seqgemm)         MOE_TYPE="X-MOE-4D" ;;
+                primusgroupgemm) MOE_TYPE="X-MOE-4D-GroupedGEMM-primus" ;;
+                tritongroupgemm) MOE_TYPE="X-MOE-4D-GroupedGEMM-triton" ;;
                 yes_planner)     PLANNER_CHOICE="yes_planner" ;;
                 no_planner)      PLANNER_CHOICE="no_planner" ;;
-                *) echo "ERROR: unknown ELMoE option '$arg'" >&2; usage ;;
+                *) echo "ERROR: unknown X-MoE-4D option '$arg'" >&2; usage ;;
             esac
         done
 
@@ -244,7 +254,7 @@ training)
         fi
         derive_checkpoint_flags
 
-        echo "ELMoE training: MOE_TYPE=${MOE_TYPE}, planner=${PLANNER_CHOICE}"
+        echo "X-MoE-4D training: MOE_TYPE=${MOE_TYPE}, planner=${PLANNER_CHOICE}"
 
         # yes_planner needs the profiling cache — warn (don't launch) if missing.
         if [[ "$PLANNER_MODE" == "yes-planner" || "$PLANNER_MODE" == "yes-planner-membal" ]]; then
@@ -257,7 +267,7 @@ training)
                 echo "  [Planner] Cache found: $CACHE_FILENAME"
             else
                 echo "  [Planner] Cache MISSING: $CACHE_FILE" >&2
-                echo "  Run: ./run_exp_training.sh profiling_cache ELMoE   (once) first." >&2
+                echo "  Run: ./run_exp_training.sh profiling_cache X-MoE-4D   (once) first." >&2
                 exit 1
             fi
         fi
@@ -295,8 +305,8 @@ training)
 # PROFILING CACHE  (single-node, X-MoE base, MBS 1..10, 10-min walltime)
 # ===========================================================================
 profiling_cache)
-    if [[ "${MODEL,,}" != "elmoe" ]]; then
-        echo "ERROR: profiling_cache only supports ELMoE (X-MoE-based single-layer profiling)." >&2
+    if ! is_xmoe_4d "$MODEL"; then
+        echo "ERROR: profiling_cache only supports X-MoE-4D (X-MoE-based single-layer profiling)." >&2
         usage
     fi
 
@@ -336,8 +346,8 @@ env_validate)
 # ===========================================================================
 # MAIN_RESULTS  (launch the 5 headline comparison runs; each 63B / 32 GPUs)
 # ===========================================================================
-#   1. ELMoE SeqGEMM + yes_planner   (dynamic-ckpt, uneven PP, Minimax planner)
-#   2. ELMoE SeqGEMM + no_planner    (full activation checkpointing, even PP)
+#   1. X-MoE-4D SeqGEMM + yes_planner   (dynamic-ckpt, uneven PP, Minimax planner)
+#   2. X-MoE-4D SeqGEMM + no_planner    (full activation checkpointing, even PP)
 #   3. X-MoE     4. DS-MoE     5. DS-Tutel
 # DS-TED is intentionally NOT in this set: with TP=1 it is equivalent to DS-MoE.
 # It remains available standalone via `./run_exp_training.sh training DS-TED`.
@@ -349,8 +359,8 @@ main_results)
     echo " main_results: launching 5 headline runs (each ${MODEL_SIZE_SEL} / 32 GPUs)"
     echo "=================================================================="
     declare -a RUNS=(
-        "training ELMoE seqgemm yes_planner"
-        "training ELMoE seqgemm no_planner"
+        "training X-MoE-4D seqgemm yes_planner"
+        "training X-MoE-4D seqgemm no_planner"
         "training X-MoE"
         "training DS-MoE"
         "training DS-Tutel"
@@ -380,12 +390,12 @@ main_results)
 # directly comparable. The template computes GBS = nbs * mbs * (GPUS/PP/TP),
 # so DP = GPUS/PP and nbs = GBS / (mbs * DP).
 #
-#   (a) ELMoE-3D : mbs=4 always. 8 GPUs -> EP4-PP2; >8 GPUs -> EP8, PP = GPUS/8.
+#   (a) X-MoE-4D : mbs=4 always. 8 GPUs -> EP4-PP2; >8 GPUs -> EP8, PP = GPUS/8.
 #   (b) X-MoE    : PP=1, EP = all GPUs. mbs = largest of {4,2,1} that keeps nbs
 #                  integral  => mbs=4 at 8/16 GPUs, mbs=2 at 32 (4*32=128 does
 #                  not divide 320), etc.
 #
-#   GPUs | ELMoE                        | X-MoE
+#   GPUs | X-MoE-4D                        | X-MoE
 #      8 | EP4-PP2 mbs4 dp4  nbs20 =320 | EP8-PP1  mbs4 dp8  nbs10 =320
 #     16 | EP8-PP2 mbs4 dp8  nbs10 =320 | EP16-PP1 mbs4 dp16 nbs5  =320
 #     32 | EP8-PP4 mbs4 dp8  nbs10 =320 | EP32-PP1 mbs2 dp32 nbs5  =320
@@ -417,8 +427,8 @@ loss_validate)
     echo " loss_validate: ${NODES} node(s) / ${TOTAL_GPUS} GPUs | 10B | GBS=${GBS_LOSS} | ${TRAIN_ITERS} steps | ${WALLTIME_LOSS_VALIDATE}"
     echo "=================================================================="
 
-    # ---- (a) ELMoE-3D ------------------------------------------------------
-    MOE_TYPE="ELMOE-3D"; BS=4
+    # ---- (a) X-MoE-4D ------------------------------------------------------
+    MOE_TYPE="X-MOE-4D"; BS=4
     if (( TOTAL_GPUS == 8 )); then
         EP_PARALLEL_SIZE=4; PP_SIZE=2
     else
@@ -426,10 +436,10 @@ loss_validate)
     fi
     LV_DP=$(( TOTAL_GPUS / PP_SIZE / MP_SIZE ))
     if (( GBS_LOSS % (BS * LV_DP) != 0 )); then
-        echo "ERROR: ELMoE — GBS=${GBS_LOSS} not divisible by mbs(${BS}) * DP(${LV_DP})." >&2; exit 1
+        echo "ERROR: X-MoE-4D — GBS=${GBS_LOSS} not divisible by mbs(${BS}) * DP(${LV_DP})." >&2; exit 1
     fi
     NBS=$(( GBS_LOSS / (BS * LV_DP) ))
-    echo "  (a) ELMoE-3D  EP${EP_PARALLEL_SIZE}-PP${PP_SIZE}  mbs=${BS} nbs=${NBS} dp=${LV_DP}  -> GBS=$(( BS * NBS * LV_DP ))"
+    echo "  (a) X-MoE-4D  EP${EP_PARALLEL_SIZE}-PP${PP_SIZE}  mbs=${BS} nbs=${NBS} dp=${LV_DP}  -> GBS=$(( BS * NBS * LV_DP ))"
     JOB_NAME="${RUN_TYPE}_n${NODES}g${TOTAL_GPUS}_ep${EP_PARALLEL_SIZE}_pp${PP_SIZE}_mbs${BS}_nbs${NBS}_i${TRAIN_ITERS}_${MOE_TYPE}"
     render_and_submit "$JOB_NAME" "$WALLTIME_LOSS_VALIDATE"
 

@@ -30,15 +30,15 @@ examples_xmoe/data/*.idx
 examples_xmoe/data/*.jsonl
 examples_xmoe/data/index-cache/
 
-examples_elmoe/data/FORGE/*
-examples_elmoe/data/llama31_tokenizer
-examples_elmoe/data/index-cache
-examples_elmoe/data/*.txt
-examples_elmoe/data/*.json
-examples_elmoe/data/*.bin
-examples_elmoe/data/*.idx
-examples_elmoe/data/*.jsonl
-examples_elmoe/data/index-cache/
+examples_xmoe_4d/data/FORGE/*
+examples_xmoe_4d/data/llama31_tokenizer
+examples_xmoe_4d/data/index-cache
+examples_xmoe_4d/data/*.txt
+examples_xmoe_4d/data/*.json
+examples_xmoe_4d/data/*.bin
+examples_xmoe_4d/data/*.idx
+examples_xmoe_4d/data/*.jsonl
+examples_xmoe_4d/data/index-cache/
 
 examples_xmoe/scripts-frontier/logs/*
 examples_xmoe/scripts-frontier/logs_old/*
@@ -46,15 +46,17 @@ examples_xmoe/scripts-frontier/output/*
 examples_xmoe/scripts-frontier/planner_profiling_cache_disable_P2P_dec_13/*
 examples_xmoe/scripts-frontier/temp_ds_json/*
 examples_xmoe/scripts-frontier/temp_slurm/*
-examples_xmoe/scripts-frontier/results/*# auto-generated json files and logs   
+# auto-generated json files and logs
+examples_xmoe/scripts-frontier/results/*
 
-examples_elmoe/scripts-frontier/logs/*
-examples_elmoe/scripts-frontier/logs_old/*
-examples_elmoe/scripts-frontier/output/*
-examples_elmoe/scripts-frontier/planner_profiling_cache_disable_P2P_dec_13/*
-examples_elmoe/scripts-frontier/temp_ds_json/*
-examples_elmoe/scripts-frontier/temp_slurm/*
-examples_elmoe/scripts-frontier/results/*# auto-generated json files and logs   
+examples_xmoe_4d/scripts-frontier/logs/*
+examples_xmoe_4d/scripts-frontier/logs_old/*
+examples_xmoe_4d/scripts-frontier/output/*
+examples_xmoe_4d/scripts-frontier/planner_profiling_cache_disable_P2P_dec_13/*
+examples_xmoe_4d/scripts-frontier/temp_ds_json/*
+examples_xmoe_4d/scripts-frontier/temp_slurm/*
+# auto-generated json files and logs
+examples_xmoe_4d/scripts-frontier/results/*
 
 # *.json
 *.log
@@ -65,9 +67,14 @@ megatron/fused_kernels/*_hip.h
 megatron/fused_kernels/*_hip.hip
 
 # Checkpoints
-examples_elmoe/scripts-frontier/checkpoint
+examples_xmoe_4d/scripts-frontier/checkpoint
 
 # Run artifacts 
-examples_elmoe/scripts-frontier/output
-examples_elmoe/scripts-frontier/temp_slurm
-examples_elmoe/scripts-frontier/temp_ds_json
+examples_xmoe_4d/scripts/logs
+examples_xmoe_4d/scripts/temp_sh
+examples_xmoe_4d/scripts/results
+examples_xmoe_4d/scripts/planner_profiling_cache
+examples_xmoe_4d/scripts-frontier/planner_profiling_cache
+examples_xmoe_4d/scripts-frontier/output
+examples_xmoe_4d/scripts-frontier/temp_slurm
+examples_xmoe_4d/scripts-frontier/temp_ds_json

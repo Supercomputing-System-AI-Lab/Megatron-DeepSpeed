@@ -180,8 +180,8 @@ def apply_planner_result(result, remaining_argv):
     os.environ['UNEVEN_PP'] = 'True'
     os.environ['DYNAMIC_CHECKPOINT'] = 'True'
     
-    print (f'[ELMoE_launch.py] {partition_str=}')
-    print (f'[ELMoE_launch.py] {ckpt_str=}')
+    print (f'[ELM_PP_launch.py] {partition_str=}')
+    print (f'[ELM_PP_launch.py] {ckpt_str=}')
     
     # Override --micro-batch-size and --global-batch-size in argv
     remaining_argv = _override_arg(remaining_argv, '--micro-batch-size', 
@@ -200,8 +200,8 @@ def apply_planner_result(result, remaining_argv):
     # Pass as CLI args (nargs='+' expects separate entries)
     remaining_argv.extend(['--uneven-pp-partition'] + partition_list)
     remaining_argv.extend(['--dynamic-checkpoint-partition'] + ckpt_list) 
-    print (f'[ELMoE_launch.py] {partition_list=}')
-    print (f'[ELMoE_launch.py] {ckpt_list=}')
+    print (f'[ELM_PP_launch.py] {partition_list=}')
+    print (f'[ELM_PP_launch.py] {ckpt_list=}')
     
     if rank == 0:
         print("=" * 70)
@@ -351,7 +351,7 @@ def _sync_ds_config_with_planner(remaining_argv, result, _wait_timeout_s=120.0):
     config_path = _find_arg_value(remaining_argv, '--deepspeed_config')
     if config_path is None or not os.path.exists(config_path):
         if rank == 0:
-            print(f"[ELMoE_launch.py] WARNING: --deepspeed_config not usable "
+            print(f"[ELM_PP_launch.py] WARNING: --deepspeed_config not usable "
                   f"({config_path!r}); skipping ds-config mbs sync.", flush=True)
         return
 
@@ -364,7 +364,7 @@ def _sync_ds_config_with_planner(remaining_argv, result, _wait_timeout_s=120.0):
         if marker is not None:
             with open(marker, 'w', encoding='utf-8') as f:
                 f.write("ready\n")
-        print(f"[ELMoE_launch.py] ds-config synced: "
+        print(f"[ELM_PP_launch.py] ds-config synced: "
               f"train_micro_batch_size_per_gpu={cfg['train_micro_batch_size_per_gpu']} "
               f"train_batch_size={cfg['train_batch_size']} "
               f"(gradient_accumulation_steps re-derived by DeepSpeed)", flush=True)
@@ -377,7 +377,7 @@ def _sync_ds_config_with_planner(remaining_argv, result, _wait_timeout_s=120.0):
             waited += 0.05
             if waited >= _wait_timeout_s:
                 raise RuntimeError(
-                    f"[ELMoE_launch.py] rank {rank}: timed out after "
+                    f"[ELM_PP_launch.py] rank {rank}: timed out after "
                     f"{_wait_timeout_s}s waiting for ds-config marker {marker}")
     # If no shared job id, the atomic rename plus the dist-init collective that runs
     # before deepspeed.initialize() reads the file provides cross-rank visibility.
@@ -396,24 +396,24 @@ def main():
             planner_args.planner_mode = 'optimize-membal'
 
         if rank == 0:
-            print(f"[ELMoE_launch.py] Running planner (mode={planner_args.planner_mode})...")
+            print(f"[ELM_PP_launch.py] Running planner (mode={planner_args.planner_mode})...")
 
         result = run_planner(remaining_argv, planner_args)
         remaining_argv = apply_planner_result(result, remaining_argv)
 
         if rank == 0:
-            print(f"[ELMoE_launch.py] Planner done. Handing off to pretrain_gpt_deepspeed.py")
+            print(f"[ELM_PP_launch.py] Planner done. Handing off to pretrain_gpt_deepspeed.py")
     else:
         if rank == 0:
-            print("[ELMoE_launch.py] Planner disabled. Passing through to pretrain_gpt_deepspeed.py")
+            print("[ELM_PP_launch.py] Planner disabled. Passing through to pretrain_gpt_deepspeed.py")
 
     sys.argv = [sys.argv[0]] + remaining_argv
     
     if rank == 0:
         # Debug: confirm micro-batch-size is in argv
-        print(f"[ELMoE_launch.py] sys.argv has {len(sys.argv)} entries")
+        print(f"[ELM_PP_launch.py] sys.argv has {len(sys.argv)} entries")
         mbs_check = '--micro-batch-size' in sys.argv
-        print(f"[ELMoE_launch.py] --micro-batch-size in argv: {mbs_check}")
+        print(f"[ELM_PP_launch.py] --micro-batch-size in argv: {mbs_check}")
 
     runpy.run_module('pretrain_gpt_deepspeed', run_name='__main__')
 

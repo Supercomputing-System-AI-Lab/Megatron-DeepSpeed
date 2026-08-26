@@ -454,7 +454,7 @@ def extract_job_id(log_file_path):
 
 def compare_predicted_vs_actual_memory(args):
     """Compare the planner's PREDICTED per-stage memory (the 'Stage Memory (GB): [...]' line that
-    ELMoE_launch.py prints) against the ACTUAL profiled per-rank 'max reserved' memory.
+    ELM_PP_launch.py prints) against the ACTUAL profiled per-rank 'max reserved' memory.
 
     Layout: the run samples one rank per node (stride = gpus_per_node). For a model replica
     (DP) >= 2, each pipeline stage spans nodes_per_stage = nodes // pp adjacent nodes
