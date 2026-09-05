@@ -1,7 +1,8 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """GPT-2 model."""
-import time 
+import re
+import time
 import torch
 
 from megatron import get_args
@@ -18,22 +19,273 @@ from megatron.model import LayerNorm
 from .language_model import EmbeddingPipe
 from .transformer import ParallelTransformerLayerPipe, LMHeadPipe
 from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
+from deepspeed.moe.utils import is_moe_param
 
 try:
     from apex.normalization import MixedFusedRMSNorm
 except ImportError:
     MixedFusedRMSNorm = None
 
-try:         
+try:
     from deepspeed.checkpoint import (
         VOCABULARY_PARAMETER_PATTERNS,
         PIPELINE_REPLICATED_PARAMETER_PATTERNS,
         TP_REPLICATED_PARAMETER_PATTERNS,
         PARAMETER_WITH_ROW_PARALLELISM_PATTERNS,
+        PARAMETER_WITH_2_SUB_PARAMS_CAT_DIM_0,
     )
-    DS_UNIVERSAL_CHECKPOINT_INFO = True 
+    DS_UNIVERSAL_CHECKPOINT_INFO = True
 except ImportError:
-    DS_UNIVERSAL_CHECKPOINT_INFO = False  
+    DS_UNIVERSAL_CHECKPOINT_INFO = False
+def _tp_pattern(param_name):
+    """Regex matching `param_name`, with numeric path components left open.
+
+    Layer and expert indices become \\d+, so one pattern covers every layer and every
+    expert. For expert parallelism that is required rather than merely tidy: a rank names
+    its experts 0..num_local_experts-1, while the universal checkpoint names them by global
+    id, so a pattern built literally from this rank's names would miss most of them.
+
+    Every other component is escaped. The hand-written lists this replaces used bare '.',
+    which is a regex wildcard, so they matched more loosely than they read.
+    """
+    return r'\.'.join(r'\d+' if part.isdigit() else re.escape(part) for part in param_name.split('.'))
+
+
+def _unique(patterns):
+    """Order-preserving de-duplication -- collapsing indices makes many names share one pattern."""
+    return list(dict.fromkeys(patterns))
+
+
+def _merge_ucp_info_dicts(dicts):
+    """Per-key ordered union of universal_checkpoint_info dicts gathered across the
+    pipeline group. Deterministic on every rank: keys and entries appear in
+    pipeline-rank order, deduplicated. Values are lists of patterns; a key present
+    on any stage is present in the union."""
+    merged = dict()
+    for d in dicts:
+        if not d:
+            continue
+        for key, patterns in d.items():
+            merged.setdefault(key, [])
+            merged[key].extend(p for p in patterns if p not in merged[key])
+    return merged
+
+
+# ---------------------------------------------------------------------------------------
+# GPTModel <-> GPTModelPipe parameter-name correspondence.
+#
+# The two classes build the same network and name it differently: GPTModel by module path
+# (language_model.encoder.layers.K...), GPTModelPipe by GLOBAL SPEC INDEX (pipe/module.py
+# names each layer str(local_idx + _local_start)) -- spec 0 is the fp32->16 cast, 1 the
+# embedding, 2..num_layers+1 the transformer layers, then the final norm, then the LM head.
+# The correspondence is a bijection parameterised only by num_layers and whether the
+# embedding is tied.
+#
+# It is used ONLY to look up atoms a counterpart model already wrote (see
+# universal_checkpoint_name_aliases and DeepSpeed's ZeROOptimizer._hp_param_folder).
+# Nothing is ever renamed on disk: a universal checkpoint always carries the names the
+# model that wrote it used.
+# ---------------------------------------------------------------------------------------
+def pipe_name_candidates(name, num_layers):
+    """Pipe-class names for a GPTModel parameter name (may be empty)."""
+    out = []
+    m = re.match(r'language_model\.encoder\.layers\.(\d+)\.(.+)', name)
+    if m:
+        out.append(f'{int(m.group(1)) + 2}.{m.group(2)}')
+    # The embedding's pipe spelling depends on whether the model TIES embeddings:
+    # untied builds LayerSpec(EmbeddingPipe) at spec 1, tied builds TiedLayerSpec('embed').
+    # Offer only the spelling that matches THIS model's configuration. Offering both would
+    # let a tied reader silently satisfy its single embedding from an untied checkpoint
+    # while that checkpoint's separate LM-head atom goes unread -- a wrong load with no
+    # error, instead of the missing-atom failure that correctly reports the mismatch.
+    tied = not getattr(get_args(), 'untie_embeddings_and_output_weights', False)
+    for kind in ('word_embeddings', 'position_embeddings'):
+        m = re.match(r'language_model\.embedding\.' + kind + r'\.(.+)', name)
+        if m:
+            out.append(f'tied_modules.embed.{kind}.{m.group(1)}' if tied
+                       else f'1.{kind}.{m.group(1)}')
+    m = re.match(r'language_model\.encoder\.final_(?:layernorm|norm|rmsnorm)\.(.+)', name)
+    if m:
+        out.append(f'{num_layers + 2}.{m.group(1)}')
+    m = re.match(r'language_model\.output_layer\.(.+)', name)
+    if m:
+        out.append(f'{num_layers + 3}.lm_head.{m.group(1)}')
+    return out
+
+
+def gptmodel_name_candidates(name, num_layers):
+    """GPTModel names for a pipe-class parameter name (the inverse; may be empty)."""
+    out = []
+    m = re.match(r'tied_modules\.embed\.(word_embeddings|position_embeddings)\.(.+)', name)
+    if m:
+        return [f'language_model.embedding.{m.group(1)}.{m.group(2)}']
+    m = re.match(r'(\d+)\.(.+)', name)
+    if not m:
+        return out
+    idx, sub = int(m.group(1)), m.group(2)
+    if idx == 1 and sub.startswith(('word_embeddings.', 'position_embeddings.')):
+        out.append(f'language_model.embedding.{sub}')
+    elif 2 <= idx < num_layers + 2:
+        out.append(f'language_model.encoder.layers.{idx - 2}.{sub}')
+    elif idx == num_layers + 2:
+        # the final norm; both spellings exist across configurations
+        out.append(f'language_model.encoder.final_layernorm.{sub}')
+        out.append(f'language_model.encoder.final_norm.{sub}')
+    elif idx == num_layers + 3 and sub.startswith('lm_head.'):
+        out.append('language_model.output_layer.' + sub[len('lm_head.'):])
+    return out
+
+
+def _name_aliases(param_names, to_candidates):
+    """{canonical_name: [alternative, ...]} for every parameter this model owns."""
+    num_layers = get_args().num_layers
+    aliases = {}
+    for name in param_names.values():
+        alts = to_candidates(name, num_layers)
+        if alts:
+            aliases[name] = alts
+    return aliases
+
+
+def _tp_partition_dim(submodule, param, param_name):
+    """Dimension along which tensor parallelism splits `param`, or None if it is replicated.
+
+    Read from the layer's TYPE first. Megatron also stamps `tensor_model_parallel` and
+    `partition_dim` on each parameter, but only from inside _initialize_affine_weight_{gpu,cpu}
+    (layers.py:89-116), which run under `config.perform_initialization`. A run started with
+    --no-initialization therefore has no stamps at all, and a classifier that trusted them
+    would call the entire model replicated -- producing a checkpoint that cannot be loaded at
+    any other tensor-parallel degree, silently. The layer type is always present.
+
+    The annotations are still consulted for layers this function does not know, so a custom
+    parallel layer is classified correctly whenever it was initialised normally.
+    """
+    if isinstance(submodule, tensor_parallel.RowParallelLinear):
+        # The weight is split along its input dimension; the bias is full-size on every rank
+        # and added once after the reduction.
+        return 1 if param_name == 'weight' else None
+    if isinstance(submodule, (tensor_parallel.ColumnParallelLinear, tensor_parallel.VocabParallelEmbedding)):
+        # Both the weight and the bias are split along the output dimension.
+        return 0
+    if getattr(param, 'tensor_model_parallel', False):
+        dim = getattr(param, 'partition_dim', -1)
+        return dim if dim in (0, 1) else None
+    return None
+
+
+def _classify_tp_parameters(module):
+    """Group every parameter by how tensor parallelism splits it.
+
+    Returns (replicated, row_parallel, column_split) as lists of parameter NAMES.
+
+    Derived from the model rather than restated as hand-written regexes, so the lists stay
+    true for whatever this model is configured as -- GQA, SwiGLU, RMSNorm, MoE -- and stay
+    true when it changes. A stale list does not fail loudly: a row-parallel weight that
+    matches no pattern falls through to the converter's default and is concatenated along
+    dim 0, which gives the right numel and the wrong tensor.
+    """
+    args = get_args()
+
+    # Whether experts are sharded across tensor-parallel ranks is a configuration choice.
+    # It must not be read from the per-layer `is_expert_without_slicing` flag, because
+    # ColumnParallelLinear sets that from the configuration (layers.py:513) while
+    # RowParallelLinear sets it from the topology (`moe and world_size == 1`, layers.py:706).
+    # At TP=1 with expert tensor parallelism enabled the two disagree, and every expert's
+    # dense_4h_to_h.weight would be recorded replicated -- so a later TP=4 load would chunk a
+    # row-parallel weight along dim 0.
+    experts_are_replicated = not getattr(args, 'enable_expert_tensor_parallelism', False)
+
+    # A sequence-parallel position embedding shards the SEQUENCE across tensor-parallel ranks
+    # (layers.py:216-233) using a plain torch.nn.Embedding, so its weight carries no
+    # tensor-parallel annotations while every rank holds a different slice. Calling it
+    # replicated would make the converter assert the ranks' slices are equal, which they are
+    # not; the correct merge is the default concatenation along dim 0, so declare nothing.
+    # Matched by prefix because the weight belongs to the wrapped child, not to the wrapper.
+    sequence_sharded = tuple(
+        f'{name}.' for name, sub in module.named_modules()
+        if isinstance(sub, tensor_parallel.layers.SequenceParallelPositionEmbedding))
+
+    replicated, row_parallel, column_split = [], [], []
+    for module_name, submodule in module.named_modules():
+        if sequence_sharded and module_name.startswith(sequence_sharded):
+            for param_name, _ in submodule.named_parameters(recurse=False):
+                column_split.append(f'{module_name}.{param_name}')
+            continue
+        for param_name, param in submodule.named_parameters(recurse=False):
+            name = f'{module_name}.{param_name}' if module_name else param_name
+            if experts_are_replicated and is_moe_param(param):
+                replicated.append(name)
+                continue
+            dim = _tp_partition_dim(submodule, param, param_name)
+            if dim is None:
+                replicated.append(name)
+            elif dim == 1:
+                row_parallel.append(name)
+            else:
+                column_split.append(name)
+    return replicated, row_parallel, column_split
+
+
+def _gated_mlp_names(module, column_split):
+    """Names of SwiGLU's fused gate/up projection, restricted to the ones TP actually splits.
+
+    An annotation says HOW a tensor is sharded; it cannot say WHAT the tensor contains, and
+    SwiGLU's fusion is a content property. ParallelMLP projects to twice the FFN width and
+    its activation does `torch.chunk(x, 2, dim=-1)`, so each tensor-parallel rank's slice is
+    [gate_r ; up_r]. Concatenating the ranks therefore yields
+    [gate_0, up_0, gate_1, up_1, ...] where the unsharded layout is [gate_all ; up_all] --
+    the same numel and shape, a different tensor, and no error anywhere. The converter's
+    two-sub-parameter rule splits each rank's slice before concatenating, which is the only
+    way to recover the original order.
+
+    Restricted to `column_split` because a parameter that TP does not split has nothing to
+    reorder, and declaring a pattern that the replicated rule claims first would leave it
+    unmatched under --strict.
+    """
+    split = set(column_split)
+    names = []
+    for module_name, submodule in module.named_modules():
+        # ParallelMLP sets .swiglu from args.swiglu, which is also what doubles the
+        # projection width (arguments.py sets gated_linear_unit from the same flag).
+        if not getattr(submodule, 'swiglu', False):
+            continue
+        projection = getattr(submodule, 'dense_h_to_4h', None)
+        if projection is None:
+            continue
+        for param_name, _ in projection.named_parameters(recurse=False):
+            name = f'{module_name}.dense_h_to_4h.{param_name}'
+            if name in split:
+                names.append(name)
+    return names
+
+
+def _vocabulary_names(module):
+    """Names of parameters whose first dimension is the padded vocabulary.
+
+    The vocabulary is padded up to a multiple of
+    make_vocab_size_divisible_by * tensor_model_parallel_size, so the padded size is a
+    property of the topology rather than of the model: the same 50257-token tokenizer gives
+    50304 rows at TP=1 and 50688 at TP=4. Naming these makes the converter store them
+    unpadded and each run pad back to its own size on load. Without it a TP=1 checkpoint
+    cannot be loaded at TP=4 at all -- the numel check in load_hp_checkpoint_state fails.
+
+    Two modules can carry that dimension: the input embedding, and -- when the output weight
+    is not tied to it -- the output projection. The output projection is an ordinary
+    ColumnParallelLinear, so it cannot be recognised by type; it is recognised by having the
+    padded vocabulary as its output width, which is the property that actually matters.
+    """
+    args = get_args()
+    names = []
+    for module_name, submodule in module.named_modules():
+        if isinstance(submodule, tensor_parallel.VocabParallelEmbedding):
+            names.append(f'{module_name}.weight')
+        elif (args.untie_embeddings_and_output_weights
+              and isinstance(submodule, tensor_parallel.ColumnParallelLinear)
+              and getattr(submodule, 'output_size', None) == args.padded_vocab_size):
+            names.append(f'{module_name}.weight')
+    return names
+
+
 
 def _seq_chunked_cross_entropy(lm_output, labels_sb, logit_weights,
                                  parallel_output, chunk):
@@ -309,32 +561,40 @@ class GPTModel(MegatronModule):
             state_dict["moe_state_dict"] = moe_state_dict
         self.language_model.load_state_dict(state_dict, strict=strict)
 
+    def universal_checkpoint_name_aliases(self, param_names):
+        """Alternative names under which this model's parameters may already be stored in a
+        universal checkpoint (see DeepSpeed ZeROOptimizer._hp_param_folder). Consulted ONLY
+        when the atom directory for the parameter's own name is absent; nothing on disk is
+        ever renamed. This model names parameters by module path; a checkpoint written by
+        GPTModelPipe names them by global spec index.
+        """
+        return _name_aliases(param_names, pipe_name_candidates)
+
     def universal_checkpoint_info(self):
+        # GPTModel is the non-pipeline model, so one rank holds every layer and the lists
+        # derived here are complete. (GPTModelPipe declares its own: its parameter names are
+        # stage-local, so no single stage can enumerate the model.)
+        #
+        # The previous lists here were GPTModelPipe's, copied verbatim -- they name
+        # `tied_modules.embed.*` and stage-local `\d+.*`, neither of which exists in this
+        # model's namespace, so every pattern matched nothing. At TP=1 that is invisible,
+        # because with one slice every merge branch is the identity. At TP>1 it is not: the
+        # embedding is stored padded to the writer's tensor-parallel degree and the load
+        # fails its numel check, and row-parallel weights would be merged along the wrong
+        # dimension.
         info = dict()
         if DS_UNIVERSAL_CHECKPOINT_INFO:
-            # Vocabulary parameters (embeddings) that require special handling due to padding.
-            info[VOCABULARY_PARAMETER_PATTERNS] = [
-                r"tied_modules.embed.word_embeddings.weight"
-            ]
-
-            # Parameter slices that should be averaged not concatenated.
-            info[TP_REPLICATED_PARAMETER_PATTERNS] = [
-                r"tied_modules.embed.position_embeddings.weight",
-                r"\d+.input_layernorm.weight",
-                r"\d+.input_layernorm.bias",
-                r"\d+.post_attention_layernorm.weight",
-                r"\d+.post_attention_layernorm.bias",
-                r"\d+.self_attention.dense.bias",
-                r"\d+.mlp.dense_4h_to_h.bias",
-                r"\d+.weight",
-                r"\d+.bias",
-            ]
-
-            # Parameter that are sliced on the row dimension
-            info[PARAMETER_WITH_ROW_PARALLELISM_PATTERNS] = [
-                r"\d+.mlp.dense_4h_to_h.weight",
-                r"\d+.self_attention.dense.weight",
-            ]
+            replicated, row_parallel, column_split = _classify_tp_parameters(self)
+            info[TP_REPLICATED_PARAMETER_PATTERNS] = _unique(map(_tp_pattern, replicated))
+            info[PARAMETER_WITH_ROW_PARALLELISM_PATTERNS] = _unique(map(_tp_pattern, row_parallel))
+            # column_split is deliberately not declared: concatenating along dim 0 is what
+            # the converter already does for a parameter no rule claims.
+            gated = _gated_mlp_names(self, column_split)
+            if gated:
+                info[PARAMETER_WITH_2_SUB_PARAMS_CAT_DIM_0] = _unique(map(_tp_pattern, gated))
+            info[VOCABULARY_PARAMETER_PATTERNS] = _unique(map(_tp_pattern, _vocabulary_names(self)))
+            # ORIGINAL_VOCAB_SIZE is not set here: megatron/checkpointing.py already records it
+            # from the tokenizer before merging this dict in.
 
         return info
 
@@ -594,15 +854,29 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                                             embedding_weights_in_fp32=args.embedding_weights_in_fp32,
                                             tied_weight_attr='word_embeddings_weight'))
 
+        # Per-layer expert counts, mirroring the non-pipe ParallelTransformer
+        # (transformer.py:2106-2126): a single-entry num_experts list is replicated
+        # per expert-interval slot, then the expert_interval and first-k-dense rules
+        # (1-indexed) pick each layer's count. Without this the pipe model builds
+        # MoE at EVERY layer and cannot load any checkpoint trained with dense lead
+        # layers (DeepSeek first_k_dense_replace) -- their atoms are a dense MLP.
+        _experts_per_slot = list(args.num_experts)
+        if len(_experts_per_slot) == 1:
+            _experts_per_slot = _experts_per_slot * (args.num_layers // args.expert_interval)
         for layer_idx in range(args.num_layers):
+            layer_num = layer_idx + 1
+            if layer_num % args.expert_interval == 0:
+                n_e = _experts_per_slot[(layer_num - 1) // args.expert_interval]
+            else:
+                n_e = 1
+            if layer_num <= args.first_k_dense_replace:
+                n_e = 1
             self.specs.append(
                 LayerSpec(ParallelTransformerLayerPipe,
                     config,
                     layer_number=layer_idx,
-                    self_attn_mask_type=AttnMaskType.causal, 
-                    
-                    # Zixian: 2025-09-26: Adding num_experts=args.num_experts in PP model init
-                    num_experts=args.num_experts[0], 
+                    self_attn_mask_type=AttnMaskType.causal,
+                    num_experts=n_e,
                     ))
 
         # Final layernorm after transformer layers
@@ -688,36 +962,49 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                          custom_checkpoint_partition=checkpoint_partition,
                          )
 
+    def universal_checkpoint_name_aliases(self, param_names):
+        """Alternative names under which this model's parameters may already be stored in a
+        universal checkpoint (see DeepSpeed ZeROOptimizer._hp_param_folder). Consulted ONLY
+        when the atom directory for the parameter's own name is absent; nothing on disk is
+        ever renamed. This model names parameters by global spec index; a checkpoint written
+        by GPTModel names them by module path.
+        """
+        return _name_aliases(param_names, gptmodel_name_candidates)
+
+    # Derived exactly like GPTModel above, with one pipeline-specific twist: a stage
+    # only holds its own layers (with --first-k-dense-replace stage 0 may hold no MoE
+    # layer at all, and only the last stage holds the LM head), so no single stage's
+    # module tree yields the complete lists. _tp_pattern collapses layer and expert
+    # indices to \d+, which makes a stage's contribution depend only on which layer
+    # FLAVORS it holds -- so an all_gather union over the pipeline group is complete
+    # and identical on every rank. The record each rank saves in its mp_rank file is
+    # therefore whole-model, and the converter (which reads one file) needs nothing.
+    #
+    # CONSTRAINT: this method performs a collective over the pipeline group. Its only
+    # caller is megatron/checkpointing.py's save path, which runs on all ranks inside
+    # the collective save. Do not call it from a rank subset.
     def universal_checkpoint_info(self):
         info = dict()
-        if DS_UNIVERSAL_CHECKPOINT_INFO:
-            # Vocabulary parameters (embeddings) that require special handling due to padding.
-            info[VOCABULARY_PARAMETER_PATTERNS] = [
-                r"tied_modules.embed.word_embeddings.weight"
-            ]
-
-            # Replicated (shared) parameters on the pipeline dimension
-            info[PIPELINE_REPLICATED_PARAMETER_PATTERNS] = [
-                r"tied_modules.embed.word_embeddings.weight",
-                r"tied_modules.embed.position_embeddings.weight"
-            ]
-
-            # Parameter slices that should be averaged not concatenated.
-            info[TP_REPLICATED_PARAMETER_PATTERNS] = [
-                r"tied_modules.embed.position_embeddings.weight",
-                r"\d+.input_layernorm.weight",
-                r"\d+.input_layernorm.bias",
-                r"\d+.post_attention_layernorm.weight",
-                r"\d+.post_attention_layernorm.bias",
-                r"\d+.self_attention.dense.bias",
-                r"\d+.mlp.dense_4h_to_h.bias",
-                r"\d+.weight",
-                r"\d+.bias",
-            ]
-
-            # Parameter that are sliced on the row dimension
-            info[PARAMETER_WITH_ROW_PARALLELISM_PATTERNS] = [
-                r"\d+.mlp.dense_4h_to_h.weight",
-                r"\d+.self_attention.dense.weight",
-            ]
+        if not DS_UNIVERSAL_CHECKPOINT_INFO:
+            return info
+        replicated, row_parallel, column_split = _classify_tp_parameters(self)
+        info[TP_REPLICATED_PARAMETER_PATTERNS] = _unique(map(_tp_pattern, replicated))
+        info[PARAMETER_WITH_ROW_PARALLELISM_PATTERNS] = _unique(map(_tp_pattern, row_parallel))
+        # column_split is deliberately not declared: cat(dim=0) is the converter's default.
+        gated = _gated_mlp_names(self, column_split)
+        if gated:
+            info[PARAMETER_WITH_2_SUB_PARAMS_CAT_DIM_0] = _unique(map(_tp_pattern, gated))
+        info[VOCABULARY_PARAMETER_PATTERNS] = _unique(map(_tp_pattern, _vocabulary_names(self)))
+        # Tied embeddings live on the first and last stage under one name; the
+        # converter dedupes them by skipping pp_index > 0 for these patterns. With
+        # --untie-embeddings-and-output-weights there are no tied modules and the
+        # key is (correctly) absent.
+        tied = [name for name, _ in self.named_parameters() if name.startswith('tied_modules.')]
+        if tied:
+            info[PIPELINE_REPLICATED_PARAMETER_PATTERNS] = _unique(map(_tp_pattern, tied))
+        if torch.distributed.is_initialized() and mpu.get_pipeline_model_parallel_world_size() > 1:
+            gathered = [None] * mpu.get_pipeline_model_parallel_world_size()
+            torch.distributed.all_gather_object(gathered, info,
+                                                group=mpu.get_pipeline_model_parallel_group())
+            info = _merge_ucp_info_dicts(gathered)
         return info

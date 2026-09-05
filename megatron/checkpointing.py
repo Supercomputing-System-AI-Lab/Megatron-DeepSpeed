@@ -538,6 +538,14 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     args = get_args()
     load_dir = getattr(args, load_arg)
 
+    if args.universal_checkpoint and args.finetune:
+        # --finetune forces load_module_only / no optimizer / no LR scheduler and resets the
+        # iteration to 0, which defeats the point of resuming from a universal checkpoint.
+        # (It is still the right flag for a weights-only bootstrap such as an HF import.)
+        print_rank_0('WARNING: --universal-checkpoint combined with --finetune: optimizer state and '
+                     'the LR schedule will NOT be restored and iteration resets to 0. '
+                     'Drop --finetune to resume properly.')
+
     if args.deepspeed:
         if args.finetune:
             loaded_dir, state_dict = model[0].load_checkpoint(load_dir,
@@ -780,4 +788,18 @@ def _universal_checkpoint_info(model):
     info[ORIGINAL_VOCAB_SIZE] = tokenizer.vocab_size
     info[PADDED_VOCAB_SIZE] = args.padded_vocab_size
     info.update(model[0].universal_checkpoint_info())
+
+    # Descriptive MoE topology. Informational / for external tooling: the record the converter
+    # actually consumes is MOE_UCP_INFO, written by the engine (deepspeed/runtime/engine.py::_get_moe_ucp_info),
+    # because only the engine can query the expert-parallel process groups.
+    num_experts = getattr(args, 'num_experts', None)
+    if num_experts and max(num_experts) > 1:
+        info['moe'] = {
+            'num_experts': num_experts,
+            'expert_parallel_size': getattr(args, 'moe_expert_parallel_size', None),
+            'num_shared_experts': getattr(args, 'num_shared_experts', None),
+            'first_k_dense_replace': getattr(args, 'first_k_dense_replace', None),
+            'expert_interval': getattr(args, 'expert_interval', None),
+            'enable_expert_tensor_parallelism': getattr(args, 'enable_expert_tensor_parallelism', False),
+        }
     return info
