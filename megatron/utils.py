@@ -36,8 +36,8 @@ def update_rotary_pos_emb(seq_length):
     # partial rotary embeddings, which is better than full rotary
     # Wang and Komatsuzaki et al
     # https://github.com/kingoflolz/mesh-transformer-jax/
-    rotary_pos_emb = RotaryEmbedding(rotary_dim)(seq_length).to(
-        get_accelerator().current_device_name())
+    rotary_pos_emb = RotaryEmbedding(rotary_dim, base=args.rotary_base)(
+        seq_length).to(get_accelerator().current_device_name())
     args.rotary_pos_emb = rotary_pos_emb
 
 

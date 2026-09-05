@@ -636,6 +636,10 @@ def _add_network_size_args(parser):
                        help='Use rotary positional embeddings or not')
     group.add_argument('--rotary-percent', type=float, default=1.0,
                        help='Percent of rotary dimension to use, default 100%')
+    group.add_argument('--rotary-base', type=float, default=10000,
+                       help='RoPE theta. Raise for context extension '
+                       '(e.g. 100000 for 4096->8192 CPT); default matches '
+                       'the pretrained model.')
     group.add_argument('--no-position-embedding',
                        action='store_false',
                        help='Disable position embedding.',
