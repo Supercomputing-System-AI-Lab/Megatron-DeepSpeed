@@ -423,6 +423,50 @@ def validate_args(args):
     # FlashAttention
     args.use_flash_attn = args.use_flash_attn_v1 or args.use_flash_attn_triton or args.use_flash_attn_v2
 
+    # Intra-document attention. Implemented as document-boundary cu_seqlens on
+    # the flash-attn varlen call, so every constraint below is about keeping the
+    # boundaries and the token stream in agreement.
+    if args.intra_document_attention:
+        assert args.use_flash_attn_v2, \
+            '--intra-document-attention needs the flash-attn varlen entry point; ' \
+            'pass --use-flash-attn-v2 (the v1 flash_attn_unpadded_func import is ' \
+            'broken in this environment, so v1 is not accepted)'
+        assert not args.use_flash_attn_triton, \
+            '--intra-document-attention is incompatible with --use-flash-attn-triton ' \
+            '(the triton wrapper takes no cu_seqlens argument)'
+        assert not args.reset_attention_mask, \
+            '--intra-document-attention and --reset-attention-mask are two ' \
+            'implementations of the same thing; pick one'
+        # PP support (2026-08-22): cu_seqlens now travels the pipe as a
+        # FIXED-SHAPE (-1)-padded int32 activation (b*s+1 slots), built in
+        # get_batch_pipe, revived through EmbeddingPipe's activation-mask
+        # branch, and sentinel-stripped in FlashSelfAttention. The former
+        # PP==1 asserts are therefore lifted.
+        # answer_loss_only is safe here ONLY with a packed SFT corpus (no pad
+        # tokens). With the legacy PADDED corpus, pad id equals the EOD id, so
+        # every pad token becomes a length-1 attention segment (~3500/sample).
+        if args.answer_loss_only and args.rank == 0:
+            print('WARNING: --intra-document-attention + --answer-loss-only assumes '
+                  'a PACKED SFT corpus. With a padded corpus (pad id == EOD id) '
+                  'every pad token becomes a length-1 attention segment.',
+                  flush=True)
+        # Megatron's TP-companion --sequence-parallel composes correctly:
+        # get_batch builds cu_seqlens from the FULL tokens BEFORE the per-TP-
+        # rank sequence slice (pretrain_gpt_deepspeed.py builds the boundaries
+        # at :453 and slices at :470), and under companion SP attention runs
+        # on the gathered full sequence, so full-sequence boundaries are
+        # exactly right. DeepSpeed-Ulysses stays excluded: its get_batch
+        # slicing shards the attention input itself (labels/mask included),
+        # so the boundaries would be partial.
+        assert args.ds_sequence_parallel_size == 1, \
+            '--intra-document-attention does not support DeepSpeed-Ulysses ' \
+            'sequence parallelism: get_batch slices tokens per SP rank, so ' \
+            'the boundaries would be partial'
+        assert not args.curriculum_learning_legacy and \
+            not args.data_efficiency_curriculum_learning, \
+            '--intra-document-attention is incompatible with curriculum learning ' \
+            '(both truncate or reshape tokens after the boundaries are built)'
+
     # AML
     if args.aml_data_download_path is not None:
         data_paths = []
@@ -1328,6 +1372,16 @@ def _add_data_args(parser):
     group.add_argument('--reset-attention-mask', action='store_true',
                        help='Reset self attention maske after '
                        'end-of-document token.')
+    group.add_argument('--intra-document-attention', action='store_true',
+                       help='Prevent tokens from attending across document '
+                       'boundaries within a packed training sequence. Unlike '
+                       '--reset-attention-mask (which builds a dense O(seq^2) '
+                       'block-diagonal mask and forces the non-flash kernel), '
+                       'this expresses the same block-diagonal structure through '
+                       'the flash-attention varlen entry point: cu_seqlens is cut '
+                       'at every EOD instead of once per sample. Requires '
+                       '--use-flash-attn-v2 (or v1). Costs no extra memory and '
+                       'strictly less compute than full causal attention.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
     group.add_argument('--answer-loss-only', action='store_true',

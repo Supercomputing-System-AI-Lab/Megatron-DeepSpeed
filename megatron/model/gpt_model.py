@@ -257,6 +257,33 @@ class GPTModel(MegatronModule):
 
         return info
     
+_PIPE_DBG = {'strip': 0, 'loss': 0, 'rider': 0}
+
+def _pipe_dbg(site, obj):
+    if _PIPE_DBG[site] >= 3:
+        return
+    _PIPE_DBG[site] += 1
+    def desc(o):
+        if torch.is_tensor(o):
+            return f'Tensor{tuple(o.shape)}:{o.dtype}'
+        if isinstance(o, (tuple, list)):
+            return type(o).__name__ + '(' + ', '.join(desc(e) for e in o) + ')'
+        return type(o).__name__
+    import torch.distributed as dist
+    rk = dist.get_rank() if dist.is_initialized() else -1
+    print(f'[pipe-dbg rank{rk}] {site} <- {desc(obj)}', flush=True)
+
+
+def _strip_pipe_extras(inputs):
+    _pipe_dbg('strip', inputs)
+    if torch.is_tensor(inputs):
+        return inputs
+    if isinstance(inputs, tuple):
+        if len(inputs) == 2:          # (hidden, cu_seqlens)
+            return inputs[0]
+    return inputs
+
+
 def CrossEntropy(output, labels):
     labels, loss_mask = labels[0], labels[1]
 
@@ -337,6 +364,10 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                     ))
 
         # Final layernorm after transformer layers
+        if args.intra_document_attention or getattr(args, 'pipe_moe_aux_loss', False):
+            # The norm/head specs take a single tensor; drop the activation
+            # mask (and stash the aux-loss rider) first.
+            self.specs.append(_strip_pipe_extras)
         if args.normalization == 'layernorm':
             self.specs.append(LayerSpec(LayerNorm,
                           args.hidden_size,

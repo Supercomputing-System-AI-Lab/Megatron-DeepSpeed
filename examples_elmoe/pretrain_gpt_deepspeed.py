@@ -219,19 +219,25 @@ def model_provider(pre_process=True, post_process=True):
             # Predompute the attention mask and store it in args. This avoids having to
             # pipeline it as an activation during training. The mask is constant, and thus
             # we can reuse it.
-            attention_mask = torch.tril(torch.ones(
-                (1, args.seq_length, args.seq_length), device=get_accelerator().current_device_name())).view(
-                    1, 1, args.seq_length, args.seq_length)
-
-            # Convert attention mask to binary:
-            attention_mask = (attention_mask < 0.5)
-            if args.fp16:
-                attention_mask = attention_mask.half()
-            elif args.bf16:
-                attention_mask = attention_mask.bfloat16()
+            # Under --intra-document-attention the mask is PER-BATCH (document
+            # boundaries), so no constant is precomputed; the absence of
+            # args.attn_mask routes EmbeddingPipe to forward the activation.
+            if args.intra_document_attention:
+                attention_mask = None
+            else:
+                attention_mask = torch.tril(torch.ones(
+                    (1, args.seq_length, args.seq_length), device=get_accelerator().current_device_name())).view(
+                        1, 1, args.seq_length, args.seq_length)
+                # Convert attention mask to binary:
+                attention_mask = (attention_mask < 0.5)
+                if args.fp16:
+                    attention_mask = attention_mask.half()
+                elif args.bf16:
+                    attention_mask = attention_mask.bfloat16()
 
             # Attention mask must be bool.
-            args.attn_mask = attention_mask.to(torch.bool)
+            if attention_mask is not None:
+                args.attn_mask = attention_mask.to(torch.bool)
 
             # For prertaining, since sequence length is fixed, cache rotary embedding in args, to avoid communicating around
             if args.use_rotary_position_embeddings:
@@ -259,6 +265,66 @@ def model_provider(pre_process=True, post_process=True):
     '''
     see_memory_usage(f"After Building Model", force=True)
     return model
+
+
+
+
+def build_intra_doc_cu_seqlens(tokens, eod_token, pad_to_full=False):
+    """Document-boundary cu_seqlens for the flash-attn varlen kernel.
+
+    Returned in the FLATTENED (b*s) index space, because that is what
+    FlashSelfAttention.forward works in after its 'b s ... -> (b s) ...'
+    rearrange (megatron/model/transformer.py). Today that function builds
+    arange(0, (b+1)*s, step=s) -- one segment per sample, so every token in a
+    sample can see every earlier token in it, across document boundaries. This
+    returns the same thing subdivided at each document end, so a token can only
+    attend within its own document.
+
+    Segment ends are:
+      * every EOD position + 1   (the EOD terminates its document, and belongs
+                                  to it -- matching megatron/utils.py's dense
+                                  reset_attention_mask, which zeroes
+                                  [i+1:, :i+1] for an EOD at i)
+      * every sample boundary k*s (samples are independent by construction)
+
+    A sample that starts mid-document is fine: its leading fragment simply
+    becomes the first segment. Duplicate ends (an EOD landing exactly on a
+    sample boundary) are removed by the sort-unique, which also guarantees
+    strictly increasing offsets and therefore no zero-length segments.
+    """
+    b, s = tokens.shape
+    device = tokens.device
+    eod_ends = (tokens.reshape(-1) == eod_token).nonzero(as_tuple=True)[0] + 1
+    sample_ends = torch.arange(1, b + 1, device=device, dtype=eod_ends.dtype) * s
+    # unique() sorts and dedups; one device->host sync per micro-batch, not per layer.
+    ends = torch.unique(torch.cat([eod_ends, sample_ends]))
+    cu_seqlens = torch.cat([torch.zeros(1, device=device, dtype=ends.dtype), ends])
+    cu_seqlens = cu_seqlens.to(torch.int32)
+    # Hard invariants, not tidiness: the varlen kernel's output buffer is
+    # uninitialized (torch::empty_like) and only rows covered by a segment are
+    # written, so full coverage of [0, b*s] keeps garbage out of the residual
+    # stream. unique() above already synced, so these asserts add no new stall.
+    assert int(cu_seqlens[0]) == 0 and int(cu_seqlens[-1]) == b * s, \
+        f'cu_seqlens must cover [0, {b*s}], got [{int(cu_seqlens[0])}, {int(cu_seqlens[-1])}]'
+    assert bool((cu_seqlens[1:] > cu_seqlens[:-1]).all()), 'cu_seqlens not strictly increasing'
+    # A wrong EOD id fails SILENTLY (no EOD found -> stock arange -> no masking
+    # while the flag reports on), so surface the segment count where a human
+    # will see it: n_segments == b on every batch means the id never matched.
+    calls = getattr(build_intra_doc_cu_seqlens, '_calls', 0)
+    if calls < 8:
+        build_intra_doc_cu_seqlens._calls = calls + 1
+        n_seg = cu_seqlens.numel() - 1
+        print_rank_0(f'[intra-doc] micro-batch {calls}: {n_seg} segments over b={b} '
+                     f'samples (mean seg len {b*s/n_seg:.0f} tokens)')
+    if pad_to_full:
+        # Pipeline transport: inter-stage recv buffers are shape-frozen after
+        # the first microbatch, so the tensor must have a FIXED length. b*s+1
+        # is the true worst case (every token an EOD); sentinel -1 can never
+        # collide with a valid offset. Stripped in FlashSelfAttention.
+        padded = torch.full((b * s + 1,), -1, dtype=torch.int32, device=device)
+        padded[:cu_seqlens.numel()] = cu_seqlens
+        return padded
+    return cu_seqlens
 
 
 def get_batch(data_iterator):
@@ -305,6 +371,15 @@ def get_batch(data_iterator):
             print_rank_0('[sft] loss_mask density {:.4f}'.format(
                 loss_mask.sum().item() / loss_mask.numel()))
 
+    if args.intra_document_attention:
+        # The flash path leaves attention_mask None (skip_mask above). Reuse that
+        # slot for the document boundaries: it already reaches every layer via
+        # GPTModel -> ParallelTransformer -> ParallelAttention, and it is passed
+        # into _checkpointed_forward, so it survives activation recompute. A
+        # module-level global would not.
+        assert attention_mask is None, \
+            '--intra-document-attention expects the flash path, which builds no dense mask'
+        attention_mask = build_intra_doc_cu_seqlens(tokens, tokenizer.eod)
 
     # For DS's sequence parallel
     seq_parallel_world_size = mpu.get_sequence_parallel_world_size()
@@ -375,12 +450,28 @@ def get_batch_pipe(data):
         if args.answer_loss_only else None
 
     # Get the masks and postition ids.
-    attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
-        tokens,
-        tokenizer.eod,
-        args.reset_position_ids,
-        args.reset_attention_mask,
-        args.eod_mask_loss)
+    if args.intra_document_attention:
+        # Document boundaries ride the attention_mask slot as a FIXED-SHAPE
+        # padded int32 tensor (see build_intra_doc_cu_seqlens pad_to_full).
+        # Do NOT call get_ltor_masks_and_position_ids here: it always builds a
+        # dense fp32 (1,s,s) mask on the host (4.3 GB per microbatch at 32k)
+        # that this path would immediately discard. Build the two cheap
+        # outputs directly, matching its semantics with eod_mask_loss False.
+        assert not args.eod_mask_loss, 'intra-doc pipe path assumes eod_mask_loss off'
+        attention_mask = build_intra_doc_cu_seqlens(
+            tokens, tokenizer.eod, pad_to_full=True)
+        loss_mask = torch.ones(tokens.shape, dtype=torch.float,
+                               device=tokens.device)
+        position_ids = torch.arange(tokens.shape[1], dtype=torch.long,
+                                    device=tokens.device)
+        position_ids = position_ids.unsqueeze(0).expand_as(tokens).contiguous()
+    else:
+        attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
+            tokens,
+            tokenizer.eod,
+            args.reset_position_ids,
+            args.reset_attention_mask,
+            args.eod_mask_loss)
     if answer_mask is not None:
         # Multiply, don't replace: composes with whatever the line above built,
         # and must precede the curriculum truncation below.

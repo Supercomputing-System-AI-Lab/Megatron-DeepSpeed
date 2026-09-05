@@ -354,7 +354,10 @@ class EmbeddingPipe(Embedding):
         if hasattr(self._args, 'attn_mask'):
             return embeddings
         else:
-            assert False
+            # Reachable only under --intra-document-attention (model_provider
+            # skips the constant-mask precompute): the padded int32 cu_seqlens
+            # travels the pipe as an activation. Optionally start the MoE
+            # auxiliary-loss rider (a differentiable fp32 scalar).
             return embeddings, attention_mask
 
 

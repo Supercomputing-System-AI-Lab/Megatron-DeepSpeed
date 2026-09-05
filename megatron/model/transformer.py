@@ -433,11 +433,17 @@ class FlashSelfAttention(torch.nn.Module):
         args = get_args()
         self.flash_attn_func = flash_attn_varlen_func if args.use_flash_attn_v2 else flash_attn_unpadded_func
 
-    def forward(self, q, k, v):
+    def forward(self, q, k, v, cu_seqlens=None):
         """Implements the multihead softmax attention.
         Arguments
         ---------
             q, k, v: The tensor containing the query, key, and value. (B, S, H, D)
+            cu_seqlens: optional int32 segment offsets in the FLATTENED (B*S)
+                index space, for --intra-document-attention. When None (the
+                default, and every pre-existing caller) this falls back to the
+                uniform one-segment-per-sample arange below, so behaviour is
+                unchanged. When supplied, segments are cut at document (EOD)
+                boundaries and the kernel skips cross-document tiles entirely.
         """
 
         assert all((i.dtype in [torch.float16, torch.bfloat16] for i in (q,k,v)))
@@ -453,10 +459,29 @@ class FlashSelfAttention(torch.nn.Module):
         if get_accelerator().device_name() == 'cuda':
             # goes for cuda device
             q, k, v = [rearrange(x, 'b s ... -> (b s) ...') for x in [q, k, v]]
-            cu_seqlens_q = torch.arange(0, (batch_size + 1) * seqlen_q, step=seqlen_q, dtype=torch.int32,
-                                        device=q.device)
+            if cu_seqlens is not None:
+                # --intra-document-attention: already built in this flattened
+                # (b s) index space by get_batch, cut at every EOD.
+                # Pipeline transport pads to fixed shape with sentinel -1
+                # (see build_intra_doc_cu_seqlens); strip it here. Boolean
+                # indexing preserves order and is a no-op on unpadded input.
+                cu_seqlens = cu_seqlens[cu_seqlens >= 0]
+                cu_seqlens_q = cu_seqlens
+                # Pass the true max segment length, not the full sample length:
+                # the CK varlen backward allocates a float32 workspace of
+                # n_segments x heads x max_seqlen_q, so leaving this at s
+                # over-allocates it by the segment count, and the launch grid
+                # over-provisions the same way.
+                seqlen_q = seqlen_k = int((cu_seqlens[1:] - cu_seqlens[:-1]).max())
+            else:
+                cu_seqlens_q = torch.arange(0, (batch_size + 1) * seqlen_q, step=seqlen_q, dtype=torch.int32,
+                                            device=q.device)
         else:
             # goes for other device
+            assert cu_seqlens is None, (
+                '--intra-document-attention requires the flash-attn varlen entry point, but '
+                'this accelerator takes the flash_attn_builder path, which accepts no '
+                'cu_seqlens argument. Intra-document masking cannot be expressed here.')
             q, k, v = [rearrange(x, 'b s h d -> b h s d').contiguous() for x in [q, k, v]]
 
         if self.training:
@@ -469,8 +494,17 @@ class FlashSelfAttention(torch.nn.Module):
             # turn off FA causal mask after first inference autoregressive iteration
             # only on first autoregressive step q,k,v have same seqlen
             is_causal = seqlen_q == seqlen_k
-            cu_seqlens_k = torch.arange(0, (batch_size + 1) * seqlen_k, step=seqlen_k, dtype=torch.int32,
-                        device=q.device) if get_accelerator().device_name() == 'cuda' else None
+            if cu_seqlens is not None:
+                # Validation forwards run in eval mode but are still full-sequence,
+                # so the document segments remain valid. Incremental decode (which
+                # would break them) never reaches here: ParallelAttention only
+                # forwards cu_seqlens when inference_params is None.
+                assert seqlen_q == seqlen_k, \
+                    'intra-document cu_seqlens is only valid for full-sequence forwards'
+                cu_seqlens_k = cu_seqlens_q
+            else:
+                cu_seqlens_k = torch.arange(0, (batch_size + 1) * seqlen_k, step=seqlen_k, dtype=torch.int32,
+                            device=q.device) if get_accelerator().device_name() == 'cuda' else None
             self.dropout_p = 0
 
         output = self.flash_attn_func(
@@ -545,6 +579,10 @@ class ParallelAttention(MegatronModule):
             and attention_type == AttnType.self_attn \
             and self.attn_mask_type == AttnMaskType.causal
         self.use_flash_attn_triton = args.use_flash_attn_triton
+        # Document-boundary cu_seqlens ride the attention_mask argument slot
+        # (which is None on the flash path) down to FlashSelfAttention.
+        self.intra_document_attention = getattr(args, 'intra_document_attention', False) \
+            and self.use_flash_attn and not self.use_flash_attn_triton
         if self.use_flash_attn:
             global flash_attn_builder
             try:
@@ -559,6 +597,12 @@ class ParallelAttention(MegatronModule):
                 assert flash_attn_varlen_func != None, "Cannot import FlashAttention v2 "
             if args.use_flash_attn_triton:
                 assert flash_attn_func != None, "Cannot import FlashAttention triton "
+            if self.intra_document_attention:
+                assert get_accelerator().device_name() == 'cuda', (
+                    '--intra-document-attention needs the flash_attn varlen kernel, which '
+                    'is only reachable on the cuda/ROCm accelerator branch of '
+                    'FlashSelfAttention.forward; this build would use flash_attn_builder, '
+                    'which takes no cu_seqlens.')
 
             assert attention_type == AttnType.self_attn, ('FlashAttention code path only supports '
                                                           'self-attention for now')
@@ -901,11 +945,17 @@ class ParallelAttention(MegatronModule):
                             query_layer, key_layer, value_layer = [rearrange(x, 's b ... -> b s ...').contiguous()
                                     for x in (query_layer, key_layer, value_layer)]
 
+                        # Empty when the flag is off, so the call below is
+                        # byte-for-byte the pre-existing one.
+                        _fa_kwargs = {}
+                        if self.intra_document_attention and inference_params is None:
+                            _fa_kwargs['cu_seqlens'] = attention_mask
+
                         if self.sequence_parallel:
-                            context_layer = self.core_attention_flash(query_layer, key_layer, value_layer)
+                            context_layer = self.core_attention_flash(query_layer, key_layer, value_layer, **_fa_kwargs)
                         else:
                             with tensor_parallel.get_cuda_rng_tracker().fork():
-                                context_layer = self.core_attention_flash(query_layer, key_layer, value_layer)
+                                context_layer = self.core_attention_flash(query_layer, key_layer, value_layer, **_fa_kwargs)
 
                         if not self.use_flash_attn_triton:
                             context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()
