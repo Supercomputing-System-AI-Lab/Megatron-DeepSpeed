@@ -485,6 +485,31 @@ def get_batch_pipe(data):
             labels = labels[:, :args.curriculum_seqlen].contiguous()
         loss_mask = loss_mask[:, :args.curriculum_seqlen].contiguous()
 
+    # For DS's sequence parallel
+    seq_parallel_world_size = mpu.get_sequence_parallel_world_size()
+    seq_parallel_world_rank = mpu.get_sequence_parallel_rank()
+
+    # For Megatron's sequence parallel
+    if args.sequence_parallel:
+        seq_parallel_world_size = mpu.get_tensor_model_parallel_world_size()
+        seq_parallel_world_rank = mpu.get_tensor_model_parallel_rank()
+    seq_length = tokens.size(1)
+
+    assert seq_length % seq_parallel_world_size == 0
+    sub_seq_length = seq_length // seq_parallel_world_size
+    sub_seq_start = seq_parallel_world_rank * sub_seq_length
+    sub_seq_end = (seq_parallel_world_rank + 1) * sub_seq_length
+
+    tokens = tokens[:, sub_seq_start:sub_seq_end]
+    position_ids = position_ids[:, sub_seq_start:sub_seq_end]
+    # For DS's sequence parallel
+    if mpu.get_sequence_parallel_world_size() > 1:
+        labels = labels[:, sub_seq_start:sub_seq_end]
+        # loss_mask stays FULL-length: vocab_sequence_parallel_cross_entropy
+        # all-gathers the per-shard losses back to [S, B] (cross_entropy.py:28)
+        # and its backward re-slices to this rank's window, so loss_func sees
+        # full-sequence losses and needs the full-sequence mask.
+
     return (tokens, position_ids, attention_mask), (labels, loss_mask)
 
 

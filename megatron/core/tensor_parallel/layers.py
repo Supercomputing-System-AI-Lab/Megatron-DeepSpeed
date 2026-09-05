@@ -164,6 +164,11 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.sparse = False
         self._weight = None
         self.tensor_model_parallel_size = get_tensor_model_parallel_world_size()
+        # Companion sequence parallelism (Korthikanti-style, TP group):
+        # forward must compensate for the per-TP-rank sequence shards it is
+        # fed -- see the sequence_parallel branch in forward.
+        self.sequence_parallel = config.sequence_parallel and \
+            self.tensor_model_parallel_size > 1
         # Divide the weight matrix along the vocaburaly dimension.
         self.vocab_start_index, self.vocab_end_index = \
             VocabUtility.vocab_range_from_global_vocab_size(
@@ -191,6 +196,25 @@ class VocabParallelEmbedding(torch.nn.Module):
                                               partition_dim=0, stride=1)
 
     def forward(self, input_):
+        if self.sequence_parallel:
+            # Under companion sequence parallelism the input is this TP
+            # rank's [b, s/TP] sequence shard of the tokens (get_batch
+            # slices tokens per TP rank), so the TP all-reduce below would
+            # sum lookups of DIFFERENT tokens. Gather the token shards
+            # across the TP group (rank order == sequence order), run the
+            # unchanged masked local-vocab lookup on the full sequence, and
+            # reduce-scatter the seq-major output -- each rank leaves with
+            # its own sequence shard, fully reduced. The reduce-scatter's
+            # backward all-gathers the output grads, so the embedding
+            # weight grad is complete per vocab partition with no extra
+            # synchronization. Tokens carry no grad; a plain all_gather
+            # suffices.
+            shards = [torch.empty_like(input_)
+                      for _ in range(self.tensor_model_parallel_size)]
+            torch.distributed.all_gather(
+                shards, input_.contiguous(),
+                group=get_tensor_model_parallel_group())
+            input_ = torch.cat(shards, dim=1)          # [b, s/TP] -> [b, s]
         if self.tensor_model_parallel_size > 1:
             # Build the mask.
             input_mask = (input_ < self.vocab_start_index) | \
@@ -208,8 +232,16 @@ class VocabParallelEmbedding(torch.nn.Module):
         # Mask the output embedding.
         if self.tensor_model_parallel_size > 1:
             output_parallel[input_mask, :] = 0.0
-        # Reduce across all the model parallel GPUs.
-        output = reduce_from_tensor_model_parallel_region(output_parallel)
+        if self.sequence_parallel:
+            # The sequence mappings shard dim 0: go [b, s, h] -> [s, b, h],
+            # reduce-scatter to this rank's [s/TP, b, h] shard, and return
+            # to the caller's [b, s/TP, h] layout.
+            output = reduce_scatter_to_sequence_parallel_region(
+                output_parallel.transpose(0, 1).contiguous())
+            output = output.transpose(0, 1).contiguous()
+        else:
+            # Reduce across all the model parallel GPUs.
+            output = reduce_from_tensor_model_parallel_region(output_parallel)
         return output
 
 
@@ -709,6 +741,13 @@ class RowParallelLinear(torch.nn.Module):
         self.config = config
         self.gradient_accumulation_fusion = config.gradient_accumulation_fusion
         self.sequence_parallel = config.sequence_parallel
+        if self.sequence_parallel and self.is_expert_without_slicing:
+            # Expert linears run on this rank's dispatched expert tokens, not
+            # on TP sequence shards; the sequence-parallel reduce-scatter in
+            # forward would combine unrelated per-rank tensors of unequal
+            # shapes across the TP group. Mirror ColumnParallelLinear's
+            # self-disable (its world_size==1 branch fires for experts).
+            self.sequence_parallel = False
         if self.sequence_parallel and not self.input_is_parallel:
             raise RuntimeError("To enable `sequence_parallel`, `input_is_parallel` must be `True`")
 

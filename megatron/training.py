@@ -335,6 +335,35 @@ def setup_teacher_model(args, model_provider):
 
     return teacher_model
 
+def mark_norm_params_for_sequence_parallel(model_modules):
+    """Tag replicated norm weights with the `sequence_parallel` attribute.
+
+    Under companion sequence parallelism the norm activations are sharded
+    seq-wise across the TP group, so every TP replica of a norm weight
+    accumulates gradient over a disjoint sequence shard and the gradients
+    must be summed across the TP group. Megatron's fused LayerNorm sets the
+    attribute on its own weights (fused_layer_norm.py), but the apex
+    MixedFusedRMSNorm modules built under `--normalization rmsnorm`
+    (transformer.py) are constructed bare and never mark theirs -- so both
+    Megatron's allreduce_layernorm_grads sweep and the DeepSpeed engine's
+    _allreduce_sequence_parallel_grads hook (the only reachable path under
+    DeepSpeed) would sweep nothing. Tensor-parallel-partitioned params are
+    excluded: their gradients are per-partition, not sequence-shard
+    replicas.
+    """
+    marked = 0
+    for model_module in model_modules:
+        for module in model_module.modules():
+            if 'norm' not in type(module).__name__.lower():
+                continue
+            for param in module.parameters(recurse=False):
+                if getattr(param, 'tensor_model_parallel', False):
+                    continue
+                setattr(param, 'sequence_parallel', True)
+                marked += 1
+    return marked
+
+
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True):
     """Build the model."""
     args = get_args()
@@ -403,6 +432,13 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     for model_module in model:
         for param in model_module.parameters():
             tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
+
+    # Companion sequence parallelism: rmsnorm weights must carry the
+    # `sequence_parallel` attribute so their gradients get the TP-group sum
+    # (see mark_norm_params_for_sequence_parallel). Must run before the
+    # deepspeed early return below.
+    if args.sequence_parallel:
+        mark_norm_params_for_sequence_parallel(model)
 
     # Print number of parameters.
     if mpu.get_data_parallel_rank() == 0:
