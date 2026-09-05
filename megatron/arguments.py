@@ -1384,6 +1384,12 @@ def _add_data_args(parser):
                        'strictly less compute than full causal attention.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
+    group.add_argument('--pipe-moe-aux-loss', action='store_true',
+                       help='Pipeline runs only: thread the MoE auxiliary (load-balance) '
+                            'loss through the pipe as a scalar rider and add '
+                            'moe_loss_coeff * rider to the final loss. Without this, the '
+                            'pipe path silently drops the auxiliary loss (long-standing '
+                            'HACK in ParallelTransformerLayerPipe).')
     group.add_argument('--answer-loss-only', action='store_true',
                        help='SFT: take the loss only where the answer-mask stream is 1. '
                        'Expects a <prefix>_answer_mask_document.{bin,idx} sibling of '

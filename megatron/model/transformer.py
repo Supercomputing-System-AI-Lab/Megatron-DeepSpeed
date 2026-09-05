@@ -1745,6 +1745,22 @@ class ParallelTransformerLayerPipe(ParallelTransformerLayer):
             # HACK: currently MoE model does not support pipeline parallel, so
             # here we just ignore the moe_loss returned by forward()
             return super().forward(*inputs, **kwargs, rotary_pos_emb=rotary_pos_emb)[0], attention_mask
+        elif len(inputs) == 3:
+            # (hidden, activation mask, MoE aux-loss rider): --pipe-moe-aux-loss.
+            # The rider accumulates each layer's raw auxiliary loss and rides
+            # the pipe as a differentiable fp32 scalar; the loss function adds
+            # moe_loss_coeff * rider at the last stage.
+            hidden_states, attention_mask, rider = inputs
+            out = super().forward(hidden_states, attention_mask, **kwargs,
+                                  rotary_pos_emb=rotary_pos_emb)
+            layer_moe = out[1] if isinstance(out, tuple) and len(out) > 1 else None
+            if layer_moe is not None and torch.is_tensor(layer_moe):
+                rider = rider + layer_moe.float().reshape(1)
+            elif isinstance(layer_moe, (list, tuple)):
+                for l in layer_moe:
+                    if torch.is_tensor(l):
+                        rider = rider + l.float().reshape(1)
+            return out[0], attention_mask, rider
         else:
             raise RuntimeError('Received more inputs than understood.')
 

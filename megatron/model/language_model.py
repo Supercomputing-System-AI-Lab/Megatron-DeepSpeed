@@ -358,6 +358,10 @@ class EmbeddingPipe(Embedding):
             # skips the constant-mask precompute): the padded int32 cu_seqlens
             # travels the pipe as an activation. Optionally start the MoE
             # auxiliary-loss rider (a differentiable fp32 scalar).
+            if getattr(self._args, 'pipe_moe_aux_loss', False):
+                rider = torch.zeros(1, dtype=torch.float32,
+                                    device=embeddings.device)
+                return embeddings, attention_mask, rider
             return embeddings, attention_mask
 
 

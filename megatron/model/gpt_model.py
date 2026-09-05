@@ -256,7 +256,17 @@ class GPTModel(MegatronModule):
             ]
 
         return info
-    
+
+
+# --pipe-moe-aux-loss / --intra-document-attention pipe support: the tail
+# specs (final norm, LM head) are single-tensor modules, so a function spec
+# strips the extras first. The rider is stashed stage-locally; the DeepSpeed
+# pipe engine calls loss_fn(outputs, labels) inside the SAME _exec_forward_pass
+# as the forward, so the stash cannot interleave across microbatches. The
+# stashed tensor keeps its autograd graph, so the auxiliary loss backpropagates
+# through every stage.
+_PIPE_EXTRAS_STASH = []
+
 _PIPE_DBG = {'strip': 0, 'loss': 0, 'rider': 0}
 
 def _pipe_dbg(site, obj):
@@ -279,9 +289,40 @@ def _strip_pipe_extras(inputs):
     if torch.is_tensor(inputs):
         return inputs
     if isinstance(inputs, tuple):
+        if len(inputs) == 3:          # (hidden, cu_seqlens, rider)
+            _PIPE_EXTRAS_STASH.append(inputs[2])
+            return inputs[0]
         if len(inputs) == 2:          # (hidden, cu_seqlens)
             return inputs[0]
     return inputs
+
+
+def _fold_pipe_moe_rider(loss):
+    """Add the stashed --pipe-moe-aux-loss rider onto a computed LM loss.
+    Shared by CrossEntropyWithMoE and ChunkedCrossEntropyWithMoE so the
+    aux-loss rider composes identically with both tails."""
+    if _PIPE_EXTRAS_STASH:
+        rider = _PIPE_EXTRAS_STASH.pop()
+        args = get_args()
+        coeff = getattr(args, 'moe_loss_coeff', 0.0) or 0.0
+        # Hot-path print gate (128k S3.5 hygiene): the f-string calls
+        # .item() twice -- a device sync per micro-batch. First 3
+        # occurrences only, unless XMOE_PIPE_MOE_VERBOSE=1.
+        import os
+        if _PIPE_DBG['rider'] < 3 or os.environ.get('XMOE_PIPE_MOE_VERBOSE', '0') == '1':
+            _PIPE_DBG['rider'] += 1
+            print(f'[pipe-moe] rider={rider.sum().item():.6e} coeff={coeff} '
+                  f'lm_loss={loss.item():.6e}', flush=True)
+        loss = loss + coeff * rider.sum()
+    return loss
+
+
+def CrossEntropyWithMoE(output, labels):
+    _pipe_dbg('loss', output)
+    if isinstance(output, tuple) and len(output) >= 1 and torch.is_tensor(output[0]):
+        # Defensive unwrap; _pipe_dbg above records what actually arrived.
+        output = output[0]
+    return _fold_pipe_moe_rider(CrossEntropy(output, labels))
 
 
 def CrossEntropy(output, labels):
@@ -425,8 +466,11 @@ class GPTModelPipe(PipelineModule,MegatronModule):
         print (f'[megatron/model/gpt_model.py] {custom_pp_partition=}')
         print (f'[megatron/model/gpt_model.py] {checkpoint_partition=}')
         
+        _loss_fn = (CrossEntropyWithMoE
+                    if getattr(args, 'pipe_moe_aux_loss', False)
+                    else CrossEntropy)
         super().__init__(layers=self.specs,
-                         loss_fn=CrossEntropy,
+                         loss_fn=_loss_fn,
                          topology=topo,
                          activation_checkpoint_interval=interval,
                          partition_method='type:transformer',
