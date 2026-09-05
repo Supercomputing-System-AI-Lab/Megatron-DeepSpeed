@@ -268,7 +268,9 @@ def CrossEntropy(output, labels):
     # [s b] => [b, s]
     losses = losses.transpose(0, 1).contiguous()
     loss_mask = loss_mask.view(-1)
-    loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
+    # clamp: under --answer-loss-only a microbatch can contain zero supervised
+    # tokens; identity in pretraining, where the mask is all ones.
+    loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum().clamp(min=1)
     return loss
 
 

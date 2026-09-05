@@ -267,7 +267,7 @@ def get_batch(data_iterator):
     tokenizer = get_tokenizer()
 
     # Items and their type.
-    keys = ['text']
+    keys = ['text', 'loss_mask'] if args.answer_loss_only else ['text']
     datatype = torch.int64
 
     # Broadcast data.
@@ -281,6 +281,10 @@ def get_batch(data_iterator):
     tokens_ = data_b['text'].long()
     labels = tokens_[:, 1:].contiguous()
     tokens = tokens_[:, :-1].contiguous()
+    # SFT: shift the answer mask [:, 1:] so it aligns with labels, not tokens.
+    answer_mask = data_b['loss_mask'].float()[:, 1:].contiguous() \
+        if args.answer_loss_only else None
+
 
     #ADDED
     # Get the masks and postition ids.
@@ -292,6 +296,15 @@ def get_batch(data_iterator):
         args.reset_attention_mask,
         args.eod_mask_loss,
         skip_mask)
+    if answer_mask is not None:
+        # Multiply, don't replace: composes with whatever the line above built.
+        loss_mask = loss_mask * answer_mask
+        if int(os.getenv('SFT_DEBUG_MASK', '0')):
+            # gate 4: must match supervised_density_of_real x (1 - padding_waste)
+            # from the corpus manifest
+            print_rank_0('[sft] loss_mask density {:.4f}'.format(
+                loss_mask.sum().item() / loss_mask.numel()))
+
 
     # For DS's sequence parallel
     seq_parallel_world_size = mpu.get_sequence_parallel_world_size()
@@ -347,7 +360,7 @@ def get_batch_pipe(data):
     tokenizer = get_tokenizer()
 
     # Items and their type.
-    keys = ['text']
+    keys = ['text', 'loss_mask'] if args.answer_loss_only else ['text']
     datatype = torch.int64
 
     # Broadcast data.
@@ -357,6 +370,9 @@ def get_batch_pipe(data):
     tokens_ = data_b['text'].long()
     labels = tokens_[:, 1:].contiguous()
     tokens = tokens_[:, :-1].contiguous()
+    # SFT: shift the answer mask [:, 1:] so it aligns with labels, not tokens.
+    answer_mask = data_b['loss_mask'].float()[:, 1:].contiguous() \
+        if args.answer_loss_only else None
 
     # Get the masks and postition ids.
     attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
@@ -365,6 +381,10 @@ def get_batch_pipe(data):
         args.reset_position_ids,
         args.reset_attention_mask,
         args.eod_mask_loss)
+    if answer_mask is not None:
+        # Multiply, don't replace: composes with whatever the line above built,
+        # and must precede the curriculum truncation below.
+        loss_mask = loss_mask * answer_mask
     if args.curriculum_learning_legacy and args.curriculum_seqlen < tokens.size()[1]:
         # seqlen-based curriculum learning
         # tokens, position_ids, labels, loss_mask have size [batch size, seqlen]
@@ -381,7 +401,10 @@ def loss_func(loss_mask, moe_loss, mos_loss, output_tensor):
     args = get_args()
     losses = output_tensor.float()
     loss_mask = loss_mask.view(-1).float()
-    loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
+    # clamp: under --answer-loss-only a microbatch can contain zero supervised
+    # tokens (all-prompt); an unguarded denominator is a silent nan. Identity in
+    # pretraining, where the mask is all ones.
+    loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum().clamp(min=1)
     
     # Reduce loss for logging.
     averaged_loss = average_losses_across_data_parallel_group([loss])

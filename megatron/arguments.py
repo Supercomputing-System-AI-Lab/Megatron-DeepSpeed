@@ -414,6 +414,12 @@ def validate_args(args):
     args.curriculum_learning_legacy = False
     args.compression_training = False
 
+    # SFT answer-only loss: data_post_process rewrites only data['text'] (and can
+    # reshape the batch), which would silently desynchronize the answer-mask stream.
+    if args.answer_loss_only:
+        assert not args.data_efficiency_curriculum_learning, \
+            '--answer-loss-only is incompatible with --data-efficiency-curriculum-learning'
+
     # FlashAttention
     args.use_flash_attn = args.use_flash_attn_v1 or args.use_flash_attn_triton or args.use_flash_attn_v2
 
@@ -1324,6 +1330,10 @@ def _add_data_args(parser):
                        'end-of-document token.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
+    group.add_argument('--answer-loss-only', action='store_true',
+                       help='SFT: take the loss only where the answer-mask stream is 1. '
+                       'Expects a <prefix>_answer_mask_document.{bin,idx} sibling of '
+                       'each --data-path prefix (built by tools/preprocess_sft_data.py).')
     group.add_argument('--train-data-exact-num-epochs', type=int, default=None,
                        help='When building the train dataset, force it to be '
                        'an exact number of epochs of the raw data')

@@ -263,11 +263,57 @@ class GPTDataset(torch.utils.data.Dataset):
                                   splits_string, num_samples, seq_length, seed,
                                   data_cache_path=data_cache_path)
 
+        # SFT: open the answer-mask sibling stream (built by
+        # tools/preprocess_sft_data.py). Byte-identical `sizes` means the index
+        # mappings built above are valid for both streams, so one set of
+        # doc/sample/shuffle indices drives both.
+        self.answer_mask_dataset = None
+        if get_args().answer_loss_only:
+            args = get_args()
+            mask_prefix = data_prefix.replace('_text_document',
+                                              '_answer_mask_document')
+            assert mask_prefix != data_prefix, \
+                'cannot derive the answer-mask prefix from {}'.format(data_prefix)
+            self.answer_mask_dataset = get_indexed_dataset_(
+                mask_prefix, args.data_impl, not args.mmap_warmup)
+            assert np.array_equal(self.indexed_dataset.sizes,
+                                  self.answer_mask_dataset.sizes), \
+                'answer-mask stream is not document-aligned with the text stream'
+
 
     def __len__(self):
         # -1 is due to data structure used to retieve the index:
         #    sample i --> [sample_idx[i], sample_idx[i+1])
         return self.sample_idx.shape[0] - 1
+
+    def _sample_from(self, indexed_dataset, doc_index_f, doc_index_l,
+                     offset_f, offset_l):
+        """Extract one sample from an indexed dataset. Used for the text stream
+        and, under --answer-loss-only, replayed on the aligned answer-mask
+        stream with the same indices."""
+        # If we are within the same document, just extract the chunk.
+        doc_ids = []
+        if doc_index_f == doc_index_l:
+            doc_ids.append(self.doc_idx[doc_index_f])
+            sample = indexed_dataset.get(self.doc_idx[doc_index_f],
+                                         offset=offset_f,
+                                         length=offset_l - offset_f + 1)
+        else:
+            # Otherwise, get the rest of the initial document.
+            doc_ids.append(self.doc_idx[doc_index_f])
+            sample_list = [indexed_dataset.get(self.doc_idx[doc_index_f],
+                                               offset=offset_f)]
+            # Loop over all in between documents and add the entire document.
+            for i in range(doc_index_f + 1, doc_index_l):
+                doc_ids.append(self.doc_idx[i])
+                sample_list.append(indexed_dataset.get(self.doc_idx[i]))
+            # And finally add the relevant portion of last document.
+            doc_ids.append(self.doc_idx[doc_index_l])
+            sample_list.append(indexed_dataset.get(
+                self.doc_idx[doc_index_l],
+                length=offset_l + 1))
+            sample = np.concatenate(sample_list)
+        return sample, doc_ids
 
     def __getitem__(self, idx):
         args = get_args()
@@ -279,34 +325,22 @@ class GPTDataset(torch.utils.data.Dataset):
         doc_index_l = self.sample_idx[idx + 1][0]
         offset_f = self.sample_idx[idx][1]
         offset_l = self.sample_idx[idx + 1][1]
-        # If we are within the same document, just extract the chunk.
-        doc_ids = []
-        if doc_index_f == doc_index_l:
-            doc_ids.append(self.doc_idx[doc_index_f])
-            sample = self.indexed_dataset.get(self.doc_idx[doc_index_f],
-                                              offset=offset_f,
-                                              length=offset_l - offset_f + 1)
-        else:
-            # Otherwise, get the rest of the initial document.
-            doc_ids.append(self.doc_idx[doc_index_f])
-            sample_list = [self.indexed_dataset.get(self.doc_idx[doc_index_f],
-                                                    offset=offset_f)]
-            # Loop over all in between documents and add the entire document.
-            for i in range(doc_index_f + 1, doc_index_l):
-                doc_ids.append(self.doc_idx[i])
-                sample_list.append(self.indexed_dataset.get(self.doc_idx[i]))
-            # And finally add the relevant portion of last document.
-            doc_ids.append(self.doc_idx[doc_index_l])
-            sample_list.append(self.indexed_dataset.get(
-                self.doc_idx[doc_index_l],
-                length=offset_l + 1))
-            sample = np.concatenate(sample_list)
+        sample, doc_ids = self._sample_from(self.indexed_dataset,
+                                            doc_index_f, doc_index_l,
+                                            offset_f, offset_l)
         if args.return_data_index:
             return {'text': np.array(sample, dtype=np.int64),
                     'index': np.array([orig_idx], dtype=np.int64)}
         elif self.return_doc_ids: # for retro preprocessing
             return {'text': np.array(sample, dtype=np.int64),
                     'doc_ids': np.array(doc_ids, dtype=np.int64)}
+        elif self.answer_mask_dataset is not None:
+            mask, _ = self._sample_from(self.answer_mask_dataset,
+                                        doc_index_f, doc_index_l,
+                                        offset_f, offset_l)
+            # int64, not uint8: broadcast_data requires one dtype for all keys.
+            return {'text': np.array(sample, dtype=np.int64),
+                    'loss_mask': np.array(mask, dtype=np.int64)}
         else:
             return {'text': np.array(sample, dtype=np.int64)}
 
