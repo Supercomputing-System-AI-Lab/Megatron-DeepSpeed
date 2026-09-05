@@ -1390,6 +1390,12 @@ def _add_data_args(parser):
                             'moe_loss_coeff * rider to the final loss. Without this, the '
                             'pipe path silently drops the auxiliary loss (long-standing '
                             'HACK in ParallelTransformerLayerPipe).')
+    group.add_argument('--seq-chunked-ce', type=int, default=0,
+                       help='If >0, compute the LM cross-entropy in sequence chunks of '
+                            'this many tokens with per-chunk recompute, so the full '
+                            '[s, b, vocab] logits (bf16 + fp32 copies) are never resident '
+                            'at once. Loss-preserving (CE is per-token independent). '
+                            'Needed at 32k seq where the fp32 logits alone are ~13 GB.')
     group.add_argument('--answer-loss-only', action='store_true',
                        help='SFT: take the loss only where the answer-mask stream is 1. '
                        'Expects a <prefix>_answer_mask_document.{bin,idx} sibling of '
