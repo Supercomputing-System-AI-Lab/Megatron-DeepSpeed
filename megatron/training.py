@@ -765,7 +765,11 @@ def train_step(forward_step_func, data_iterator,
         assert isinstance(model[0], deepspeed.PipelineEngine)
         loss = model[0].train_batch(data_iter=data_iterator)
         grad_norm = model[0].get_global_grad_norm()
-        return {'lm loss' : loss}, skipped_iter, grad_norm, num_zeros_in_grad
+        loss_dict = {'lm loss' : loss}
+        # the prediction head's parts (DeepSeek-V3 CS5): 'lm main loss' and 'mtp loss' from the last stage; {} without the head
+        from megatron.model.deepseek_v3.mtp import pop_pipe_loss_parts
+        loss_dict.update(pop_pipe_loss_parts())
+        return loss_dict, skipped_iter, grad_norm, num_zeros_in_grad
 
     # Set grad to zero.
     if not args.deepspeed:

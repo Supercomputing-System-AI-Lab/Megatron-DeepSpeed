@@ -18,6 +18,8 @@ from .utils import scaled_init_method_normal
 from megatron.model import LayerNorm
 from .language_model import EmbeddingPipe
 from .transformer import ParallelTransformerLayerPipe, LMHeadPipe
+from .deepseek_v3.mtp import (MTPBlockPipe, LMHeadMTPPipe, MTPCrossEntropy, _mtp_tail_cast,   # the prediction head (CS5)
+                              mtp_embedding_passthrough)
 from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
 from deepspeed.moe.utils import is_moe_param
 
@@ -98,7 +100,9 @@ def pipe_name_candidates(name, num_layers):
     # let a tied reader silently satisfy its single embedding from an untied checkpoint
     # while that checkpoint's separate LM-head atom goes unread -- a wrong load with no
     # error, instead of the missing-atom failure that correctly reports the mismatch.
-    tied = not getattr(get_args(), 'untie_embeddings_and_output_weights', False)
+    _a = get_args()
+    # the prediction head (CS5) shares the table through TiedLayerSpec('embed') even with an untied head
+    tied = (not getattr(_a, 'untie_embeddings_and_output_weights', False)) or getattr(_a, 'num_nextn_predict_layers', 0) > 0
     for kind in ('word_embeddings', 'position_embeddings'):
         m = re.match(r'language_model\.embedding\.' + kind + r'\.(.+)', name)
         if m:
@@ -841,8 +845,11 @@ class GPTModelPipe(PipelineModule,MegatronModule):
 
         self.specs.append(_to_float16)
 
+        # the prediction head (CS5, megatron/model/deepseek_v3/mtp.py): the table is tied to the last stage, the head hands
+        # the hidden states on, two specs after the cast publish the tail's modules, the loss function runs the head
+        mtp_on = getattr(args, 'num_nextn_predict_layers', 0) > 0
         # Embedding layer
-        if args.untie_embeddings_and_output_weights:
+        if args.untie_embeddings_and_output_weights and not mtp_on:
             self.specs.append(LayerSpec(EmbeddingPipe,
                                         args.hidden_size,
                                         args.padded_vocab_size,
@@ -912,7 +919,7 @@ class GPTModelPipe(PipelineModule,MegatronModule):
         chunked_tail = use_chunked_pipe_tail(args)
         if args.untie_embeddings_and_output_weights:
             self.specs.append(
-                LayerSpec(LMHeadChunkedPipe if chunked_tail else LMHeadPipe,
+                LayerSpec(LMHeadMTPPipe if mtp_on else (LMHeadChunkedPipe if chunked_tail else LMHeadPipe),
                           args.hidden_size, args.padded_vocab_size, config)
             )
         else:
@@ -933,8 +940,27 @@ class GPTModelPipe(PipelineModule,MegatronModule):
         # Convert to fp32 if needed (chunked tail: keep the model dtype --
         # the per-chunk loss upcasts chunk-locally)
         if args.fp16 or args.bf16:
-            self.specs.append(_keep_dtype_for_chunked_tail if chunked_tail
-                              else float16_to_fp32)
+            self.specs.append(_mtp_tail_cast if mtp_on
+                              else (_keep_dtype_for_chunked_tail if chunked_tail else float16_to_fp32))
+        if mtp_on:
+            # the prediction head's two specs (CS5): the shared table and the block; both pass the stream through and
+            # publish themselves for MTPCrossEntropy. The block's layer follows the expert rule of layer num_layers + 1.
+            _mtp_layer_num = args.num_layers + 1
+            _n_e_mtp = (_experts_per_slot[min((_mtp_layer_num - 1) // args.expert_interval, len(_experts_per_slot) - 1)]
+                        if _mtp_layer_num % args.expert_interval == 0 else 1)
+            self.specs.append(
+                TiedLayerSpec('embed',
+                              EmbeddingPipe,
+                              args.hidden_size,
+                              args.padded_vocab_size,
+                              args.max_position_embeddings,
+                              args.hidden_dropout,
+                              config,
+                              num_tokentypes=num_tokentypes,
+                              embedding_weights_in_fp32=args.embedding_weights_in_fp32,
+                              forward_fn=mtp_embedding_passthrough,
+                              tied_weight_attr='word_embeddings_weight'))
+            self.specs.append(LayerSpec(MTPBlockPipe, config, layer_number=args.num_layers, num_experts=_n_e_mtp))
 
         if args.checkpoint_activations:
             interval = args.checkpoint_num_layers
@@ -957,7 +983,9 @@ class GPTModelPipe(PipelineModule,MegatronModule):
         print (f'[megatron/model/gpt_model.py] {custom_pp_partition=}')
         print (f'[megatron/model/gpt_model.py] {checkpoint_partition=}')
         
-        if chunked_tail:
+        if mtp_on:
+            _loss_fn = MTPCrossEntropy          # main + lambda x mtp (+ the MoE rider when --pipe-moe-aux-loss)
+        elif chunked_tail:
             _loss_fn = (ChunkedCrossEntropyWithMoE
                         if getattr(args, 'pipe_moe_aux_loss', False)
                         else ChunkedCrossEntropy)
