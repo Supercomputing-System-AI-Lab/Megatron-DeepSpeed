@@ -1341,7 +1341,8 @@ class ParallelTransformerLayer(MegatronModule):
                                     n_group=getattr(args, 'n_group', 1),
                                     topk_group=getattr(args, 'topk_group', 1),
                                     norm_topk_prob=getattr(args, 'norm_topk_prob', False),
-                                    routed_scaling_factor=getattr(args, 'routed_scaling_factor', 1.0))
+                                    routed_scaling_factor=getattr(args, 'routed_scaling_factor', 1.0),
+                                    moe_seq_balance_coeff=getattr(args, 'moe_seq_balance_coeff', 0.0))
 
         # Set bias+dropout+add fusion grad_enable execution handler.
         TORCH_MAJOR = int(torch.__version__.split('.')[0])

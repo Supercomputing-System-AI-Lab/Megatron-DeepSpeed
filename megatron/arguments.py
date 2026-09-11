@@ -612,7 +612,9 @@ def _add_deepseek_v3_args(parser):
     group.add_argument('--routed-scaling-factor', type=float, default=1.0, help='multiplier on the routed weights (V3: 2.5).')
     group.add_argument('--moe-router-bias-update-speed', type=float, default=0.0,
                        help='the auxiliary-loss-free bias step gamma (V3 report: 0.001); 0 = no bias.')
-    group.add_argument('--moe-seq-balance-coeff', type=float, default=0.0, help='the sequence-wise balance loss alpha (V3: 0.0001).')
+    group.add_argument('--moe-seq-balance-coeff', type=float, default=0.0,
+                       help='the sequence-wise balance loss alpha (V3 report eq. 17-20; V3: 0.0001). > 0 replaces the batch-wise '
+                            'balance loss and --moe-loss-coeff; under pipeline parallelism it needs --pipe-moe-aux-loss.')
     group.add_argument('--yarn-factor', type=float, default=None, help='YaRN scaling factor; None = no YaRN.')
     group.add_argument('--yarn-original-max-position-embeddings', type=int, default=None)
     group.add_argument('--yarn-beta-fast', type=float, default=32.0)
@@ -659,10 +661,41 @@ def _validate_deepseek_v3_args(args):
         assert args.topk_method == 'noaux_tc', 'the balancing bias belongs to --topk-method noaux_tc'
     if args.yarn_factor is not None:
         assert args.yarn_original_max_position_embeddings is not None, '--yarn-factor needs --yarn-original-max-position-embeddings'
-    assert args.moe_seq_balance_coeff == 0.0, 'the sequence-wise balance loss (decision V3) is not built yet'
-    assert args.num_nextn_predict_layers == 0, 'the multi-token prediction head (blueprint CS5) is not built yet'
-    assert args.index_topk == 0 and args.index_n_heads == 0 and args.indexer_loss_coeff == 0.0 and not args.dsa_dense_warmup \
-        and not args.dsa_freeze_non_indexer, 'the V3.2 indexer (blueprint CS7) is not built yet'
+    if args.moe_seq_balance_coeff > 0.0:
+        # decision V3: the sequence-wise balance loss replaces the batch-wise one. It rides the one auxiliary-loss slot of the
+        # MoE layer, so its alpha becomes the coefficient Megatron applies to that slot (the argument dump shows the value).
+        assert args.moe_seq_balance_coeff < 1.0, '--moe-seq-balance-coeff is a small alpha (the V3 report: 0.0001)'
+        args.moe_loss_coeff = args.moe_seq_balance_coeff
+        if args.pipeline_model_parallel_size > 1:
+            assert args.pipe_moe_aux_loss, ('under pipeline parallelism the balance loss reaches the loss only through '
+                                            '--pipe-moe-aux-loss (the template switch PIPE_MOE_AUX=1); without it the pipe '
+                                            'path drops the loss silently')
+    if args.num_nextn_predict_layers > 0:
+        # the prediction head (blueprint CS5, megatron/model/deepseek_v3/mtp.py): depth 1 on the pipeline path with the untied head
+        assert args.num_nextn_predict_layers == 1, 'the prediction head is built for depth 1 (the report trains D = 1)'
+        assert getattr(args, 'deepspeed', False) and not args.no_pipeline_parallel, \
+            'the prediction head lives on the pipeline path (GPTModelPipe); the non-pipe GPTModel does not build it'
+        assert args.untie_embeddings_and_output_weights, \
+            'the prediction head shares the table through TiedLayerSpec and takes the untied head'
+        assert not args.sequence_parallel and (getattr(args, 'seq_chunked_ce', 0) or 0) == 0 \
+            and not getattr(args, 'intra_document_attention', False), \
+            'the prediction head is not built with sequence parallelism, the chunked cross-entropy or intra-document attention yet'
+    if args.index_topk > 0 or args.index_n_heads > 0 or args.indexer_loss_coeff > 0.0 or args.dsa_dense_warmup \
+            or args.dsa_freeze_non_indexer or args.dsa_rotate_activation:
+        # V3.2 (blueprint CS7): the lightning indexer and the sparse attention (megatron/model/deepseek_v3/indexer.py,
+        # sparse_core.py, losses.py); the two stages of the report are --dsa-dense-warmup (+ --dsa-freeze-non-indexer) and then
+        # the sparse stage with everything trainable.
+        assert args.index_topk > 0 and args.index_n_heads > 0, 'the V3.2 indexer needs --index-topk and --index-n-heads'
+        assert args.q_lora_rank is not None, 'the indexer reads the query residual: --q-lora-rank (the released Indexer does)'
+        assert args.index_head_dim >= args.qk_rope_head_dim, 'the indexer head holds the rotary channels'
+        assert not args.dsa_rotate_activation, 'the Hadamard rotation of the released indexer is an aid of its fp8 path; not built'
+        if args.dsa_dense_warmup:
+            assert args.indexer_loss_coeff > 0.0, 'the dense warm-up trains the indexer by its loss: --indexer-loss-coeff > 0'
+        if args.dsa_freeze_non_indexer:
+            assert args.dsa_dense_warmup, 'the freeze belongs to the dense warm-up (--dsa-dense-warmup)'
+        if args.indexer_loss_coeff > 0.0:
+            assert getattr(args, 'deepspeed', False) and not args.no_pipeline_parallel and args.pipe_moe_aux_loss, \
+                'the indexer loss rides the pipe beside the MoE balance loss: the pipeline path with --pipe-moe-aux-loss (PIPE_MOE_AUX=1)'
     args.attention_kinds = ['mla'] * (args.num_layers + args.num_nextn_predict_layers)
     # V3 has no absolute position table; only --use-rotary-position-embeddings clears this flag otherwise.
     args.add_position_embedding = False
