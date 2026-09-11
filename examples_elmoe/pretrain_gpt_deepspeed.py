@@ -401,6 +401,10 @@ def get_batch(data_iterator):
     # For DS's sequence parallel
     if mpu.get_sequence_parallel_world_size() > 1:
         labels = labels[:, sub_seq_start:sub_seq_end]
+        # loss_mask stays FULL-length: vocab_sequence_parallel_cross_entropy
+        # all-gathers the per-shard losses back to [S, B] (cross_entropy.py:28)
+        # and its backward re-slices to this rank's window, so loss_func sees
+        # full-sequence losses and needs the full-sequence mask.
 
     return tokens, labels, loss_mask, attention_mask, position_ids
 

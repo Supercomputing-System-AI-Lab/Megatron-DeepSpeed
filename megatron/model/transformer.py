@@ -920,6 +920,13 @@ class ParallelAttention(MegatronModule):
                 # apply relative positional encoding (rotary embedding)
                 if rotary_pos_emb is not None:
                     q_pos_emb, k_pos_emb = rotary_pos_emb
+                    if self.enable_ds_sequence_parallel and inference_params is None:
+                        # DS-Ulysses: this rank holds global positions
+                        # [r*s/P, (r+1)*s/P); the table covers the full seq_length.
+                        _sp_rank = parallel_state.get_sequence_parallel_rank()
+                        _sp_len = query_layer.size(0)
+                        q_pos_emb = q_pos_emb[_sp_rank * _sp_len:(_sp_rank + 1) * _sp_len]
+                        k_pos_emb = k_pos_emb[_sp_rank * _sp_len:(_sp_rank + 1) * _sp_len]
                     query_layer = apply_rotary_pos_emb(query_layer, q_pos_emb)
                     key_layer = apply_rotary_pos_emb(key_layer, k_pos_emb)
                     # TODO, can apply positional embedding to value_layer so it has
@@ -927,18 +934,24 @@ class ParallelAttention(MegatronModule):
                     # otherwise, only relative positional embedding takes effect
                     # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
 
-                if self.enable_ds_sequence_parallel:
+                if _ragged_context is not None:
+                    pass
+                elif self.enable_ds_sequence_parallel:
+                    # DistributedAttention.forward requires batch_dim_idx (which
+                    # axis is batch): [s,b,...] layouts pass 1, [b,s,...] pass 0.
                     if self.use_flash_attn:
+                        batch_dim_idx = 1
                         if not self.use_flash_attn_triton:
                             query_layer, key_layer, value_layer = [rearrange(x, 's b ... -> b s ...').contiguous()
                                     for x in (query_layer, key_layer, value_layer)]
+                            batch_dim_idx = 0
 
-                        context_layer = self.dist_attn(query_layer, key_layer, value_layer)
+                        context_layer = self.dist_attn(query_layer, key_layer, value_layer, batch_dim_idx)
 
                         if not self.use_flash_attn_triton:
                             context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()
                     else:
-                        context_layer = self.dist_attn(query_layer, key_layer, value_layer, attention_mask)
+                        context_layer = self.dist_attn(query_layer, key_layer, value_layer, 1, attention_mask)
                 else:
                     if self.use_flash_attn:
                         if not self.use_flash_attn_triton:
