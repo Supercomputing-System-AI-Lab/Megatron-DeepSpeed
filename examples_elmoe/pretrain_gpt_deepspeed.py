@@ -270,6 +270,9 @@ def model_provider(pre_process=True, post_process=True):
         n_idx, n_total = warmup_split(model)
         print_rank_0(f'[deepseek_v3.2] dense warm-up: {n_idx:,} of {n_total:,} parameters learn (indexer.*); the rest at learning rate 0')
     see_memory_usage(f"After Building Model", force=True)
+    if os.getenv('XMOE_ACT_DUMP'):
+        from megatron.model.act_dump import attach      # the activation dump of the first micro-batch (off without the variable)
+        attach(model)
     return model
 
 
