@@ -313,6 +313,14 @@ class DeepSeekV3Attention(MegatronModule):
             cos, sin = self.rotary.cos_sin(positions)
         q_pe = apply_interleaved_rope(q_pe, cos, sin)
         k_pe = apply_interleaved_rope(k_pe, cos, sin)
+        if self.tp > 1 and not self.sequence_parallel:
+            # The rope key is one tensor shared by every head, and the heads are split over tensor parallelism: each rank's
+            # backward returns only its heads' share of the gradient. The latent takes the same care through the column
+            # projection's input copy; the rope key has no projection in between, so the copy (identity forward, all-reduce
+            # backward) goes here. Under sequence parallelism the entry gather's reduce-scatter and the replicated pieces'
+            # gradient sum already do this. Found by the two-GPU probe P2 (2026-09-11): kv_a_proj_with_mqa's gradient
+            # differed by 15 percent between the two tensor-parallel forms.
+            k_pe = copy_to_tensor_model_parallel_region(k_pe)
 
         query = torch.cat((q_nope, q_pe), dim=-1)
         key = torch.cat((k_nope, k_pe.expand(s, b, hp, self.qk_rope_head_dim)), dim=-1)
