@@ -1217,8 +1217,14 @@ def _add_distributed_args(parser):
     group.add_argument('--distributed-backend', default='nccl',
                        choices=['nccl', 'gloo', 'ccl'],
                        help='Which backend to use for distributed training.')
-    group.add_argument('--distributed-timeout-minutes', type=int, default=10,
-                       help='Timeout minutes for torch.distributed.')
+    group.add_argument('--distributed-timeout-minutes', type=int, default=15,
+                       help='Timeout minutes for torch.distributed (the process '
+                       'group, so also the first barriers, which wait for rank 0 '
+                       'to build the dataset index and compile the fused '
+                       'kernels). Default 15, not 10: cold-node start-ups have '
+                       'exceeded 10 min at the NCCL rendezvous; kept short '
+                       'because jobs here are typically under 30 min and a '
+                       'hang must fail inside its wall.')
     group.add_argument('--DDP-impl', default='local',
                        choices=['local', 'torch', 'FSDP'],
                        help='which DistributedDataParallel implementation '
