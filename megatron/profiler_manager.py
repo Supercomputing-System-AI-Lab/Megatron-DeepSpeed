@@ -196,7 +196,7 @@ def _get_profiler(wait=0, warmup=0, active=2, repeat=1):
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
             schedule=sched,
             record_shapes=True,
-            with_stack=False,
+            with_stack=os.getenv('PROFILE_WITH_STACK') == '1',   # the Python call stack per op (TraceLens's nn.Module view needs it; heavy at scale, off by default)
             with_flops=False,
             with_modules=True,
             profile_memory=False,
