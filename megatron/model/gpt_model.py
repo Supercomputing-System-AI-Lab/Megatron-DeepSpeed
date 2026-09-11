@@ -505,6 +505,15 @@ class GPTModel(MegatronModule):
         # to capture input/output shape for buffers, it will DEFAULT return lm_output.clone(), moe_losses
         # when the if-statement is a 1-line if.
         # ****************************************************************************************************
+        # EVAL-ONLY ALIAS (2026-08-31): the .clone() doubles the full-logits footprint --
+        # 12.2 GiB extra at seq 65536, 25.6 GiB at 131072. Job 5385821's workers died at
+        # exactly 'Tried to allocate 12.17 GiB' on this line. The clone exists for
+        # torch.distributed.pipelining meta-device shape capture, a TRAINING-pipe concern;
+        # under no_grad inference the caller may alias. Training behavior is unchanged.
+        if not torch.is_grad_enabled():
+            if self.return_moe_loss:
+                return lm_output, moe_losses
+            return lm_output
         if self.return_moe_loss: 
             # print (f'[gpt_model.py] return lm_output.clone(), moe_losses')
             return lm_output.clone(), moe_losses

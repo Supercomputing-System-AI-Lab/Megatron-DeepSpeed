@@ -491,9 +491,10 @@ class FlashSelfAttention(torch.nn.Module):
             is_causal = self.causal
             cu_seqlens_k = cu_seqlens_q if get_accelerator().device_name() == 'cuda' else None
         else:
-            # turn off FA causal mask after first inference autoregressive iteration
-            # only on first autoregressive step q,k,v have same seqlen
-            is_causal = seqlen_q == seqlen_k
+            # turn off FA causal mask only for pure 1-token decode; a chunked
+            # prefill (q>1 with cached keys) must stay causal or chunk tokens
+            # attend to their own future (their keys are already in the cache).
+            is_causal = (seqlen_q == seqlen_k) or (seqlen_q > 1)
             if cu_seqlens is not None:
                 # Validation forwards run in eval mode but are still full-sequence,
                 # so the document segments remain valid. Incremental decode (which
@@ -739,7 +740,13 @@ class ParallelAttention(MegatronModule):
         return hidden_states
 
     def _allocate_memory(self, inference_max_sequence_len, batch_size):
-        return torch.empty(
+        # zeros, NOT empty: the ragged decode path reads [:kv_hi] where kv_hi is the
+        # BATCH max extent, so short rows' never-written slots enter the PV einsum
+        # with probability exactly 0 -- and IEEE 0.0 * NaN/Inf = NaN would silently
+        # poison a live row's context if the allocation carried garbage bit
+        # patterns. Zero-init closes that permanently (live slots are always
+        # genuinely written before being attended); one memset per process.
+        return torch.zeros(
             inference_max_sequence_len,
             batch_size,
             self.num_attention_heads_per_partition,
@@ -756,6 +763,56 @@ class ParallelAttention(MegatronModule):
         return hidden_states.reshape(slen, batch,
                                      num_key_value_heads_per_partition * n_rep,
                                      head_dim)
+
+
+    def _ragged_decode_step(self, query_layer, key_layer, value_layer,
+                            inference_key_memory, inference_value_memory,
+                            row_lengths, rotary_pos_emb, inference_params):
+        """Phase 5b: one batched decode step over rows at DIFFERENT positions.
+
+        Contract (driver: megatron_ds_eval/lm_eval_adapter._kv_generate_rows_batched):
+        the cache slot index IS the token's true position for every row -- the prefill
+        right-pads to the batch max but each row's real tokens land at their true
+        positions, and each generated token of row b is scattered at row_lengths[b].
+        Hence:
+          * K rotary is UNIFORM (angle = slot index); only Q needs per-row angles;
+          * row b's valid extent is slots [0, row_lengths[b]]; anything beyond is
+            leftover prefill pad or another row's progress and must not be attended.
+        Flash's decode kernel takes no attention mask, so this branch computes eager
+        masked attention instead: at q_len == 1 it is bandwidth-bound (microseconds)
+        and makes per-row extents exact. fp32 math, cast back on return. Batch
+        columns are independent throughout -- no cross-row contamination is possible.
+        """
+        assert not self.use_gqa, 'ragged batched decode: GQA repeat not wired'
+        b_size = query_layer.size(1)
+        dev = query_layer.device
+        b_idx = torch.arange(b_size, device=dev)
+        # scatter this step's (pre-rotary, like the uniform path) K/V at true positions
+        inference_key_memory[row_lengths, b_idx] = key_layer[0]
+        inference_value_memory[row_lengths, b_idx] = value_layer[0]
+        # extent comes host-side from the driver (it evolves deterministically from
+        # the prompt lengths): a .max().item() here would be a blocking GPU->CPU
+        # sync repeated once PER LAYER per token -- 28 stalls/step in exactly the
+        # launch-bound loop this path exists to amortize.
+        kv_hi = getattr(inference_params, 'kv_extent', None)
+        if kv_hi is None:
+            kv_hi = int(row_lengths.max().item()) + 1
+        k = inference_key_memory[:kv_hi, :b_size]
+        v = inference_value_memory[:kv_hi, :b_size]
+        if rotary_pos_emb is not None:
+            q_pos_emb, k_pos_emb = rotary_pos_emb
+            q_pos = q_pos_emb[row_lengths].transpose(0, 1)   # [1, b, 1, dim]
+            query_layer = apply_rotary_pos_emb(query_layer, q_pos)
+            k = apply_rotary_pos_emb(k, k_pos_emb[:kv_hi])
+        q = query_layer[0].float()                            # [b, np, hn]
+        k = k.float()                                         # [kv, b, np, hn]
+        v = v.float()
+        scores = torch.einsum('bnh,sbnh->bns', q, k) / math.sqrt(q.size(-1))
+        dead = torch.arange(kv_hi, device=dev)[None, :] > row_lengths[:, None]
+        scores = scores.masked_fill(dead[:, None, :], float('-inf'))
+        probs = torch.softmax(scores, dim=-1)
+        ctx = torch.einsum('bns,sbnh->bnh', probs, v)         # [b, np, hn]
+        return ctx.reshape(1, b_size, -1).to(query_layer.dtype)
 
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, inference_params=None,
@@ -776,10 +833,18 @@ class ParallelAttention(MegatronModule):
                     inf_max_seq_len, inf_max_batch_size)
                 inference_params.key_value_memory_dict[self.layer_number] = (
                     inference_key_memory, inference_value_memory)
-                is_first_step = True
             else:
                 inference_key_memory, inference_value_memory = \
                     inference_params.key_value_memory_dict[self.layer_number]
+            # "First step" means a prefill starting at position 0, NOT "buffers were
+            # just allocated". Deriving it from the offset (rather than dict
+            # membership) lets a driver keep one InferenceParams -- and its KV
+            # buffers -- alive across sequences: reset sequence_len_offset to 0 and
+            # the reused buffers get full-prefix rotary and a fresh [0:L] overwrite.
+            # Stale cache beyond sequence_end is never read (reads slice
+            # [:sequence_end]). Identical behavior for single-use InferenceParams:
+            # offset is 0 exactly on the allocating call in every existing caller.
+            is_first_step = (inference_params.sequence_len_offset == 0)
 
         # =====================
         # Query, Key, and Value
@@ -868,43 +933,54 @@ class ParallelAttention(MegatronModule):
                 else:
                     rotary_pos_emb = ((rotary_pos_emb,) * 2)
 
+        _ragged_context = None
         if inference_params:
-            batch_start = inference_params.batch_size_offset
-            batch_end = batch_start + key_layer.size(1)
-            assert batch_end <= inference_key_memory.size(1)
-            sequence_start = inference_params.sequence_len_offset
-            sequence_end = sequence_start + key_layer.size(0)
-            assert sequence_end <= inference_key_memory.size(0)
-            # Copy key and values.
-            inference_key_memory[sequence_start:sequence_end,
-                                 batch_start:batch_end, ...] = key_layer
-            inference_value_memory[sequence_start:sequence_end,
-                                   batch_start:batch_end, ...] = value_layer
-            key_layer = inference_key_memory[
-                :sequence_end, batch_start:batch_end, ...]
-            value_layer = inference_value_memory[
-                :sequence_end, batch_start:batch_end, ...]
+            _rl = getattr(inference_params, 'row_lengths', None)
+            if _rl is not None and query_layer.size(0) == 1:
+                # Phase 5b batched ragged decode: rows sit at different positions.
+                # Write/read/rotary/attention happen in the helper; the generic
+                # attention section below is skipped via _ragged_context.
+                _ragged_context = self._ragged_decode_step(
+                    query_layer, key_layer, value_layer,
+                    inference_key_memory, inference_value_memory,
+                    _rl, rotary_pos_emb, inference_params)
+            else:
+                batch_start = inference_params.batch_size_offset
+                batch_end = batch_start + key_layer.size(1)
+                assert batch_end <= inference_key_memory.size(1)
+                sequence_start = inference_params.sequence_len_offset
+                sequence_end = sequence_start + key_layer.size(0)
+                assert sequence_end <= inference_key_memory.size(0)
+                # Copy key and values.
+                inference_key_memory[sequence_start:sequence_end,
+                                     batch_start:batch_end, ...] = key_layer
+                inference_value_memory[sequence_start:sequence_end,
+                                       batch_start:batch_end, ...] = value_layer
+                key_layer = inference_key_memory[
+                    :sequence_end, batch_start:batch_end, ...]
+                value_layer = inference_value_memory[
+                    :sequence_end, batch_start:batch_end, ...]
 
 
-            # adjust the key rotary positional embedding
-            if rotary_pos_emb is not None:
-                q_pos_emb, k_pos_emb = rotary_pos_emb
-                # need to cross check this condition during inference
-                # if not set_inference_key_value_memory:
-                if not is_first_step:
-                    # In inference, we compute one token at a time.
-                    # Select the correct positional embedding
-                    # (only the last token in the sequence)
-                    q_pos_emb = q_pos_emb[sequence_end - 1 : sequence_end]
-                else:
-                    # In the first forward pass of inference,
-                    # we use the entire provided prefix.
-                    # q_pos_emb here has the rope embeddings of the entire
-                    # prefix + to-be-generated output so
-                    # we slice to just the prefix.
-                    q_pos_emb = q_pos_emb[:sequence_end, :, :, :]
-                k_pos_emb = k_pos_emb[:sequence_end, :, :, :]
-                rotary_pos_emb = (q_pos_emb, k_pos_emb)
+                # adjust the key rotary positional embedding
+                if rotary_pos_emb is not None:
+                    q_pos_emb, k_pos_emb = rotary_pos_emb
+                    # need to cross check this condition during inference
+                    # if not set_inference_key_value_memory:
+                    if not is_first_step:
+                        # Chunked prefill feeds multi-token chunks with offset>0:
+                        # each query needs its own position. For q_len==1 this
+                        # slice is [sequence_end-1:sequence_end], the old behavior.
+                        q_pos_emb = q_pos_emb[sequence_start : sequence_end]
+                    else:
+                        # In the first forward pass of inference,
+                        # we use the entire provided prefix.
+                        # q_pos_emb here has the rope embeddings of the entire
+                        # prefix + to-be-generated output so
+                        # we slice to just the prefix.
+                        q_pos_emb = q_pos_emb[:sequence_end, :, :, :]
+                    k_pos_emb = k_pos_emb[:sequence_end, :, :, :]
+                    rotary_pos_emb = (q_pos_emb, k_pos_emb)
 
 
         # ==================================
@@ -917,8 +993,11 @@ class ParallelAttention(MegatronModule):
         
         with nvtx.range("Transformer Attention"):
             with record_function ("Transformer Attention"): 
+                if _ragged_context is not None:
+                    # Phase 5b ragged decode: attention (incl. rotary) already done
+                    context_layer = _ragged_context
                 # apply relative positional encoding (rotary embedding)
-                if rotary_pos_emb is not None:
+                if _ragged_context is None and rotary_pos_emb is not None:
                     q_pos_emb, k_pos_emb = rotary_pos_emb
                     if self.enable_ds_sequence_parallel and inference_params is None:
                         # DS-Ulysses: this rank holds global positions
@@ -1668,7 +1747,10 @@ class ParallelTransformerLayer(MegatronModule):
             self.moe_timer.stop()
         # log_memory(event="after_moe", layer_num=self.layer_number)
         # utils.report_memory (f"  - after_moe_L{self.layer_number}")
-        torch.cuda.reset_peak_memory_stats()
+        if TIMING:
+            # Gated: this fires once per LAYER per forward; in a KV decode loop that is
+            # 28 calls per generated token of pure overhead when no one reads the stats.
+            torch.cuda.reset_peak_memory_stats()
             
         # print (f'AFTER MLP, {rank=}, {self.layer_number=} {layernorm_output.shape=}') 
         
