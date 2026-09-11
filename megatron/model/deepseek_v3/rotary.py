@@ -75,9 +75,10 @@ class YarnRotaryTable(torch.nn.Module):
         return 1.0
 
     def cos_sin(self, positions):
-        """positions [s] (int64) -> cos, sin [s, dim] in fp32, scaled by attention_scaling (the released forward)."""
+        """positions [s] (int64) -> cos, sin [s, dim] in fp32, scaled by attention_scaling (the released forward); positions
+        [s, b] (document-local positions of a micro-batch of several sequences) -> [s, b, dim], the per-row form of the apply."""
         inv_freq = self.inv_freq.to(positions.device)
-        freqs = positions.to(torch.float32)[:, None] * inv_freq[None, :]
+        freqs = positions.to(torch.float32)[..., None] * inv_freq
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos() * self.attention_scaling, emb.sin() * self.attention_scaling
 

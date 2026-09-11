@@ -20,7 +20,7 @@ carry partial gradients per rank and are marked sequence_parallel so the engine'
 Parameter names are the released model's (self_attn.X -> self_attention.X), so a checkpoint importer maps them by prefix.
 The inference cache follows ParallelAttention's contract (inference_params.key_value_memory_dict, sequence_len_offset,
 batch_size_offset; the batched ragged decode with row_lengths and kv_extent): keys are cached rotated, values at their own width.
-Not built here (open items of the blueprint): document-local positions for microbatches larger than one, the V3.2 indexer.
+Not built here (open items of the blueprint): the V3.2 indexer.
 """
 import torch
 import torch.nn.functional as F
@@ -175,16 +175,17 @@ class DeepSeekV3Attention(MegatronModule):
 
     def _positions(self, s, b, attention_mask, device):
         """Document-local positions under intra-document attention (cu_seqlens ride the attention_mask slot; the pipe path pads
-        them with -1), else 0..s-1."""
+        them with -1), else 0..s-1. cu_seqlens index the flash layout [b, s] flattened row by row; the result is [s] for a
+        micro-batch of one sequence and [s, b] otherwise (one angle per position and row, the rotary table's per-row form)."""
         if self.intra_document_attention and attention_mask is not None and attention_mask.dtype in (torch.int32, torch.int64):
             cu = attention_mask.flatten()
             cu = cu[cu >= 0]
             n = int(cu[-1].item())
-            assert n == s * b and b == 1, ('document-local positions are built for micro-batch 1 under intra-document attention; '
-                                           f'got {s} x {b} tokens and cu_seqlens ending at {n}')
+            assert n == s * b, f'cu_seqlens end at {n}; the micro-batch holds {s} x {b} tokens'
             lengths = cu[1:] - cu[:-1]
             starts = torch.repeat_interleave(cu[:-1], lengths)
-            return torch.arange(s, device=device) - starts.to(device)
+            flat = torch.arange(n, device=device) - starts.to(device)
+            return flat if b == 1 else flat.view(b, s).transpose(0, 1).contiguous()
         return torch.arange(s, device=device)
 
     def _eager_attention(self, query, key, value, query_start=0):
