@@ -268,6 +268,76 @@ def model_provider(pre_process=True, post_process=True):
 
 
 
+# ============================ BATCH TOKEN-ID DIAGNOSTIC ============================
+# Answers two questions that loss curves cannot:
+#   1. do two runs at DIFFERENT parallelism degrees consume the SAME global batch?
+#   2. do tensor-parallel peers receive IDENTICAL tokens? (they should -- with
+#      sequence_parallel=False, broadcast_data replicates the batch across the TP group)
+#
+# Enable:
+#   export DUMP_BATCH_TOKENS=1
+# Options:
+#   DUMP_BATCH_TOKENS_ITERS=0,1,2   iterations to dump, or "all"   (default 0,1,2)
+#   DUMP_BATCH_TOKENS_FULL=1        also emit the COMPLETE id sequence (stdout + file)
+#   DUMP_BATCH_TOKENS_DIR=<dir>     where the per-rank files go     (default ./token_dump)
+#
+# WHY A HASH AND NOT JUST THE IDS: the per-rank partition of the global batch differs
+# between DP=8 and DP=2, so per-rank tokens are EXPECTED to differ. What must match
+# between two runs is the MULTISET of per-sequence hashes over all ranks and
+# microbatches. sha1 is taken over the raw int64 bytes, so it is stable across ranks,
+# runs and machines.
+#
+# NOTE ON ABBREVIATION: the full dump is produced with " ".join(map(str, ids)) --
+# plain Python string formatting, never torch/numpy repr -- so it is never truncated
+# by print options or edgeitems.
+_DUMP_MB_COUNTER = {}
+
+
+def _dump_batch_tokens(tokens, tag="train"):
+    if os.environ.get('DUMP_BATCH_TOKENS', '0') != '1':
+        return
+    import hashlib
+
+    args = get_args()
+    it = getattr(args, 'curr_iteration', -1)
+    wanted = os.environ.get('DUMP_BATCH_TOKENS_ITERS', '0,1,2')
+    if wanted != 'all' and str(it) not in [w.strip() for w in wanted.split(',')]:
+        return
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    try:
+        dp_rank, dp_size = mpu.get_data_parallel_rank(), mpu.get_data_parallel_world_size()
+        tp_rank, tp_size = mpu.get_tensor_model_parallel_rank(), mpu.get_tensor_model_parallel_world_size()
+    except Exception:
+        dp_rank = dp_size = tp_rank = tp_size = -1
+
+    key = (tag, it)
+    mb = _DUMP_MB_COUNTER.get(key, 0)
+    _DUMP_MB_COUNTER[key] = mb + 1
+
+    full = os.environ.get('DUMP_BATCH_TOKENS_FULL', '0') == '1'
+    out_dir = os.environ.get('DUMP_BATCH_TOKENS_DIR', 'token_dump')
+
+    cpu = tokens.detach().to('cpu', torch.int64).contiguous()
+    for b in range(cpu.shape[0]):
+        ids = cpu[b].tolist()
+        h = hashlib.sha1(cpu[b].numpy().tobytes()).hexdigest()[:16]
+        header = (f"[BATCH-IDS] tag={tag} iter={it} mb={mb} rank={rank} "
+                  f"dp={dp_rank}/{dp_size} tp={tp_rank}/{tp_size} b={b} "
+                  f"len={len(ids)} sha1={h}")
+        print(f"{header} first8={ids[:8]} last8={ids[-8:]}", flush=True)
+
+        if full:
+            flat = " ".join(map(str, ids))
+            print(f"{header} ids={flat}", flush=True)
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+                with open(os.path.join(out_dir, f"rank_{rank:03d}.txt"), "a") as fh:
+                    fh.write(header + "\n" + flat + "\n")
+            except OSError as e:
+                print(f"[BATCH-IDS] could not write {out_dir}: {e}", flush=True)
+# ========================== END BATCH TOKEN-ID DIAGNOSTIC ==========================
+
 
 def build_intra_doc_cu_seqlens(tokens, eod_token, pad_to_full=False):
     """Document-boundary cu_seqlens for the flash-attn varlen kernel.
@@ -351,6 +421,7 @@ def get_batch(data_iterator):
     answer_mask = data_b['loss_mask'].float()[:, 1:].contiguous() \
         if args.answer_loss_only else None
 
+    _dump_batch_tokens(tokens, tag="train")
 
     #ADDED
     # Get the masks and postition ids.

@@ -84,6 +84,46 @@ def _create_ds_config_dict():
     return ds_config_dict
     
 
+def _debug_dump_loaded_weights(model):
+    """Print a fingerprint of selected loaded weights, to compare against the universal atoms.
+
+    Under --universal-checkpoint the bf16 weights are rebuilt from the fp32 atoms, so this is
+    the direct way to check that a TP-sharded parameter received the slice it should.
+
+    NOTE: for a 2-D weight of shape [R, C] split over TP, chunk(dim=0) and chunk(dim=1) produce
+    the SAME number of elements, so load_hp_checkpoint_state's numel assertion cannot tell them
+    apart. weight[1,0] does: with the correct row-parallel slice it is W[1,0]; with the wrong
+    axis it is another element of W (edit 24.1 of the pathway page traces it).  Enable with DEBUG_WEIGHT_DUMP=1.
+    """
+    import os
+    if os.environ.get('DEBUG_WEIGHT_DUMP', '0') != '1':
+        return
+    want = os.environ.get('DEBUG_WEIGHT_DUMP_PARAMS',
+                          'layers.0.self_attention.dense.weight,'
+                          'layers.0.self_attention.query_key_value.weight,'
+                          'layers.0.mlp.dense_h_to_4h.weight,'
+                          'layers.0.mlp.dense_4h_to_h.weight,'
+                          'layers.1.self_attention.dense.weight,'
+                          'layers.1.self_attention.query_key_value.weight,'
+                          'layers.1.mlp.dense_h_to_4h.weight,'
+                          'layers.1.mlp.dense_4h_to_h.weight').split(',')
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    tp = mpu.get_tensor_model_parallel_world_size()
+    tpr = mpu.get_tensor_model_parallel_rank()
+    for m in model:
+        mod = m.module if hasattr(m, 'module') else m
+        for n, p in mod.named_parameters():
+            if not any(w.strip() and w.strip() in n for w in want):
+                continue
+            d = p.detach().float().cpu()
+            flat = d.flatten()
+            extra = ""
+            if d.dim() == 2:
+                extra = f" w[1,0]={d[1,0].item():+.8f} w[2,0]={d[2,0].item():+.8f}"
+            print(f"[WDUMP] rank={rank} tp={tpr}/{tp} {n} shape={tuple(d.shape)} "
+                  f"flat[:4]={[round(v,8) for v in flat[:4].tolist()]}{extra}", flush=True)
+
+
 def pretrain(train_valid_test_dataset_provider,
              model_provider,
              model_type,
@@ -684,6 +724,7 @@ def setup_model_and_optimizer(model_provider_func,
             timers = get_timers()
             timers('load-checkpoint', log_level=0).start(barrier=True)
             args.iteration = load_checkpoint(model, optimizer, opt_param_scheduler)
+            _debug_dump_loaded_weights(model)
             timers('load-checkpoint').stop(barrier=True)
             timers.log(['load-checkpoint'])
         else:
