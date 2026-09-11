@@ -88,13 +88,27 @@ def flatten(d, prefix=''):
 # First-principles sharding rules. Derived from the Megatron layer definitions, NOT from the
 # checkpoint's published pattern lists -- that independence is the whole point.
 # --------------------------------------------------------------------------------------------
-LAYER = r'language_model\.encoder\.layers\.\d+\.'
+# A pipeline checkpoint (layer_<idx>-model_<tp>-model_states.pt) names a parameter '<idx>.<name within the layer>', the
+# non-pipeline one 'language_model.encoder.layers.<L>.<name>'; the rules accept both (2026-09-11).
+LAYER = r'(?:language_model\.encoder\.layers\.\d+\.|\d+\.(?:layer\.)?)'   # '<idx>.layer.' = the prediction head's block
 RULES = [
     # (regex, rule, human label)
     (r'language_model\.embedding\.word_embeddings\.weight$', 'vocab', 'vocab embedding'),
     (r'language_model\.output_layer\.weight$', 'vocab', 'vocab output layer'),
+    (r'\d+\.word_embeddings\.weight$', 'vocab', 'vocab embedding (pipeline)'),
+    (r'\d+\.lm_head\.weight$', 'vocab', 'vocab output layer (pipeline)'),
     (LAYER + r'self_attention\.query_key_value\.weight$', 'cat0', 'qkv (column parallel)'),
     (LAYER + r'self_attention\.dense\.weight$', 'cat1', 'attn dense (row parallel)'),
+    # DeepSeek-V3 latent attention (megatron/model/deepseek_v3/attention.py): the narrow down-projections and their norms are
+    # replicated plain modules, the up-projections are column parallel (heads split), the output projection row parallel.
+    (LAYER + r'self_attention\.q_a_proj\.weight$', 'same', 'V3 q_a_proj (replicated)'),
+    (LAYER + r'self_attention\.q_a_layernorm\.weight$', 'same', 'V3 q_a_layernorm (replicated)'),
+    (LAYER + r'self_attention\.kv_a_proj_with_mqa\.weight$', 'same', 'V3 kv_a_proj_with_mqa (replicated)'),
+    (LAYER + r'self_attention\.kv_a_layernorm\.weight$', 'same', 'V3 kv_a_layernorm (replicated)'),
+    (LAYER + r'self_attention\.q_b_proj\.weight$', 'cat0', 'V3 q_b_proj (column parallel)'),
+    (LAYER + r'self_attention\.q_proj\.weight$', 'cat0', 'V3 q_proj, the V2-Lite form (column parallel)'),
+    (LAYER + r'self_attention\.kv_b_proj\.weight$', 'cat0', 'V3 kv_b_proj (column parallel)'),
+    (LAYER + r'self_attention\.o_proj\.weight$', 'cat1', 'V3 o_proj (row parallel)'),
     (LAYER + r'mlp\.dense_4h_to_h\.weight$', 'cat1', 'mlp 4h_to_h (row parallel)'),
     (LAYER + r'mlp\.shared_experts\.shared_mlp\.dense_4h_to_h\.weight$', 'cat1',
      'shared-expert 4h_to_h (row parallel)'),
@@ -104,6 +118,11 @@ RULES = [
     (LAYER + r'input_layernorm\.weight$', 'same', 'input layernorm (replicated)'),
     (LAYER + r'post_attention_layernorm\.weight$', 'same', 'post-attn layernorm (replicated)'),
     (r'language_model\.encoder\.final_layernorm\.weight$', 'same', 'final layernorm (replicated)'),
+    (r'\d+\.weight$', 'same', 'final layernorm (pipeline, replicated)'),
+    # the prediction head (megatron/model/deepseek_v3/mtp.py): its norms and projection are plain replicated modules; the shared table
+    (r'\d+\.(?:enorm|hnorm|final_norm)\.weight$', 'same', 'MTP norm (replicated)'),
+    (r'\d+\.eh_proj\.weight$', 'same', 'MTP eh_proj (replicated)'),
+    (r'tied_modules\.embed\.word_embeddings\.weight$', 'vocab', 'vocab embedding (tied)'),
     (LAYER + r'mlp\.deepspeed_moe\.gate\.wg\.weight$', 'avg', 'MoE router (replicated, averaged)'),
 ]
 EXPERT_RE = re.compile(LAYER + r'mlp\.deepspeed_moe\.experts\.deepspeed_experts\.\d+\.')
@@ -170,7 +189,29 @@ def main():
     sd0 = load(mp_files[0])
     uci = sd0.get('universal_checkpoint_info', {})
     orig_vocab = uci.get('original_vocab_size')
-    slices = [flatten(load(f)['module']) for f in mp_files]
+    layer_files = sorted(glob.glob(os.path.join(args.src, 'layer_*-model_*-model_states.pt')))
+    pipeline = bool(layer_files)
+    if pipeline:
+        # one file per (layer index, TP rank); the parameter name is '<idx>.<key>'; the mp_rank files carry no module state
+        tp = len({re.search(r'-model_(\d+)-', f).group(1) for f in layer_files})
+        slices = [{} for _ in range(tp)]
+        for f in layer_files:
+            m = re.search(r'layer_(\d+)-model_(\d+)-', f)
+            idx, r = int(m.group(1)), int(m.group(2))
+            slices[r].update({f'{idx}.{k}': v for k, v in flatten(load(f)).items()})
+        buffer_names = []
+        for f in mp_files:
+            for n in load(f).get('buffer_names') or []:
+                if n not in buffer_names:
+                    buffer_names.append(n)
+        for r in range(tp):                      # buffers are checked in phase 5, not as parameters
+            for n in buffer_names:
+                slices[r].pop(n, None)
+        print(f'  pipeline checkpoint: {len(layer_files)} layer files, {tp} TP rank{"s" if tp > 1 else ""}, '
+              f'{len(buffer_names)} persistent buffer(s)')
+    else:
+        slices = [flatten(load(f)['module']) for f in mp_files]
+        buffer_names = list(sd0.get('buffer_names') or [])
     names = sorted(slices[0])
     print(f'  {len(names)} non-expert parameters per rank; original_vocab_size={orig_vocab}')
 
@@ -253,12 +294,25 @@ def main():
     print(f'\n=== PHASE 4  expert atoms vs layer_*_expert_*_model_states.pt (independent path) ===')
     first_k = (uci.get('moe') or {}).get('first_k_dense_replace', 0)
     sample = expert if args.max_experts == 0 else expert[::max(1, len(expert) // args.max_experts)]
+    # A pipeline checkpoint numbers the expert files by the stage-local MoE-layer index and the stage's mp rank (engine
+    # _save_moe_checkpoint), so the same file id recurs on every stage: the map pipeline layer index -> (MoE-layer index,
+    # mp rank) is read from the keys of every stage's expert-0 files.
+    pipe_moe_layer = {}
+    if pipeline:
+        for f in glob.glob(os.path.join(args.src, 'layer_*_expert_0_mp_rank_*_model_states.pt')):
+            k = next(iter(load(f)))
+            mm = re.search(r'layer_(\d+)_expert_0_mp_rank_(\d+)_', f)
+            pipe_moe_layer[int(k.split('.')[0])] = (int(mm.group(1)), int(mm.group(2)))
     res = []
     for n in sample:
-        m = re.match(r'language_model\.encoder\.layers\.(\d+)\..*deepspeed_experts\.(\d+)\.', n)
+        m = re.match(r'(?:language_model\.encoder\.layers\.)?(\d+)\..*deepspeed_experts\.(\d+)\.', n)
         layer, gid = int(m.group(1)), int(m.group(2))
-        moe_layer = layer - first_k          # file id is the MoE-layer index, not the layer index
-        cand = glob.glob(os.path.join(args.src, f'layer_{moe_layer}_expert_{gid}_mp_rank_*_model_states.pt'))
+        if pipeline:
+            moe_layer, mp = pipe_moe_layer.get(layer, (-1, 0))
+            cand = glob.glob(os.path.join(args.src, f'layer_{moe_layer}_expert_{gid}_mp_rank_{mp:02d}_model_states.pt'))
+        else:
+            moe_layer = layer - first_k          # file id is the MoE-layer index, not the layer index
+            cand = glob.glob(os.path.join(args.src, f'layer_{moe_layer}_expert_{gid}_mp_rank_*_model_states.pt'))
         if not cand:
             res.append((n, False, float('inf'), f'no weight file layer_{moe_layer}_expert_{gid}_*'))
             continue
@@ -275,6 +329,33 @@ def main():
         rel = (atom.bfloat16().float() - ref).abs().max().item() / max(ref.abs().max().item(), 1e-12)
         res.append((n, rel == 0.0, rel, f'layer_{moe_layer}_expert_{gid} shape={tuple(atom.shape)}'))
     failures += report(f'routed experts (sampled {len(sample)}/{len(expert)})', res, args.verbose)
+
+    # ------------------------------------ phase 5: persistent buffers (the DeepSeek-V3 router bias) as atoms
+    if buffer_names:
+        print(f'\n=== PHASE 5  {len(buffer_names)} persistent buffer(s) vs zero/<name>/buffer.pt ===')
+        res = []
+        for n in buffer_names:
+            if pipeline:
+                m = re.match(r'(\d+)\.(.+)', n)
+                src = [flatten(load(os.path.join(args.src, f'layer_{int(m.group(1)):02d}-model_{r:02d}-model_states.pt')))
+                       .get(m.group(2)) for r in range(tp)]
+            else:
+                src = [flatten(load(f)['module']).get(n) for f in mp_files]
+            if any(v is None for v in src):
+                res.append((n, False, float('inf'), 'not in the source files'))
+                continue
+            if any(not torch.equal(src[0], v) for v in src[1:]):
+                res.append((n, False, float('inf'), 'differs across TP ranks'))
+                continue
+            path = os.path.join(zdir, n, 'buffer.pt')
+            if not os.path.isfile(path):
+                res.append((n, False, float('inf'), 'missing buffer.pt (converted before buffers became atoms?)'))
+                continue
+            atom = load(path)['buffer']
+            ok = atom.shape == src[0].shape and torch.equal(atom.float(), src[0].float())
+            dev = 0.0 if ok else (atom.float() - src[0].float()).abs().max().item() if atom.shape == src[0].shape else float('inf')
+            res.append((n, ok, dev, f'shape={tuple(atom.shape)} max|value|={src[0].float().abs().max().item():.4g}'))
+        failures += report('persistent buffers (bit-equal to TP rank 0)', res, args.verbose)
 
     print(f'\n{"=" * 78}')
     print('ALL CHECKS PASSED' if not failures else f'*** {failures} CHECK GROUP(S) FAILED ***')
