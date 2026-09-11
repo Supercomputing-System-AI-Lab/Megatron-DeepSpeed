@@ -89,13 +89,15 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_interleaved_rope(x, cos, sin):
+def apply_interleaved_rope(x, cos, sin, interleaved=True):
     """x [s, b, heads, dim]; cos, sin [s, dim] (one angle per position) or [s, b, dim] (one per position and row, the ragged
     decode) in fp32. The released apply_rotary_pos_emb_interleave: the channel pairs (2k, 2k+1) are first regrouped into two
     halves, then the halves rotation is applied; the result keeps the regrouped order, on q and k alike, so their dot product is
-    the one of the interleaved pairs."""
+    the one of the interleaved pairs. interleaved=False is the halves pairing (channel j with j + dim/2) without the regroup:
+    the released apply_rotary_emb(..., interleaved=False) of the V3.2 indexer ("rope in indexer is not interleaved")."""
     s, b, h, d = x.shape
-    x = x.view(s, b, h, d // 2, 2).transpose(4, 3).reshape(s, b, h, d)
+    if interleaved:
+        x = x.view(s, b, h, d // 2, 2).transpose(4, 3).reshape(s, b, h, d)
     if cos.dim() == 2:
         c = cos.to(x.dtype)[:, None, None, :]
         sn = sin.to(x.dtype)[:, None, None, :]

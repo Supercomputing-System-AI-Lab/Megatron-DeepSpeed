@@ -699,7 +699,16 @@ def _fold_pipe_moe_rider(loss):
             _PIPE_DBG['rider'] += 1
             print(f'[pipe-moe] rider={rider.sum().item():.6e} coeff={coeff} '
                   f'lm_loss={loss.item():.6e}', flush=True)
-        loss = loss + coeff * rider.sum()
+        if rider.numel() == 2:
+            # [the MoE balance loss, the V3.2 indexer loss], each with its own coefficient; both printed as parts
+            c_idx = getattr(args, 'indexer_loss_coeff', 0.0) or 0.0
+            loss = loss + coeff * rider[0] + c_idx * rider[1]
+            if torch.is_grad_enabled():
+                from .deepseek_v3.mtp import _record_part
+                _record_part('moe balance loss', rider[0])
+                _record_part('indexer loss', rider[1])
+        else:
+            loss = loss + coeff * rider.sum()
     return loss
 
 

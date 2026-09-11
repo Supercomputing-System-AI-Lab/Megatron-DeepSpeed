@@ -640,7 +640,7 @@ def _validate_deepseek_v3_args(args):
     if args.attention_variant != 'deepseek_v3':
         defaults = {'q_lora_rank': None, 'scoring_func': None, 'topk_method': None, 'yarn_factor': None, 'n_group': 1,
                     'moe_router_bias_update_speed': 0.0, 'moe_seq_balance_coeff': 0.0, 'num_nextn_predict_layers': 0,
-                    'index_topk': 0, 'indexer_loss_coeff': 0.0}
+                    'index_topk': 0, 'index_n_heads': 0, 'indexer_loss_coeff': 0.0}
         given = [k for k, d in defaults.items() if getattr(args, k) != d]
         assert not given, f'DeepSeek-V3 arguments given without --attention-variant deepseek_v3: {given}'
         args.attention_kinds = None

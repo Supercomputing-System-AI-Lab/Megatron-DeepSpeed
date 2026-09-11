@@ -369,7 +369,8 @@ class EmbeddingPipe(Embedding):
             # travels the pipe as an activation. Optionally start the MoE
             # auxiliary-loss rider (a differentiable fp32 scalar).
             if getattr(self._args, 'pipe_moe_aux_loss', False):
-                rider = torch.zeros(1, dtype=torch.float32,
+                n_slots = 2 if int(getattr(self._args, 'index_topk', 0) or 0) > 0 else 1   # + the V3.2 indexer loss
+                rider = torch.zeros(n_slots, dtype=torch.float32,
                                     device=embeddings.device)
                 return embeddings, attention_mask, rider
             return embeddings, attention_mask

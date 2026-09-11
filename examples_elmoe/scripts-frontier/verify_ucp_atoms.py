@@ -109,6 +109,10 @@ RULES = [
     (LAYER + r'self_attention\.q_proj\.weight$', 'cat0', 'V3 q_proj, the V2-Lite form (column parallel)'),
     (LAYER + r'self_attention\.kv_b_proj\.weight$', 'cat0', 'V3 kv_b_proj (column parallel)'),
     (LAYER + r'self_attention\.o_proj\.weight$', 'cat1', 'V3 o_proj (row parallel)'),
+    # DeepSeek-V3.2 lightning indexer (megatron/model/deepseek_v3/indexer.py): every rank scores every row, so its four pieces are
+    # plain replicated modules (the released Indexer's wq_b, wk, k_norm with weight and bias, weights_proj)
+    (LAYER + r'self_attention\.indexer\.(?:wq_b|wk|weights_proj)\.weight$', 'same', 'V3.2 indexer projection (replicated)'),
+    (LAYER + r'self_attention\.indexer\.k_norm\.(?:weight|bias)$', 'same', 'V3.2 indexer key norm (replicated)'),
     (LAYER + r'mlp\.dense_4h_to_h\.weight$', 'cat1', 'mlp 4h_to_h (row parallel)'),
     (LAYER + r'mlp\.shared_experts\.shared_mlp\.dense_4h_to_h\.weight$', 'cat1',
      'shared-expert 4h_to_h (row parallel)'),

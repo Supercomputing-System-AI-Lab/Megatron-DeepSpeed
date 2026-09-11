@@ -142,6 +142,14 @@ class DeepSeekV3Attention(MegatronModule):
 
         self.rotary = YarnRotaryTable(self.qk_rope_head_dim, args.rotary_base, yarn_from_args(args))
         self.softmax_scale = (self.qk_head_dim ** (-0.5)) * self.rotary.softmax_scale_factor()
+        # V3.2 (blueprint CS7): the lightning indexer and the sparse core behind --index-topk; 0 leaves the V3 module as it is
+        self.indexer = None
+        self.dsa_dense_warmup = bool(getattr(args, 'dsa_dense_warmup', False))
+        self._indexer_loss = None
+        if int(getattr(args, 'index_topk', 0) or 0) > 0:
+            from .indexer import V32Indexer
+            self.indexer = V32Indexer(config, h, self.q_lora_rank, args.index_n_heads, args.index_head_dim, args.index_topk,
+                                      self.qk_rope_head_dim, eps)
 
         from deepspeed.accelerator import get_accelerator
         self.use_flash = bool(args.use_flash_attn_v2 and not args.use_flash_attn_triton
@@ -276,16 +284,19 @@ class DeepSeekV3Attention(MegatronModule):
                 row_lengths = None                       # the ragged contract is a one-token step; a prefill is uniform
             query_start = inference_params.sequence_len_offset
 
+        qr = None
         if self.q_lora_rank is None:
             q, _ = self.q_proj(x)
         else:
-            q, _ = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
+            qr = self.q_a_layernorm(self.q_a_proj(x))
+            q, _ = self.q_b_proj(qr)
         q = q.view(s, b, hp, self.qk_head_dim)
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         compressed = self.kv_a_proj_with_mqa(x)
         latent, k_pe = torch.split(compressed, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        kv, _ = self.kv_b_proj(self.kv_a_layernorm(latent))
+        latent = self.kv_a_layernorm(latent)
+        kv, _ = self.kv_b_proj(latent)
         kv = kv.view(s, b, hp, self.qk_nope_head_dim + self.v_head_dim)
         k_nope, value = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         k_pe = k_pe.view(s, b, 1, self.qk_rope_head_dim)
@@ -319,9 +330,46 @@ class DeepSeekV3Attention(MegatronModule):
             v_mem[query_start:seq_end, b0:b1] = value
             key = k_mem[:seq_end, b0:b1]
             value = v_mem[:seq_end, b0:b1]
-        if self.use_flash and (cache is None or self.training is False):
+        if self.indexer is not None and cache is None:
+            context = self._dsa_forward(x, qr, q_nope, q_pe, latent, k_pe, query, key, value, cos, sin, attention_mask, s, b, hp)
+        elif self.use_flash and (cache is None or self.training is False):
             context = self._flash_attention(query, key, value, attention_mask if cache is None else None)
         else:
             context = self._eager_attention(query, key, value, query_start)
         output, bias = self.o_proj(context)
         return output, bias
+
+    # ------------------------------------------------------------------ V3.2 (blueprint CS7)
+    def _dsa_forward(self, x, qr, q_nope, q_pe, latent, k_pe, query, key, value, cos, sin, attention_mask, s, b, hp):
+        """The indexer on detached inputs (it learns from its own loss only), then either the dense core with the warm-up
+        loss (eq. 3) or the latent sparse core with the sparse-stage loss (eq. 4); the scalar waits in _indexer_loss for
+        pop_indexer_loss(). The cu_seqlens of intra-document attention give the visibility (one sequence per micro-batch)."""
+        from .losses import dense_attention_probs, indexer_loss_dense, indexer_loss_sparse
+        from .sparse_core import build_visibility, sparse_latent_attention
+        cu = None
+        if self.intra_document_attention and attention_mask is not None and attention_mask.dtype in (torch.int32, torch.int64):
+            assert b == 1, 'the document visibility of the sparse attention is built for a micro-batch of one sequence'
+            cu = attention_mask
+        visible = build_visibility(s, cu, x.device)
+        topk_idx, topk_scores, index_scores = self.indexer(x.detach(), qr.detach(), cos, sin, visible)
+        if self.dsa_dense_warmup:
+            if self.use_flash:
+                context = self._flash_attention(query, key, value, attention_mask)
+            else:
+                context = self._eager_attention(query, key, value, 0)
+            probs = dense_attention_probs(query.detach(), key.detach(), self.softmax_scale, visible)
+            self._indexer_loss = indexer_loss_dense(index_scores, probs)
+            return context
+        ctx, probs, _ = sparse_latent_attention(q_nope, q_pe, latent, k_pe[:, :, 0], topk_idx, self.kv_b_proj.weight,
+                                                self.softmax_scale)
+        self._indexer_loss = indexer_loss_sparse(topk_scores, probs.detach())
+        return ctx.reshape(s, b, hp * self.v_head_dim)
+
+    def pop_indexer_loss(self):
+        """The indexer loss of the last forward (a fp32 scalar with its graph), then None until the next forward; a zero
+        scalar when the indexer is off or the last forward ran through the inference cache."""
+        loss = self._indexer_loss
+        self._indexer_loss = None
+        if loss is None:
+            return torch.zeros((), dtype=torch.float32, device=self.o_proj.weight.device)
+        return loss

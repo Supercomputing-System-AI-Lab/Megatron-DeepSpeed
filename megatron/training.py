@@ -656,6 +656,11 @@ def setup_model_and_optimizer(model_provider_func,
         if teacher:
             optimizer = None
         else:
+            if getattr(args, 'dsa_freeze_non_indexer', False):
+                # the V3.2 dense warm-up (blueprint CS7): only the indexer learns; frozen by learning rate (lr_mult 0 outside
+                # indexer.*) so every optimizer group and the ZeRO layout stay as they are (indexer.py warmup_lr_condition)
+                from megatron.model.deepseek_v3.indexer import warmup_lr_condition
+                scale_lr_cond, lr_mult = warmup_lr_condition, 0.0
             optimizer = get_megatron_optimizer(model, no_wd_decay_cond,
                                                scale_lr_cond, lr_mult)
         # opt_param_scheduler is the old lr_scheduler plus weight decay scheduling

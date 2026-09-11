@@ -263,6 +263,12 @@ def model_provider(pre_process=True, post_process=True):
                 post_process=post_process
             )
     '''
+    if getattr(args, 'dsa_freeze_non_indexer', False):
+        # the dense warm-up of DeepSeek-V3.2 (blueprint CS7): only the indexer learns; the freeze is by learning rate
+        # (megatron/training.py hands indexer.warmup_lr_condition to the optimizer's groups), so nothing changes here but the log
+        from megatron.model.deepseek_v3.indexer import warmup_split
+        n_idx, n_total = warmup_split(model)
+        print_rank_0(f'[deepseek_v3.2] dense warm-up: {n_idx:,} of {n_total:,} parameters learn (indexer.*); the rest at learning rate 0')
     see_memory_usage(f"After Building Model", force=True)
     return model
 
