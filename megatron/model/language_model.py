@@ -352,6 +352,16 @@ class EmbeddingPipe(Embedding):
 
         # If cmd args has attn_mask, we don't forward it as an activation.
         if hasattr(self._args, 'attn_mask'):
+            if getattr(self._args, 'pipe_moe_aux_loss', False):
+                # The MoE auxiliary-loss rider under the cached mask (2026-09-11): the rider needs the 3-tuple contract
+                # (hidden, mask slot, rider), so a one-element placeholder rides in the mask slot; the layers put the
+                # cached mask back (ParallelTransformerLayerPipe.forward). Without this the rider was born only under
+                # --intra-document-attention and every other pipeline run dropped the auxiliary loss silently.
+                # two slots when the V3.2 indexer is on: [the MoE balance loss, the indexer loss]
+                n_slots = 2 if int(getattr(self._args, 'index_topk', 0) or 0) > 0 else 1
+                rider = torch.zeros(n_slots, dtype=torch.float32, device=embeddings.device)
+                placeholder = torch.zeros(1, dtype=torch.bool, device=embeddings.device)
+                return embeddings, placeholder, rider
             return embeddings
         else:
             # Reachable only under --intra-document-attention (model_provider

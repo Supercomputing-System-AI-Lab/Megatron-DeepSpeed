@@ -1894,16 +1894,30 @@ class ParallelTransformerLayerPipe(ParallelTransformerLayer):
             # the pipe as a differentiable fp32 scalar; the loss function adds
             # moe_loss_coeff * rider at the last stage.
             hidden_states, attention_mask, rider = inputs
+            mask_slot = attention_mask
+            if attention_mask.numel() == 1 and hasattr(self._args, 'attn_mask'):
+                # the one-element placeholder EmbeddingPipe sends under the cached mask (the rider's 3-tuple contract):
+                # attend with the cached mask, keep the placeholder in the stream
+                attention_mask = self._args.attn_mask
             out = super().forward(hidden_states, attention_mask, **kwargs,
                                   rotary_pos_emb=rotary_pos_emb)
             layer_moe = out[1] if isinstance(out, tuple) and len(out) > 1 else None
+            moe_sum = None
             if layer_moe is not None and torch.is_tensor(layer_moe):
-                rider = rider + layer_moe.float().reshape(1)
+                moe_sum = layer_moe.float().reshape(())
             elif isinstance(layer_moe, (list, tuple)):
                 for l in layer_moe:
                     if torch.is_tensor(l):
-                        rider = rider + l.float().reshape(1)
-            return out[0], attention_mask, rider
+                        moe_sum = l.float().reshape(()) if moe_sum is None else moe_sum + l.float().reshape(())
+            if rider.numel() == 2:
+                # the V3.2 indexer loss rides in the second slot (megatron/model/deepseek_v3/attention.py pop_indexer_loss)
+                idx = self.self_attention.pop_indexer_loss() if hasattr(self.self_attention, 'pop_indexer_loss') else None
+                add = torch.stack([moe_sum if moe_sum is not None else rider.new_zeros(()),
+                                   idx.float().reshape(()) if idx is not None else rider.new_zeros(())])
+                rider = rider + add
+            elif moe_sum is not None:
+                rider = rider + moe_sum.reshape(1)
+            return out[0], mask_slot, rider
         else:
             raise RuntimeError('Received more inputs than understood.')
 
