@@ -44,6 +44,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_inference_args(parser)
     parser = _add_transformer_engine_args(parser)
     parser = _add_retro_args(parser)
+    parser = _add_deepseek_v3_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -474,6 +475,8 @@ def validate_args(args):
             data_paths.append(f"{args.aml_data_download_path}/{path}")
         args.data_path = data_paths
 
+    _validate_deepseek_v3_args(args)
+
     # GQA
     if not args.use_dataset_only:
         if args.num_key_value_heads is None:
@@ -585,6 +588,84 @@ def _add_inference_args(parser):
                        'Bert embedder.')
 
     return parser
+
+
+def _add_deepseek_v3_args(parser):
+    """The DeepSeek-V3 group (blueprint CS1). Names are the released config.json keys with dashes; every default keeps
+    today's model. Consumers: the attention module (CS2), the router (CS3), the rotary table (CS4); the prediction head (CS5)
+    and the V3.2 indexer (CS7) are accepted here and refused by the validation until they are built."""
+    group = parser.add_argument_group(title='DeepSeek-V3')
+    group.add_argument('--attention-variant', type=str, default='default', choices=['default', 'deepseek_v3'],
+                       help='deepseek_v3 builds the multi-head latent attention for every layer (megatron/model/deepseek_v3).')
+    group.add_argument('--q-lora-rank', type=int, default=None, help='query latent width; None = the V2-Lite form (q_proj).')
+    group.add_argument('--kv-lora-rank', type=int, default=512, help='key/value latent width.')
+    group.add_argument('--qk-nope-head-dim', type=int, default=128, help='per-head channels without rotary.')
+    group.add_argument('--qk-rope-head-dim', type=int, default=64, help='per-head rotary channels (shared key part).')
+    group.add_argument('--v-head-dim', type=int, default=128, help='per-head value width.')
+    group.add_argument('--scoring-func', type=str, default=None, choices=['softmax', 'sigmoid'],
+                       help='router affinity; None = the gate as today.')
+    group.add_argument('--topk-method', type=str, default=None, choices=['greedy', 'noaux_tc'],
+                       help='noaux_tc = the balancing bias and the group-limited choice.')
+    group.add_argument('--n-group', type=int, default=1, help='expert groups for the group-limited choice.')
+    group.add_argument('--topk-group', type=int, default=1, help='groups kept per token.')
+    group.add_argument('--norm-topk-prob', action='store_true', help='normalise the chosen affinities to sum 1.')
+    group.add_argument('--routed-scaling-factor', type=float, default=1.0, help='multiplier on the routed weights (V3: 2.5).')
+    group.add_argument('--moe-router-bias-update-speed', type=float, default=0.0,
+                       help='the auxiliary-loss-free bias step gamma (V3 report: 0.001); 0 = no bias.')
+    group.add_argument('--moe-seq-balance-coeff', type=float, default=0.0, help='the sequence-wise balance loss alpha (V3: 0.0001).')
+    group.add_argument('--yarn-factor', type=float, default=None, help='YaRN scaling factor; None = no YaRN.')
+    group.add_argument('--yarn-original-max-position-embeddings', type=int, default=None)
+    group.add_argument('--yarn-beta-fast', type=float, default=32.0)
+    group.add_argument('--yarn-beta-slow', type=float, default=1.0)
+    group.add_argument('--yarn-mscale', type=float, default=1.0)
+    group.add_argument('--yarn-mscale-all-dim', type=float, default=1.0)
+    group.add_argument('--num-nextn-predict-layers', type=int, default=0, help='the multi-token prediction depth (V3: 1); not built yet.')
+    group.add_argument('--mtp-loss-scaling-factor', type=float, default=0.3)
+    group.add_argument('--mtp-loss-scaling-factor-decay', type=float, default=0.1)
+    group.add_argument('--mtp-loss-decay-start-iteration', type=int, default=None)
+    group.add_argument('--index-n-heads', type=int, default=0, help='V3.2 indexer heads; 0 = no indexer.')
+    group.add_argument('--index-head-dim', type=int, default=128)
+    group.add_argument('--index-topk', type=int, default=0, help='V3.2 sparse attention top-k; 0 = the V3 attention.')
+    group.add_argument('--indexer-loss-coeff', type=float, default=0.0)
+    group.add_argument('--dsa-dense-warmup', action='store_true')
+    group.add_argument('--dsa-freeze-non-indexer', action='store_true')
+    group.add_argument('--dsa-rotate-activation', action='store_true')
+    return parser
+
+
+def _validate_deepseek_v3_args(args):
+    """Refuses what the V3 modules cannot serve and derives the per-layer attention kinds (blueprint CS1)."""
+    if args.attention_variant != 'deepseek_v3':
+        defaults = {'q_lora_rank': None, 'scoring_func': None, 'topk_method': None, 'yarn_factor': None, 'n_group': 1,
+                    'moe_router_bias_update_speed': 0.0, 'moe_seq_balance_coeff': 0.0, 'num_nextn_predict_layers': 0,
+                    'index_topk': 0, 'indexer_loss_coeff': 0.0}
+        given = [k for k, d in defaults.items() if getattr(args, k) != d]
+        assert not given, f'DeepSeek-V3 arguments given without --attention-variant deepseek_v3: {given}'
+        args.attention_kinds = None
+        return
+    assert args.num_attention_heads % args.tensor_model_parallel_size == 0, \
+        'the latent attention slices its heads over tensor parallelism'
+    assert args.qk_rope_head_dim % 2 == 0, 'the rotary channels come in pairs'
+    assert args.transformer_impl == 'local', 'the latent attention is built for the local transformer implementation'
+    assert not args.use_flash_attn_triton, 'the Triton flash path takes no softmax scale'
+    assert args.ds_sequence_parallel_size == 1, 'DeepSpeed-Ulysses shards the sequence itself; not combined with the latent attention'
+    assert not getattr(args, 'retro_add_retriever', False), 'retro is not combined with the latent attention'
+    n_experts = args.num_experts[0] if isinstance(args.num_experts, (list, tuple)) else args.num_experts
+    if args.scoring_func == 'sigmoid' or args.topk_method == 'noaux_tc':
+        assert n_experts % args.n_group == 0, f'--num-experts {n_experts} must divide into --n-group {args.n_group}'
+        assert args.topk_group <= args.n_group, '--topk-group cannot exceed --n-group'
+        assert args.topk <= args.topk_group * (n_experts // args.n_group), 'the kept groups must hold at least --topk experts'
+    if args.moe_router_bias_update_speed > 0.0:
+        assert args.topk_method == 'noaux_tc', 'the balancing bias belongs to --topk-method noaux_tc'
+    if args.yarn_factor is not None:
+        assert args.yarn_original_max_position_embeddings is not None, '--yarn-factor needs --yarn-original-max-position-embeddings'
+    assert args.moe_seq_balance_coeff == 0.0, 'the sequence-wise balance loss (decision V3) is not built yet'
+    assert args.num_nextn_predict_layers == 0, 'the multi-token prediction head (blueprint CS5) is not built yet'
+    assert args.index_topk == 0 and args.index_n_heads == 0 and args.indexer_loss_coeff == 0.0 and not args.dsa_dense_warmup \
+        and not args.dsa_freeze_non_indexer, 'the V3.2 indexer (blueprint CS7) is not built yet'
+    args.attention_kinds = ['mla'] * (args.num_layers + args.num_nextn_predict_layers)
+    # V3 has no absolute position table; only --use-rotary-position-embeddings clears this flag otherwise.
+    args.add_position_embedding = False
 
 
 def _add_retro_args(parser):

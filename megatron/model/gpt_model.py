@@ -880,12 +880,15 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                 n_e = 1
             if layer_num <= args.first_k_dense_replace:
                 n_e = 1
+            _kinds = getattr(args, 'attention_kinds', None)
+            _kind = _kinds[layer_idx] if _kinds else None   # 0-based here; the V3 variant sets one kind per layer
             self.specs.append(
                 LayerSpec(ParallelTransformerLayerPipe,
                     config,
                     layer_number=layer_idx,
                     self_attn_mask_type=AttnMaskType.causal,
                     num_experts=n_e,
+                    attention_kind=_kind,
                     ))
 
         # Final layernorm after transformer layers

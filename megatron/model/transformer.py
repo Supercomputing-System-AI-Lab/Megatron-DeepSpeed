@@ -1073,8 +1073,51 @@ class ParallelAttention(MegatronModule):
             
             if TIMING: 
                 self.OUT_TIMER.stop()
+                
+        # # --- DEBUG: dump the attention weight matrices + biases (TP-slice local) ---
+        # _tp = mpu.get_tensor_model_parallel_rank()
+        # _tpw = mpu.get_tensor_model_parallel_world_size()
+        # _mods = [(_n, getattr(self, _n, None))
+        #          for _n in ('query_key_value', 'query', 'key_value', 'dense')]
+        # for _n, _m in [(_n, _m) for _n, _m in _mods if _m is not None]:
+        #     _w = _m.weight
+        #     print (f'[transformers.py] WEIGHT layer={self.layer_number} {_n} tp={_tp}/{_tpw} '
+        #            f'shape={tuple(_w.shape)} dtype={_w.dtype} '
+        #            f'w[0,:6]={[round(x, 8) for x in _w[0, :6].float().tolist()]} '
+        #            f'w[1,0]={_w[1,0].item():+.8f} w[2,0]={_w[2,0].item():+.8f} '
+        #            f'norm={_w.float().norm().item():.6f} sum={_w.float().sum().item():+.6f}')
+        #     _b = getattr(_m, 'bias', None)
+        #     if _b is None:
+        #         print (f'[transformers.py] BIAS   layer={self.layer_number} {_n} tp={_tp}/{_tpw} bias=None')
+        #     else:
+        #         print (f'[transformers.py] BIAS   layer={self.layer_number} {_n} tp={_tp}/{_tpw} '
+        #                f'shape={tuple(_b.shape)} b[:6]={[round(x, 8) for x in _b[:6].float().tolist()]} '
+        #                f'norm={_b.float().norm().item():.6f} sum={_b.float().sum().item():+.6f}')
+        # print (f'[transformers.py] DROPOUT layer={self.layer_number} '
+        #        f'training={self.training} attn_dropout_p='
+        #        f'{getattr(getattr(self, "core_attention_flash", None), "dropout_p", None)}')
+        # # --- END DEBUG ---
+
+        if (os.getenv ('DEBUG_ACTIVATION_OUTPUT') == 1): 
+            print (f'[transformers.py] AFTER OUT {output.shape=}\n{output[0][0][:30]=}')
 
         return output, bias
+
+
+def _build_self_attention(config, layer_number, attention_kind, self_attn_mask_type):
+    """One place chooses the attention class of a layer (V3 blueprint CS1). attention_kind None builds ParallelAttention exactly
+    as before; 'mla' builds the DeepSeek-V3 latent attention (megatron/model/deepseek_v3/attention.py), which takes the same
+    call and returns the same pair."""
+    if attention_kind is None:
+        return ParallelAttention(
+            config,
+            layer_number,
+            attention_type=AttnType.self_attn,
+            attn_mask_type=self_attn_mask_type)
+    if attention_kind == 'mla':
+        from megatron.model.deepseek_v3.attention import DeepSeekV3Attention
+        return DeepSeekV3Attention(config, layer_number, attn_mask_type=self_attn_mask_type)
+    raise ValueError(f'unknown attention_kind {attention_kind!r} for layer {layer_number}')
 
 
 def bias_dropout_add(x, bias, residual, prob, training):
@@ -1128,7 +1171,7 @@ class ParallelTransformerLayer(MegatronModule):
     def __init__(self, config,
                  layer_number, layer_type=LayerType.encoder,
                  self_attn_mask_type=AttnMaskType.padding,
-                 drop_path_rate=0., num_experts=1):
+                 drop_path_rate=0., num_experts=1, attention_kind=None):
         # retriever=None):
         args = get_args()
 
@@ -1166,12 +1209,9 @@ class ParallelTransformerLayer(MegatronModule):
                     eps=config.layernorm_epsilon)
         else:
             self.input_layernorm = MixedFusedRMSNorm(config.hidden_size, config.layernorm_epsilon)
-        # Self attention.
-        self.self_attention = ParallelAttention(
-            config,
-            layer_number,
-            attention_type=AttnType.self_attn,
-            attn_mask_type=self_attn_mask_type)
+        # Self attention: the kind comes from the build loop (None = ParallelAttention as before; 'mla' = DeepSeek-V3).
+        self.attention_kind = attention_kind
+        self.self_attention = _build_self_attention(config, layer_number, attention_kind, self_attn_mask_type)
         self.hidden_dropout = config.hidden_dropout
         self.bias_dropout_fusion = config.bias_dropout_fusion
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else None
@@ -2055,7 +2095,7 @@ class ParallelTransformer(MegatronModule):
                 "Full recompute not supported for Retro."
             assert args.transformer_impl == 'local', \
                 "Transformer engine does not support Retro layers."
-        def build_layer(layer_number, n_e):
+        def build_layer(layer_number, n_e, attention_kind=None):
             if args.transformer_impl == 'local':
                 current_layer_type = _get_layer_type(
                     model_type, layer_type, self.retro_layer_numbers,
@@ -2066,7 +2106,8 @@ class ParallelTransformer(MegatronModule):
                     layer_type=current_layer_type,
                     self_attn_mask_type=self_attn_mask_type,
                     drop_path_rate=self.drop_path_rates[layer_number - 1],
-                    num_experts=n_e)
+                    num_experts=n_e,
+                    attention_kind=attention_kind)
             else:
                 assert config.num_attention_heads == config.num_key_value_heads, \
                         'Transformer_engine does not support GQA'
@@ -2162,7 +2203,10 @@ class ParallelTransformer(MegatronModule):
                 # n_e == 1 falls through to the existing dense ParallelMLP branch.
                 if layer_num <= args.first_k_dense_replace:
                     n_e = 1
-                self.layers.append(build_layer(layer_num, n_e))
+                # the attention kind of this layer (1-based here, 0-based in the pipe loop): the V3 variant sets one per layer
+                kinds = getattr(args, 'attention_kinds', None)
+                kind = kinds[layer_num - 1] if kinds else None
+                self.layers.append(build_layer(layer_num, n_e, kind))
             self.layers = torch.nn.ModuleList(self.layers)
 
             # Update dropout rate for Retro encoder.

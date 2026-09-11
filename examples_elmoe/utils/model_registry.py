@@ -44,6 +44,86 @@ MODEL_SPECS = {
                      "eod_token": "<｜end▁of▁sentence｜>",
                      "softmax_before_topk": True},
 
+    # DeepSeek-V3 in the 16B shape (blueprint decision V1): DeepSeek-V2-Lite's outer shape with V3's attention and router fields.
+    # The "v3" sub-dict uses the released config.json keys; get_v3_flags renders it. rope_scaling None until an extension stage
+    # (CS4) sets {"factor": 40, "original_max_position_embeddings": 4096, "beta_fast": 32, "beta_slow": 1, "mscale": 1.0, "mscale_all_dim": 1.0}.
+    # num_nextn_predict_layers stays 0 until the prediction head (CS5) is built.
+    "V3S_16B": {"h": 2048, "ffn": 1408, "heads": 16, "ep": 64, "k": 6, "s": 4096, "layers": 27,
+                "shared": 2, "first_k_dense": 1, "dense_ffn": 10944, "expert_interval": 1,
+                "norm": "rmsnorm", "norm_eps": 1e-6, "bias": False, "swiglu": True,
+                "untie_embeddings": True, "vocab": 102400,
+                "tokenizer_type": "HFTokenizer",
+                "eod_token": "<｜end▁of▁sentence｜>",
+                "v3": {"q_lora_rank": 512, "kv_lora_rank": 512, "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+                       "scoring_func": "sigmoid", "topk_method": "noaux_tc", "n_group": 8, "topk_group": 4, "norm_topk_prob": True,
+                       "routed_scaling_factor": 2.5, "moe_router_bias_update_speed": 0.001, "moe_seq_balance_coeff": 0.0,   # 0.0001 once the loss (decision V3) is built
+                       "num_nextn_predict_layers": 0, "rope_scaling": None}},
+    # The first smoke of the latent attention alone: V3S_16B's attention fields with today's gate (softmax before top-k, as DeepSeek_16B).
+    "V3S_16B_MLA": {"h": 2048, "ffn": 1408, "heads": 16, "ep": 64, "k": 6, "s": 4096, "layers": 27,
+                "shared": 2, "first_k_dense": 1, "dense_ffn": 10944, "expert_interval": 1,
+                "norm": "rmsnorm", "norm_eps": 1e-6, "bias": False, "swiglu": True,
+                "untie_embeddings": True, "vocab": 102400,
+                "tokenizer_type": "HFTokenizer",
+                "eod_token": "<｜end▁of▁sentence｜>",
+                "softmax_before_topk": True,
+                "v3": {"q_lora_rank": 512, "kv_lora_rank": 512, "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+                       "num_nextn_predict_layers": 0, "rope_scaling": None}},
+    # The YaRN extension smoke (CS4): V3S_16B at 8,192 tokens with the rotary table scaled by 2 from an original 4,096 (V3's mscale 1.0).
+    "V3S_16B_YARN8K": {"h": 2048, "ffn": 1408, "heads": 16, "ep": 64, "k": 6, "s": 8192, "layers": 27,
+                "shared": 2, "first_k_dense": 1, "dense_ffn": 10944, "expert_interval": 1,
+                "norm": "rmsnorm", "norm_eps": 1e-6, "bias": False, "swiglu": True,
+                "untie_embeddings": True, "vocab": 102400,
+                "tokenizer_type": "HFTokenizer",
+                "eod_token": "<｜end▁of▁sentence｜>",
+                "v3": {"q_lora_rank": 512, "kv_lora_rank": 512, "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+                       "scoring_func": "sigmoid", "topk_method": "noaux_tc", "n_group": 8, "topk_group": 4, "norm_topk_prob": True,
+                       "routed_scaling_factor": 2.5, "moe_router_bias_update_speed": 0.001, "moe_seq_balance_coeff": 0.0,
+                       "num_nextn_predict_layers": 0,
+                       "rope_scaling": {"factor": 2, "original_max_position_embeddings": 4096, "beta_fast": 32, "beta_slow": 1,
+                                        "mscale": 1.0, "mscale_all_dim": 1.0}}},
+    # DeepSeek-V2-Lite as released (config_deepseek_v2_lite.json): the import probe of the latent attention (no query latent, softmax router).
+    "DeepSeek_V2_Lite": {"h": 2048, "ffn": 1408, "heads": 16, "ep": 64, "k": 6, "s": 4096, "layers": 27,
+                "shared": 2, "first_k_dense": 1, "dense_ffn": 10944, "expert_interval": 1,
+                "norm": "rmsnorm", "norm_eps": 1e-6, "bias": False, "swiglu": True,
+                "untie_embeddings": True, "vocab": 102400,
+                "tokenizer_type": "HFTokenizer",
+                "eod_token": "<｜end▁of▁sentence｜>",
+                "v3": {"q_lora_rank": None, "kv_lora_rank": 512, "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+                       "scoring_func": "softmax", "topk_method": "greedy", "n_group": 1, "topk_group": 1, "norm_topk_prob": False,
+                       "routed_scaling_factor": 1.0, "moe_router_bias_update_speed": 0.0, "num_nextn_predict_layers": 0,
+                       "rope_scaling": {"factor": 40, "original_max_position_embeddings": 4096, "beta_fast": 32, "beta_slow": 1,
+                                        "mscale": 0.707, "mscale_all_dim": 0.707}}},
+    
+    "DeepSeek_16B_8k": {"h": 2048, "ffn": 1408, "heads": 16, "ep": 64,  "k": 6, "s": 8192, "layers": 28,
+                         "shared": 2, "first_k_dense": 1, "dense_ffn": 10944, "expert_interval": 1,
+                         "norm": "rmsnorm", "norm_eps": 1e-6, "bias": False, "swiglu": True,
+                         "untie_embeddings": True, "vocab": 102400,
+                         "tokenizer_type": "HFTokenizer",
+                         "eod_token": "<｜end▁of▁sentence｜>",
+                         "softmax_before_topk": True},
+    "DeepSeek_16B_12k": {"h": 2048, "ffn": 1408, "heads": 16, "ep": 64,  "k": 6, "s": 12288, "layers": 28,
+                         "shared": 2, "first_k_dense": 1, "dense_ffn": 10944, "expert_interval": 1,
+                         "norm": "rmsnorm", "norm_eps": 1e-6, "bias": False, "swiglu": True,
+                         "untie_embeddings": True, "vocab": 102400,
+                         "tokenizer_type": "HFTokenizer",
+                         "eod_token": "<｜end▁of▁sentence｜>",
+                         "softmax_before_topk": True},
+    "DeepSeek_16B_16k": {"h": 2048, "ffn": 1408, "heads": 16, "ep": 64,  "k": 6, "s": 16384, "layers": 28,
+                         "shared": 2, "first_k_dense": 1, "dense_ffn": 10944, "expert_interval": 1,
+                         "norm": "rmsnorm", "norm_eps": 1e-6, "bias": False, "swiglu": True,
+                         "untie_embeddings": True, "vocab": 102400,
+                         "tokenizer_type": "HFTokenizer",
+                         "eod_token": "<｜end▁of▁sentence｜>",
+                         "softmax_before_topk": True},
+    "DeepSeek_16B_32k": {"h": 2048, "ffn": 1408, "heads": 16, "ep": 64,  "k": 6, "s": 32768, "layers": 28,
+                         "shared": 2, "first_k_dense": 1, "dense_ffn": 10944, "expert_interval": 1,
+                         "norm": "rmsnorm", "norm_eps": 1e-6, "bias": False, "swiglu": True,
+                         "untie_embeddings": True, "vocab": 102400,
+                         "tokenizer_type": "HFTokenizer",
+                         "eod_token": "<｜end▁of▁sentence｜>",
+                         "softmax_before_topk": True},
+    
+
     "FORGE_10B":    {"h": 2048, "ffn": 1408, "heads": 16, "ep": 64,  "k": 6, "s": 4096, "layers": 24},
     "Llama31_8B":    {"h": 4096, "ffn": 14336, "heads": 32, "kv_heads": 8,"ep": 1, "k": 1, "s": 4096, "layers": 32},
     "65B_Dense":    {"h": 8192, "ffn": 32768, "heads": 64, "ep": 1, "k": 1, "s": 2048, "layers": 80},
@@ -94,6 +174,23 @@ def get_spec(model_size):
         raise ValueError(f"Unknown model size: {model_size}")
     return MODEL_SPECS[model_size]
 
+def get_v3_flags(v3):
+    """The DeepSeek-V3 flags of a spec's "v3" sub-dict: one flag per key (config.json key with dashes), None skipped, True as a
+    bare flag, the rope_scaling sub-dict flattened to the --yarn-* flags. The variant switch is always emitted."""
+    flags = ["--attention-variant deepseek_v3"]
+    for key, value in v3.items():
+        if key == "rope_scaling":
+            if value:
+                for k2, v2 in value.items():
+                    flags.append(f"--yarn-{k2.replace('_', '-')} {v2}")
+            continue
+        if value is None or value is False:
+            continue
+        flag = "--" + key.replace("_", "-")
+        flags.append(flag if value is True else f"{flag} {value}")
+    return flags
+
+
 def get_arch_flags(spec):
     """Megatron flags implied by a spec's optional architecture fields.
 
@@ -134,6 +231,8 @@ def get_arch_flags(spec):
         flags.append(f"--eod-token '{spec['eod_token']}'")
     if spec.get("softmax_before_topk"):
         flags.append("--softmax-before-topk")
+    if spec.get("v3"):
+        flags += get_v3_flags(spec["v3"])
     return " ".join(flags)
 
 def get_filename(model_size, nodes, total_gpus, mbs):
