@@ -1073,51 +1073,8 @@ class ParallelAttention(MegatronModule):
             
             if TIMING: 
                 self.OUT_TIMER.stop()
-                
-        # # --- DEBUG: dump the attention weight matrices + biases (TP-slice local) ---
-        # _tp = mpu.get_tensor_model_parallel_rank()
-        # _tpw = mpu.get_tensor_model_parallel_world_size()
-        # _mods = [(_n, getattr(self, _n, None))
-        #          for _n in ('query_key_value', 'query', 'key_value', 'dense')]
-        # for _n, _m in [(_n, _m) for _n, _m in _mods if _m is not None]:
-        #     _w = _m.weight
-        #     print (f'[transformers.py] WEIGHT layer={self.layer_number} {_n} tp={_tp}/{_tpw} '
-        #            f'shape={tuple(_w.shape)} dtype={_w.dtype} '
-        #            f'w[0,:6]={[round(x, 8) for x in _w[0, :6].float().tolist()]} '
-        #            f'w[1,0]={_w[1,0].item():+.8f} w[2,0]={_w[2,0].item():+.8f} '
-        #            f'norm={_w.float().norm().item():.6f} sum={_w.float().sum().item():+.6f}')
-        #     _b = getattr(_m, 'bias', None)
-        #     if _b is None:
-        #         print (f'[transformers.py] BIAS   layer={self.layer_number} {_n} tp={_tp}/{_tpw} bias=None')
-        #     else:
-        #         print (f'[transformers.py] BIAS   layer={self.layer_number} {_n} tp={_tp}/{_tpw} '
-        #                f'shape={tuple(_b.shape)} b[:6]={[round(x, 8) for x in _b[:6].float().tolist()]} '
-        #                f'norm={_b.float().norm().item():.6f} sum={_b.float().sum().item():+.6f}')
-        # print (f'[transformers.py] DROPOUT layer={self.layer_number} '
-        #        f'training={self.training} attn_dropout_p='
-        #        f'{getattr(getattr(self, "core_attention_flash", None), "dropout_p", None)}')
-        # # --- END DEBUG ---
-
-        if (os.getenv ('DEBUG_ACTIVATION_OUTPUT') == 1): 
-            print (f'[transformers.py] AFTER OUT {output.shape=}\n{output[0][0][:30]=}')
 
         return output, bias
-
-
-def _build_self_attention(config, layer_number, attention_kind, self_attn_mask_type):
-    """One place chooses the attention class of a layer (V3 blueprint CS1). attention_kind None builds ParallelAttention exactly
-    as before; 'mla' builds the DeepSeek-V3 latent attention (megatron/model/deepseek_v3/attention.py), which takes the same
-    call and returns the same pair."""
-    if attention_kind is None:
-        return ParallelAttention(
-            config,
-            layer_number,
-            attention_type=AttnType.self_attn,
-            attn_mask_type=self_attn_mask_type)
-    if attention_kind == 'mla':
-        from megatron.model.deepseek_v3.attention import DeepSeekV3Attention
-        return DeepSeekV3Attention(config, layer_number, attn_mask_type=self_attn_mask_type)
-    raise ValueError(f'unknown attention_kind {attention_kind!r} for layer {layer_number}')
 
 
 def bias_dropout_add(x, bias, residual, prob, training):
