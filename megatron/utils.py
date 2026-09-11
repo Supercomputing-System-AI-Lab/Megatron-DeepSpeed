@@ -322,8 +322,25 @@ def throughput_calculator(model, args, iteration_time, total_iterations):
     # equal `num_shared_experts` experts of width ffn_hidden_size executed once per token.
     shared_ffn_gemm_macs = batch_size * num_layers * ffn_multiplier * ffn_hidden_size * hidden_size * seq_len * num_shared_experts
 
+    if getattr(args, 'attention_variant', None) == 'deepseek_v3':
+        # DeepSeek-V3 (2026-09-11): the latent attention's projections are not 4 h^2, its core uses two head widths, the
+        # first layers are dense with their own width, the prediction head adds a layer and a second head, the V3.2
+        # indexer and sparse core replace the core's key count; the standard terms above would overcount the projections
+        # and undercount the core (deepseek_v3_macs_per_token holds the derivation; the test in the V3 scope checks it
+        # against the toy model's own weights).
+        c = deepseek_v3_macs_per_token(args, seq_len)
+        tokens = batch_size * seq_len
+        pre_and_post_mha_gemm_macs = c['attention_projections'] * tokens
+        mha_bgemm_macs = c['attention_core'] * tokens
+        ffn_gemm_macs = c['routed_and_dense_ffn'] * tokens
+        shared_ffn_gemm_macs = c['shared_ffn'] * tokens
+        logit_lmhead_gemm_macs = c['head'] * tokens
+        extra_fwd_only_macs = c['forward_only'] * tokens
+    else:
+        extra_fwd_only_macs = 0
     fwd_macs = pre_and_post_mha_gemm_macs + mha_bgemm_macs + ffn_gemm_macs + logit_lmhead_gemm_macs + shared_ffn_gemm_macs
     bwd_macs = 2 * fwd_macs
+    fwd_macs += extra_fwd_only_macs    # the V3.2 warm-up teacher: recomputed in the forward, detached, no backward
     fwd_bwd_macs = fwd_macs + bwd_macs
 
     # if (hasattr(args, 'checkpoint_activations') and args.checkpoint_activations) or (hasattr(args, 'recompute_granularity') and args.recompute_granularity == 'full'):
@@ -335,6 +352,60 @@ def throughput_calculator(model, args, iteration_time, total_iterations):
     tflops = flops_per_iteration / (elapsed_time_per_iter * args.world_size * (10**12))
     # print (f'[megatron/utils] {flops_per_iteration=}, {elapsed_time_per_iter=}, {args.world_size=}')
     return samples_per_second, tflops, approx_parameters_in_billions
+
+
+def deepseek_v3_macs_per_token(args, seq_len):
+    """The multiply-accumulates one token costs in the forward of a DeepSeek-V3 model built here, by part (2026-09-11).
+    The attention core follows the convention of throughput_calculator (every query against every key of the sequence,
+    the causal half not deducted); the sparse core of V3.2 counts its selected keys instead. Returns a dict whose values
+    are MACs per token; the sum times the tokens of an iteration times 2 is the forward FLOPs."""
+    h = args.hidden_size
+    H = args.num_attention_heads
+    L = args.num_layers
+    q_lora = getattr(args, 'q_lora_rank', None)
+    kv_lora = args.kv_lora_rank
+    d_n, d_r, d_v = args.qk_nope_head_dim, args.qk_rope_head_dim, args.v_head_dim
+    d_qk = d_n + d_r
+    # the latent attention's projections (megatron/model/deepseek_v3/attention.py)
+    q_proj = (h * q_lora + q_lora * H * d_qk) if q_lora else h * H * d_qk
+    attn_proj = q_proj + h * (kv_lora + d_r) + kv_lora * H * (d_n + d_v) + H * d_v * h
+    core_dense = seq_len * H * (d_qk + d_v)
+    # the V3.2 indexer and sparse core (indexer.py, sparse_core.py), when --index-topk > 0
+    topk_keys = int(getattr(args, 'index_topk', 0) or 0)
+    H_i, d_i = int(getattr(args, 'index_n_heads', 0) or 0), int(getattr(args, 'index_head_dim', 0) or 0)
+    indexer = (q_lora * H_i * d_i + h * d_i + h * H_i + seq_len * H_i * d_i) if topk_keys > 0 else 0
+    warmup = bool(getattr(args, 'dsa_dense_warmup', False))
+    if topk_keys > 0 and not warmup:
+        k_eff = min(topk_keys, seq_len)
+        core = k_eff * H * (kv_lora + d_r) + k_eff * H * kv_lora + H * kv_lora * (d_n + d_v)   # logits, values, absorb + un-absorb
+        forward_only = 0
+    else:
+        core = core_dense
+        forward_only = (seq_len * H * d_qk) if topk_keys > 0 else 0     # the warm-up teacher: the dense scores once more
+    # the feed-forward: the first k layers dense with their own width, then the routed top-k and the shared experts
+    ffn_mult = 3 if args.swiglu else 2
+    n_dense = int(getattr(args, 'first_k_dense_replace', 0) or 0)
+    dense_ffn = int(getattr(args, 'dense_ffn_hidden_size', None) or args.ffn_hidden_size)
+    n_experts = args.num_experts[0] if isinstance(args.num_experts, (list, tuple)) else args.num_experts
+    n_shared = getattr(args, 'num_shared_experts', 0)
+    n_shared = (n_shared[0] if n_shared else 0) if isinstance(n_shared, (list, tuple)) else (n_shared or 0)
+    moe_layer_ffn = args.topk * ffn_mult * h * args.ffn_hidden_size + h * n_experts        # the experts and the gate
+    dense_layer_ffn = ffn_mult * h * dense_ffn
+    shared_layer_ffn = n_shared * ffn_mult * h * args.ffn_hidden_size
+    n_moe = L - n_dense
+    mtp = int(getattr(args, 'num_nextn_predict_layers', 0) or 0)
+    head = h * args.padded_vocab_size
+    parts = {
+        'attention_projections': (L + mtp) * attn_proj,
+        'attention_core': (L + mtp) * core + mtp * 0,
+        'routed_and_dense_ffn': n_moe * moe_layer_ffn + n_dense * dense_layer_ffn + mtp * moe_layer_ffn,
+        'shared_ffn': (n_moe + mtp) * shared_layer_ffn,
+        'head': head * (1 + mtp) + mtp * 2 * h * h,                                            # the second head and eh_proj
+        'indexer': (L + mtp) * indexer,
+        'forward_only': (L + mtp) * forward_only,
+    }
+    parts['attention_projections'] += parts.pop('indexer')
+    return parts
 
 
 def checkpoint_throughput_calculator(model, latency_second):
