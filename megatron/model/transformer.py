@@ -1333,7 +1333,15 @@ class ParallelTransformerLayer(MegatronModule):
                                     rbd_mesh_size=args.rbd_mesh_size,
                                     num_shared_experts=_n_shared,        # IMPLEMENTING SHARED EXPERT: Added
                                     shared_expert=_shared_expert_mlp,    # IMPLEMENTING SHARED EXPERT: Added
-                                    softmax_before_topk=args.softmax_before_topk)
+                                    softmax_before_topk=args.softmax_before_topk,
+                                    # DeepSeek-V3 router (blueprint CS3); None / defaults keep the gate as it was
+                                    scoring_func=getattr(args, 'scoring_func', None),
+                                    topk_method=getattr(args, 'topk_method', None),
+                                    moe_router_bias_update_speed=getattr(args, 'moe_router_bias_update_speed', 0.0),
+                                    n_group=getattr(args, 'n_group', 1),
+                                    topk_group=getattr(args, 'topk_group', 1),
+                                    norm_topk_prob=getattr(args, 'norm_topk_prob', False),
+                                    routed_scaling_factor=getattr(args, 'routed_scaling_factor', 1.0))
 
         # Set bias+dropout+add fusion grad_enable execution handler.
         TORCH_MAJOR = int(torch.__version__.split('.')[0])
