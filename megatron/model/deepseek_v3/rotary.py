@@ -89,11 +89,16 @@ def rotate_half(x):
 
 
 def apply_interleaved_rope(x, cos, sin):
-    """x [s, b, heads, dim]; cos, sin [s, dim] fp32. The released apply_rotary_pos_emb_interleave: the channel pairs (2k, 2k+1) are
-    first regrouped into two halves, then the halves rotation is applied; the result keeps the regrouped order, on q and k alike, so
-    their dot product is the one of the interleaved pairs."""
+    """x [s, b, heads, dim]; cos, sin [s, dim] (one angle per position) or [s, b, dim] (one per position and row, the ragged
+    decode) in fp32. The released apply_rotary_pos_emb_interleave: the channel pairs (2k, 2k+1) are first regrouped into two
+    halves, then the halves rotation is applied; the result keeps the regrouped order, on q and k alike, so their dot product is
+    the one of the interleaved pairs."""
     s, b, h, d = x.shape
     x = x.view(s, b, h, d // 2, 2).transpose(4, 3).reshape(s, b, h, d)
-    c = cos.to(x.dtype)[:, None, None, :]
-    sn = sin.to(x.dtype)[:, None, None, :]
+    if cos.dim() == 2:
+        c = cos.to(x.dtype)[:, None, None, :]
+        sn = sin.to(x.dtype)[:, None, None, :]
+    else:
+        c = cos.to(x.dtype)[:, :, None, :]
+        sn = sin.to(x.dtype)[:, :, None, :]
     return (x * c) + (rotate_half(x) * sn)

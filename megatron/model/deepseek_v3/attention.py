@@ -18,8 +18,9 @@ and lets o_proj reduce-scatter at its exit; the four replicated pieces (q_a_proj
 carry partial gradients per rank and are marked sequence_parallel so the engine's gradient sweep sums them over TP.
 
 Parameter names are the released model's (self_attn.X -> self_attention.X), so a checkpoint importer maps them by prefix.
-Not built here (open items of the blueprint): the inference cache (inference_params must be None), document-local positions for
-microbatches larger than one, the V3.2 indexer.
+The inference cache follows ParallelAttention's contract (inference_params.key_value_memory_dict, sequence_len_offset,
+batch_size_offset; the batched ragged decode with row_lengths and kv_extent): keys are cached rotated, values at their own width.
+Not built here (open items of the blueprint): document-local positions for microbatches larger than one, the V3.2 indexer.
 """
 import torch
 import torch.nn.functional as F
@@ -186,14 +187,17 @@ class DeepSeekV3Attention(MegatronModule):
             return torch.arange(s, device=device) - starts.to(device)
         return torch.arange(s, device=device)
 
-    def _eager_attention(self, query, key, value):
-        """The released eager_attention_forward in the [s, b, heads, d] layout: scores in fp32, causal, softmax in fp32."""
+    def _eager_attention(self, query, key, value, query_start=0):
+        """The released eager_attention_forward in the [s, b, heads, d] layout: scores in fp32, causal, softmax in fp32. The
+        query rows sit at positions query_start .. query_start + s_q - 1 of the key range (the cached prefix at inference)."""
         s, b, hp, _ = query.shape
+        s_k = key.shape[0]
         q = query.permute(1, 2, 0, 3)
         k = key.permute(1, 2, 0, 3)
         v = value.permute(1, 2, 0, 3)
         scores = torch.matmul(q, k.transpose(-1, -2)).to(torch.float32) * self.softmax_scale
-        causal = torch.ones(s, s, dtype=torch.bool, device=scores.device).tril()
+        q_pos = torch.arange(s, device=scores.device) + query_start
+        causal = torch.arange(s_k, device=scores.device)[None, :] <= q_pos[:, None]
         scores = scores.masked_fill(~causal, torch.finfo(torch.float32).min)
         probs = torch.softmax(scores, dim=-1).to(q.dtype)
         if self.training and self.attention_dropout > 0.0:
@@ -219,9 +223,38 @@ class DeepSeekV3Attention(MegatronModule):
         return context.permute(1, 0, 2, 3).reshape(s, b, hp * self.v_head_dim)
 
     # ------------------------------------------------------------------ forward
+    # ------------------------------------------------------------------ the inference cache (the same contract as ParallelAttention)
+    def _allocate_cache(self, inference_params, like):
+        """k [max_s, max_b, heads, nope + rope] (rotated) and v [max_s, max_b, heads, v_head_dim] in the activation's dtype."""
+        hp = self.heads_per_partition
+        n, bmax = inference_params.max_sequence_len, inference_params.max_batch_size
+        k = torch.empty(n, bmax, hp, self.qk_head_dim, dtype=like.dtype, device=like.device)
+        v = torch.empty(n, bmax, hp, self.v_head_dim, dtype=like.dtype, device=like.device)
+        return k, v
+
+    def _ragged_decode(self, query, key_new, value_new, k_mem, v_mem, row_lengths, inference_params):
+        """One batched decode step over rows at different positions (the contract of ParallelAttention._ragged_decode_step, the
+        eval adapter's batched generation): the cache slot is the token's true position; row b's new token lands at row_lengths[b]
+        and attends to slots 0 .. row_lengths[b]; keys are stored rotated at their true position. fp32 eager math."""
+        b = query.shape[1]
+        b_idx = torch.arange(b, device=query.device)
+        k_mem[row_lengths, b_idx] = key_new[0]
+        v_mem[row_lengths, b_idx] = value_new[0]
+        kv_hi = getattr(inference_params, 'kv_extent', None)
+        if kv_hi is None:
+            kv_hi = int(row_lengths.max().item()) + 1
+        k = k_mem[:kv_hi, :b].float()
+        v = v_mem[:kv_hi, :b].float()
+        q = query[0].float()
+        scores = torch.einsum('bnh,sbnh->bns', q, k) * self.softmax_scale
+        dead = torch.arange(kv_hi, device=query.device)[None, :] > row_lengths[:, None]
+        scores = scores.masked_fill(dead[:, None, :], float('-inf'))
+        probs = torch.softmax(scores, dim=-1)
+        context = torch.einsum('bns,sbnh->bnh', probs, v)
+        return context.reshape(1, b, -1).to(query.dtype)
+
     def forward(self, hidden_states, attention_mask, encoder_output=None, inference_params=None, rotary_pos_emb=None):
         assert encoder_output is None, 'the latent attention is self-attention only'
-        assert inference_params is None, 'the latent-attention inference cache is not built yet (blueprint tissue T5)'
         # rotary_pos_emb is the old table built by the model for ParallelAttention; this class owns its own table.
         if self.sequence_parallel:
             x = gather_from_sequence_parallel_region(hidden_states, tensor_parallel_output_grad=True)
@@ -229,6 +262,18 @@ class DeepSeekV3Attention(MegatronModule):
             x = hidden_states
         s, b, _ = x.shape
         hp = self.heads_per_partition
+        cache = None
+        row_lengths = None
+        query_start = 0
+        if inference_params is not None:
+            kv = inference_params.key_value_memory_dict
+            if self.layer_number not in kv:
+                kv[self.layer_number] = self._allocate_cache(inference_params, x)
+            cache = kv[self.layer_number]
+            row_lengths = getattr(inference_params, 'row_lengths', None)
+            if row_lengths is not None and s != 1:
+                row_lengths = None                       # the ragged contract is a one-token step; a prefill is uniform
+            query_start = inference_params.sequence_len_offset
 
         if self.q_lora_rank is None:
             q, _ = self.q_proj(x)
@@ -244,16 +289,38 @@ class DeepSeekV3Attention(MegatronModule):
         k_nope, value = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         k_pe = k_pe.view(s, b, 1, self.qk_rope_head_dim)
 
-        positions = self._positions(s, b, attention_mask, x.device)
-        cos, sin = self.rotary.cos_sin(positions)
+        if row_lengths is not None:
+            # one token per row at its own position: cos, sin [1, b, dim]
+            cos, sin = self.rotary.cos_sin(row_lengths.to(x.device))
+            cos, sin = cos[None], sin[None]
+        elif cache is not None:
+            positions = torch.arange(s, device=x.device) + query_start
+            cos, sin = self.rotary.cos_sin(positions)
+        else:
+            positions = self._positions(s, b, attention_mask, x.device)
+            cos, sin = self.rotary.cos_sin(positions)
         q_pe = apply_interleaved_rope(q_pe, cos, sin)
         k_pe = apply_interleaved_rope(k_pe, cos, sin)
 
         query = torch.cat((q_nope, q_pe), dim=-1)
         key = torch.cat((k_nope, k_pe.expand(s, b, hp, self.qk_rope_head_dim)), dim=-1)
-        if self.use_flash:
-            context = self._flash_attention(query, key, value, attention_mask)
+        if cache is not None:
+            k_mem, v_mem = cache
+            if row_lengths is not None:
+                context = self._ragged_decode(query, key, value, k_mem, v_mem, row_lengths, inference_params)
+                output, bias = self.o_proj(context)
+                return output, bias
+            b0 = inference_params.batch_size_offset
+            b1 = b0 + b
+            seq_end = query_start + s
+            assert seq_end <= k_mem.shape[0] and b1 <= k_mem.shape[1], 'the inference cache is smaller than the sequence or the batch'
+            k_mem[query_start:seq_end, b0:b1] = key
+            v_mem[query_start:seq_end, b0:b1] = value
+            key = k_mem[:seq_end, b0:b1]
+            value = v_mem[:seq_end, b0:b1]
+        if self.use_flash and (cache is None or self.training is False):
+            context = self._flash_attention(query, key, value, attention_mask if cache is None else None)
         else:
-            context = self._eager_attention(query, key, value)
+            context = self._eager_attention(query, key, value, query_start)
         output, bias = self.o_proj(context)
         return output, bias
