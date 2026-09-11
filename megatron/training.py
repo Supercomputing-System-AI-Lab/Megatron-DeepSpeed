@@ -77,11 +77,35 @@ def _create_ds_config_dict():
     
     if args.universal_checkpoint:
         ds_config_dict["checkpoint"] = {"load_universal": True}
+    sequence_parallel_pipe_config(args, ds_config_dict)
 
     # Clear config path
     args.deepspeed_config = None 
 
     return ds_config_dict
+
+
+def sequence_parallel_pipe_config(args, ds_config_dict):
+    """Under Megatron's companion sequence parallelism (--sequence-parallel) with tensor and pipeline parallelism, switch off
+    DeepSpeed's partitioning of the activations and gradients that cross a pipeline boundary (ds_config pipeline
+    pipe_partitioned / grad_partitioned, both True by default). That partitioning cuts the tensor into TP slices on the sender
+    and reassembles it by an all-gather over the receiver's tensor-parallel group, which is right only when every TP rank
+    holds the same activation; under sequence parallelism each rank holds its own sequence shard, so the reassembled tensor is
+    half of one shard and half of the other (2026-09-11, runs A2b/A3b: the stage-0 layers bit-identical with and without SP,
+    the first stage-1 layer off by 1.4 relative; the loss 8.72 instead of 7.53 from the same weights). Returns True when it
+    changed the config; a no-op for every other layout."""
+    if not getattr(args, 'sequence_parallel', False):
+        return False
+    if getattr(args, 'tensor_model_parallel_size', 1) <= 1 or getattr(args, 'pipeline_model_parallel_size', 1) <= 1:
+        return False
+    if getattr(args, 'no_pipeline_parallel', False):
+        return False
+    pipe = ds_config_dict.setdefault('pipeline', {})
+    pipe['pipe_partitioned'] = False
+    pipe['grad_partitioned'] = False
+    print_rank_0('[sequence-parallel] pipeline activations and gradients are sent whole, not partitioned across the '
+                 'tensor-parallel group (pipe_partitioned = grad_partitioned = False): each TP rank holds its own sequence shard')
+    return True
     
 
 def _debug_dump_loaded_weights(model):
