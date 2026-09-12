@@ -1025,6 +1025,68 @@ def get_data(train_val_test_num_samples):
 
     return train_dataset, val_dataset, val_dataset
 
+
+def forward_only_main():
+    """[2026-09-12, the milestone's second stage] XMOE_FORWARD_ONLY=1: the model and its DeepSpeed engine without an optimizer,
+    the universal atoms loaded by name (the eval adapter's loader: the GPTModel-canonical twins of the pipe names, the tensor-parallel
+    slices, the router-bias buffers), then XMOE_FORWARD_ONLY_STEPS forward passes of the pipe (eval_batch: no gradient, no step)
+    with the fixed-token micro-batches and the activation dump, and exit. Why: the training path's optimizer keeps 16 bytes per
+    parameter (10.7 TB for the released DeepSeek-V3); the forward alone holds the bf16 weights (1.37 TB across PP 8 x EP 8, 64
+    GCDs of 8 nodes). The launch line is the training one (the registry's flags, the riders); --load names the universal folder."""
+    import deepspeed
+    from megatron.initialize import initialize_megatron
+    from megatron.training import get_model, _create_ds_config_dict, print_datetime
+    initialize_megatron(extra_args_provider=None, args_defaults={})
+    args = get_args()
+    args.deepspeed_config_dict = _create_ds_config_dict()
+    cfg = args.deepspeed_config_dict
+    # no optimizer of any kind: without these sections the engine takes neither its ZeRO nor its bf16 branch (the bf16 branch
+    # wraps a dummy optimizer in BF16_Optimizer, which keeps fp32 masters and asserts MoE parameter groups: run X2, 5474295);
+    # the module's parameters are already bf16 from Megatron's params_dtype
+    for key in ('optimizer', 'zero_optimization', 'scheduler', 'bf16', 'fp16'):
+        cfg.pop(key, None)
+    model = get_model(model_provider, ModelType.encoder_or_decoder)
+    if args.bf16:
+        # the engine's own module-wide cast, which its bf16 section would have done: Megatron builds the norms in fp32 and
+        # relies on it (run X2, 5474402: an fp32 norm output met a bf16 GEMM weight); the gate keeps its fp32 buffers (TopKGatev2._apply)
+        model[0].bfloat16()
+    engine, _, _, _ = deepspeed.initialize(model=model[0], args=args, mpu=mpu if args.no_pipeline_parallel else None, config=cfg)
+    if not args.no_pipeline_parallel:
+        engine.set_batch_fn(get_batch_pipe)
+    print_datetime('forward-only: engine built without an optimizer')
+    repo = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+    for extra in (repo, os.path.join(repo, 'tasks', 'eval_harness')):    # the eval adapter imports pretrain_gpt from the repo root
+        if extra not in sys.path:
+            sys.path.insert(0, extra)
+    from megatron_ds_eval.loader import _load_from_universal_atoms
+    tag = open(os.path.join(args.load, 'latest_universal')).read().strip()
+    _load_from_universal_atoms(engine, os.path.join(args.load, tag, 'zero'))
+    print_datetime(f'forward-only: universal atoms of {tag} loaded')
+    steps = int(os.getenv('XMOE_FORWARD_ONLY_STEPS', '1'))
+    tokenizer = get_tokenizer()
+    seq = args.seq_length
+
+    def synthetic():
+        # the rider replaces row 0 of every micro-batch with a prompt; the rest is filler the loss ignores
+        g = torch.Generator().manual_seed(0)
+        while True:
+            yield {'text': torch.randint(0, tokenizer.vocab_size - 1, (args.micro_batch_size, seq + 1), generator=g)}
+    it = synthetic()
+    engine.eval()
+    for s in range(steps):
+        if args.no_pipeline_parallel:
+            with torch.no_grad():
+                for _ in range(engine.gradient_accumulation_steps()):
+                    tokens, labels, loss_mask, attention_mask, position_ids = get_batch(it)
+                    out = engine(tokens, position_ids, attention_mask, labels=labels)
+                    print_rank_0(f'forward-only: micro-batch done, loss-shaped output {tuple(out.shape) if torch.is_tensor(out) else type(out)}')
+        else:
+            loss = engine.eval_batch(it, compute_loss=True, reduce_output='avg')
+            print_rank_0(f'forward-only: step {s + 1}/{steps}: {engine.gradient_accumulation_steps()} micro-batches forwarded, loss {loss}')
+    torch.distributed.barrier()
+    print_datetime('forward-only: done')
+
+
 if __name__ == "__main__":
     git_ds_info()
     _maybe_init_wandb()    # opt-in via WANDB_PROJECT env var; runs once before pretrain
@@ -1039,6 +1101,9 @@ if __name__ == "__main__":
 
     to_profile=os.getenv ("to_profile")
     print (f'{to_profile=}')
+    if os.getenv('XMOE_FORWARD_ONLY') == '1':
+        forward_only_main()
+        sys.exit(0)
     
     if to_profile=='True':
         _exit_code = 0
