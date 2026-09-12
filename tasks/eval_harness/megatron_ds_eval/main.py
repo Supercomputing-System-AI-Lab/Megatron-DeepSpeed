@@ -121,6 +121,10 @@ def tasks_args(parser):
                        help='Bucket sequence lengths for faster scoring.')
     group.add_argument('--num_fewshot', type=int, default=0)
     group.add_argument('--eval_fp32', default=False, action='store_true')
+    group.add_argument('--no-optimizer', dest='no_optimizer', default=False, action='store_true',
+                       help='Build the DeepSpeed engine without any optimizer (no fp32 master copies): '
+                            'the weights alone on the GPU. For a model whose per-rank parameters '
+                            'would not fit beside their masters (the released DeepSeek-V3 on 64 GCDs).')
     group.add_argument('--limit', type=int, default=None,
                        help='Cap examples per task (debug aid).')
     group.add_argument('--bootstrap_iters', type=int, default=100000,

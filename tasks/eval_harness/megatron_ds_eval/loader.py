@@ -600,8 +600,29 @@ def load_ds_checkpoint_and_setup_megatron(extra_args_provider):
 
     # Modern Megatron-DeepSpeed requires model_type. GPT is decoder-only;
     # pretrain_gpt_deepspeed.py uses ModelType.encoder_or_decoder.
-    model, _, _ = setup_model_and_optimizer(model_provider, ModelType.encoder_or_decoder)
-    model = model[0]
+    if getattr(args, 'no_optimizer', False):
+        # [2026-09-12] --no-optimizer: the engine without any optimizer. setup_model_and_optimizer builds Megatron's optimizer
+        # and, under bf16, BF16_Optimizer's fp32 master copies on the GPU: 4 bytes per parameter of this rank on top of the
+        # 2 of the weights. The released DeepSeek-V3 on 64 GCDs holds 12 billion parameters per rank (4 of 256 experts per
+        # layer), so the masters alone are 48 GB and the load ran out of memory (job 5475759). An evaluation needs no
+        # optimizer: build the model, cast it to bf16 as the engine's bf16 section would (Megatron builds the norms in fp32),
+        # and initialise the engine with the optimizer, ZeRO, scheduler and bf16 sections removed (the bf16 section alone
+        # wraps a dummy optimizer in BF16_Optimizer, which asserts MoE parameter groups). The same recipe as the training
+        # script's forward-only mode (XMOE_FORWARD_ONLY), verified bit-identical to the training forward on Moonlight (X2).
+        import deepspeed as _ds
+        from megatron.core import mpu as _mpu_
+        from megatron.training import get_model as _get_model
+        _cfg = dict(args.deepspeed_config_dict)
+        for _k in ('optimizer', 'zero_optimization', 'scheduler', 'bf16', 'fp16'):
+            _cfg.pop(_k, None)
+        model = _get_model(model_provider, ModelType.encoder_or_decoder)
+        if args.bf16:
+            model[0].bfloat16()
+        model, _, _, _ = _ds.initialize(model=model[0], args=args, mpu=_mpu_, config=_cfg)
+        print_rank_0('[load] engine built without an optimizer (--no-optimizer): bf16 weights only')
+    else:
+        model, _, _ = setup_model_and_optimizer(model_provider, ModelType.encoder_or_decoder)
+        model = model[0]
     zero_enabled = model._config.zero_enabled
     model._config.zero_enabled = False
 
