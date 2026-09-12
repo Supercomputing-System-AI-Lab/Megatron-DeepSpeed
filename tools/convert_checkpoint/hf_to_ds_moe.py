@@ -8,6 +8,11 @@ dense GPT-2, so they cannot be reused here.
 
     Verified against: deepseek-ai/deepseek-moe-16b-base
     Target model:     GPTModel (i.e. runs launched with --no-pipeline-parallel), TP=1
+    2026-09-12:       the DeepSeek-V3 architecture (config.json with kv_lora_rank; DeepseekV3ForCausalLM: the latent attention's
+                      q_proj or q_a_proj / q_a_layernorm / q_b_proj, kv_a_proj_with_mqa, kv_a_layernorm, kv_b_proj, o_proj -- the
+                      same names in megatron/model/deepseek_v3/attention.py, copied whole; the sigmoid gate's weight and its
+                      e_score_correction_bias, which becomes the router's expert_bias BUFFER atom zero/<name>/buffer.pt; the
+                      rotary inv_freq skipped). Verified against moonshotai/Moonlight-16B-A3B with --emit universal.
 
 --------------------------------------------------------------------------------------
 USAGE
@@ -175,6 +180,16 @@ class Plan:
         self.first_k_dense = cfg["first_k_dense_replace"]
         self.moe_freq = cfg.get("moe_layer_freq", 1)
         self.vocab = cfg["vocab_size"]
+        # DeepSeek-V3 (2026-09-12): the latent attention's shapes come from config.json; head_dim is then nope + rope
+        self.v3 = cfg.get("kv_lora_rank") is not None
+        if self.v3:
+            self.q_lora_rank = cfg.get("q_lora_rank")
+            self.kv_lora_rank = cfg["kv_lora_rank"]
+            self.qk_nope = cfg["qk_nope_head_dim"]
+            self.qk_rope = cfg["qk_rope_head_dim"]
+            self.v_head = cfg["v_head_dim"]
+            self.head_dim = self.qk_nope + self.qk_rope
+        self.mtp_layers = int(cfg.get("num_nextn_predict_layers", 0) or 0)
 
         if self.heads != self.kv_heads:
             raise SystemExit(
@@ -200,16 +215,23 @@ class Plan:
 
         for L in range(self.layers):
             p = f"language_model.encoder.layers.{L}"
-            ops += [
-                (f"{p}.input_layernorm.weight", "copy", [f"model.layers.{L}.input_layernorm.weight"]),
-                (f"{p}.self_attention.query_key_value.weight", "fuse_qkv",
-                 [f"model.layers.{L}.self_attn.q_proj.weight",
-                  f"model.layers.{L}.self_attn.k_proj.weight",
-                  f"model.layers.{L}.self_attn.v_proj.weight"]),
-                (f"{p}.self_attention.dense.weight", "copy", [f"model.layers.{L}.self_attn.o_proj.weight"]),
-                (f"{p}.post_attention_layernorm.weight", "copy",
-                 [f"model.layers.{L}.post_attention_layernorm.weight"]),
-            ]
+            ops.append((f"{p}.input_layernorm.weight", "copy", [f"model.layers.{L}.input_layernorm.weight"]))
+            if self.v3:
+                # the latent attention: the same module names on both sides, every weight copied whole
+                a = f"model.layers.{L}.self_attn"
+                names = (["q_proj"] if self.q_lora_rank is None else ["q_a_proj", "q_a_layernorm", "q_b_proj"]) + \
+                        ["kv_a_proj_with_mqa", "kv_a_layernorm", "kv_b_proj", "o_proj"]
+                ops += [(f"{p}.self_attention.{n}.weight", "copy", [f"{a}.{n}.weight"]) for n in names]
+            else:
+                ops += [
+                    (f"{p}.self_attention.query_key_value.weight", "fuse_qkv",
+                     [f"model.layers.{L}.self_attn.q_proj.weight",
+                      f"model.layers.{L}.self_attn.k_proj.weight",
+                      f"model.layers.{L}.self_attn.v_proj.weight"]),
+                    (f"{p}.self_attention.dense.weight", "copy", [f"model.layers.{L}.self_attn.o_proj.weight"]),
+                ]
+            ops.append((f"{p}.post_attention_layernorm.weight", "copy",
+                        [f"model.layers.{L}.post_attention_layernorm.weight"]))
 
             if not self.is_moe_layer(L):
                 # Dense layer (first_k_dense_replace). Width = intermediate_size, which is
@@ -224,6 +246,12 @@ class Plan:
             # Router. HF mlp.gate -> DeepSpeed TopKGate.wg (sharded_moe.py: self.wg = Linear).
             ops.append((f"{p}.mlp.deepspeed_moe.gate.wg.weight", "copy",
                         [f"model.layers.{L}.mlp.gate.weight"]))
+            if self.v3:
+                # the balancing bias of the aux-loss-free router: a persistent BUFFER of TopKGatev2 (expert_bias), not a
+                # parameter; the universal form is zero/<name>/buffer.pt (ds_to_universal.extract_buffers), restored by
+                # engine._load_buffers_from_universal under the pipe name, so the atom is written under both names
+                ops.append((f"{p}.mlp.deepspeed_moe.gate.expert_bias", "buffer",
+                            [f"model.layers.{L}.mlp.gate.e_score_correction_bias"]))
 
             if self.n_shared > 0:
                 sp = f"{p}.mlp.shared_experts.shared_mlp"
@@ -240,6 +268,15 @@ class Plan:
             ("language_model.output_layer.weight", "resize_vocab", ["lm_head.weight"]),
         ]
         return ops
+
+    def ignored_sources(self, meta):
+        """HF tensors that are not weights (derived tables): consumed by nothing, reported, not an error."""
+        out = []
+        for L in range(self.layers + self.mtp_layers):
+            k = f"model.layers.{L}.self_attn.rotary_emb.inv_freq"
+            if k in meta:
+                out.append(k)
+        return out
 
     # -- routed experts, one file each
     def expert_files(self):
@@ -264,7 +301,7 @@ class Plan:
 
     def expected_shape(self, dst_key, op, srcs, meta):
         """Shape the emitted tensor must have, for dry-run checking."""
-        if op == "copy":
+        if op in ("copy", "buffer"):
             return meta[srcs[0]][0]
         if op == "resize_vocab":
             rows = self.padded_vocab or meta[srcs[0]][0][0]
@@ -323,7 +360,7 @@ PARAM_N_SUB_PARAMS_KEY = "param_n_sub_params"
 # The loader reads cat_dim to know which way to chunk. Only the row-parallel ones need
 # naming -- dim 0 is the default when the key is absent, but it is written explicitly so an
 # atom is self-describing.
-_ROW_PARALLEL_SUFFIXES = (".self_attention.dense.weight", ".dense_4h_to_h.weight")
+_ROW_PARALLEL_SUFFIXES = (".self_attention.dense.weight", ".dense_4h_to_h.weight", ".self_attention.o_proj.weight")
 
 # Parameters whose first dimension is the padded vocabulary.
 _VOCAB_SUFFIXES = ("embedding.word_embeddings.weight", "output_layer.weight")
@@ -396,8 +433,18 @@ def write_universal(out_dir, all_ops, get, plan, ds_version, atom_dtype):
     zero_dir = os.path.join(out_dir, "zero")
     os.makedirs(zero_dir, exist_ok=True)
 
+    n_buffers = 0
     for i, (dst, op, srcs) in enumerate(all_ops, 1):
         tensor = apply_op(op, [get(s) for s in srcs], plan)
+        if op == "buffer":
+            # the router's bias: one buffer atom under the module-path name and one under the pipe name (the engine's
+            # buffer restore looks up the pipe name directly, without the parameter aliases); fp32, as the gate keeps it
+            for name in {dst, to_pipe_name(dst, plan.layers, untied=True)}:
+                bdir = os.path.join(zero_dir, name)
+                os.makedirs(bdir, exist_ok=True)
+                torch.save({"buffer": tensor.float().clone()}, os.path.join(bdir, "buffer.pt"))
+            n_buffers += 1
+            continue
         ckpt = {PARAM_KEY: tensor.to(atom_dtype)}
         ckpt.update(atom_metadata(dst, op))
         param_dir = os.path.join(zero_dir, dst)
@@ -405,6 +452,8 @@ def write_universal(out_dir, all_ops, get, plan, ds_version, atom_dtype):
         torch.save(ckpt, os.path.join(param_dir, FP32_FILE))
         if i % 500 == 0 or i == len(all_ops):
             print(f"  atoms: {i}/{len(all_ops)}")
+    if n_buffers:
+        print(f"  buffer atoms: {n_buffers} (each under the module-path name and the pipe name)")
 
     # The loader reads this file before any atom. It needs ds_version (asserted non-empty,
     # and required to be >= 0.3.17 for ZeRO stage 1); everything else it takes with a
@@ -420,7 +469,7 @@ def apply_op(op, tensors, plan):
     """Execute a transform. torch is imported lazily so --dry-run stays dependency-free."""
     import torch  # noqa: F401  (only needed on the real path)
 
-    if op == "copy":
+    if op in ("copy", "buffer"):
         return tensors[0]
 
     if op == "resize_vocab":
@@ -618,7 +667,9 @@ def main():
 
     print(f"HF model      : {args.hf_model_path}")
     print(f"  arch        : {cfg.get('architectures')}  vocab={plan.vocab}  layers={plan.layers}")
-    print(f"  hidden={plan.h} heads={plan.heads} head_dim={plan.head_dim}")
+    print(f"  hidden={plan.h} heads={plan.heads} head_dim={plan.head_dim}"
+          + (f"  [DeepSeek-V3: q_lora={plan.q_lora_rank} kv_lora={plan.kv_lora_rank} nope/rope/v={plan.qk_nope}/{plan.qk_rope}/{plan.v_head}"
+             f" mtp_layers={plan.mtp_layers}]" if plan.v3 else ""))
     print(f"  routed={plan.n_routed} shared={plan.n_shared} topk={cfg.get('num_experts_per_tok')}")
     print(f"  moe_inter={plan.moe_inter} dense_inter={plan.dense_inter} "
           f"first_k_dense={plan.first_k_dense}")
@@ -671,6 +722,8 @@ def main():
                                f"expected {(plan.heads * plan.head_dim, plan.h)}")
         _ = got
 
+    ignored = plan.ignored_sources(meta)
+    used.update(ignored)
     unused = sorted(set(meta) - used)
 
     print(f"Planned outputs:")
@@ -681,7 +734,8 @@ def main():
           f"{len(non_expert) + sum(len(v) for v in expert_files.values()):>5}")
     print()
     print(f"Coverage:")
-    print(f"  HF tensors consumed : {len(used)} / {len(meta)}")
+    print(f"  HF tensors consumed : {len(used)} / {len(meta)}"
+          + (f"  (of which {len(ignored)} derived tables skipped: rotary inv_freq)" if ignored else ""))
     print(f"  missing sources     : {len(set(missing))}")
     print(f"  shape problems      : {len(bad)}")
     if missing:
