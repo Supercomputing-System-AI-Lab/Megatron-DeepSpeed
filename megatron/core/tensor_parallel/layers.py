@@ -103,11 +103,16 @@ def _initialize_affine_weight_cpu(weight, output_size, input_size,
                                   per_partition_size, partition_dim,
                                   init_method, stride=1,
                                   return_master_weight=False,
-                                  *, params_dtype=torch.float32):
+                                  *, params_dtype=torch.float32,
+                                  rank=None, world_size=None):
     """Initialize affine weight for model parallel.
 
     Build the master weight on all processes and scatter
-    the relevant chunk."""
+    the relevant chunk. rank / world_size default to the tensor-parallel
+    rank and size; an expert that is not sliced over the TP group
+    (is_expert_without_slicing) passes 0 / 1 so every TP rank keeps the
+    whole weight (with the defaults, rank r >= 1 kept nothing and the
+    final torch.cat failed on an empty list)."""
 
     set_tensor_model_parallel_attributes(tensor=weight,
                                          is_parallel=True,
@@ -125,8 +130,10 @@ def _initialize_affine_weight_cpu(weight, output_size, input_size,
     per_partition_per_stride_size = divide(per_partition_size, stride)
     weight_list = torch.split(master_weight, per_partition_per_stride_size,
                               dim=partition_dim)
-    rank = get_tensor_model_parallel_rank()
-    world_size = get_tensor_model_parallel_world_size()
+    if rank is None:
+        rank = get_tensor_model_parallel_rank()
+    if world_size is None:
+        world_size = get_tensor_model_parallel_world_size()
     my_weight_list = weight_list[rank::world_size]
 
     with torch.no_grad():
@@ -565,7 +572,8 @@ class ColumnParallelLinear(torch.nn.Module):
                     self.master_weight = _initialize_affine_weight_cpu(
                         self.weight, self.output_size, self.input_size,
                         self.output_size_per_partition, 0, init_method,
-                        stride=stride, return_master_weight=keep_master_weight_for_test)
+                        stride=stride, return_master_weight=keep_master_weight_for_test,
+                        **({'rank': 0, 'world_size': 1} if self.is_expert_without_slicing else {}))
             else:
                 self.weight = Parameter(torch.empty(
                     self.output_size_per_partition, self.input_size,
@@ -764,7 +772,8 @@ class RowParallelLinear(torch.nn.Module):
                     self.weight, self.output_size, self.input_size,
                     self.input_size_per_partition, 1, init_method,
                     stride=stride, return_master_weight=keep_master_weight_for_test,
-                    params_dtype=config.params_dtype)
+                    params_dtype=config.params_dtype,
+                    **({'rank': 0, 'world_size': 1} if self.is_expert_without_slicing else {}))
         else:
             self.weight = Parameter(torch.empty(
                 self.output_size, self.input_size_per_partition,
