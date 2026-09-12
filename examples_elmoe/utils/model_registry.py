@@ -44,6 +44,23 @@ MODEL_SPECS = {
                      "eod_token": "<｜end▁of▁sentence｜>",
                      "softmax_before_topk": True},
 
+    # deepseek-ai/DeepSeek-V3 (2026-09-12, the milestone's second stage): the released 671B model, every value from its config.json
+    # (hidden 7168, 61 layers, 128 heads, q_lora 1536, kv_lora 512, 256 routed + 1 shared
+    # experts, top 8, 8 groups of which 4, scaling 2.5, dense first 3 layers of 18432, rope theta
+    # 10000 with YaRN factor 40 over 4096, eps 1e-06, vocabulary 129280); the prediction head's
+    # layer (num_nextn_predict_layers 1) is left out of the forward comparison (0 here; transformers' class skips it too).
+    # The weights are fp8 block-quantized in the release: the converter dequantizes them to bf16 atoms. The run tokenizes nothing
+    # (XMOE_NULL_TOKENIZER=1, --vocab-size 129279); a forward-only pipeline (PP 8, EP 8, 8 nodes) holds the 1.37 TB of bf16 weights.
+    "DeepSeek_V3_671B": {"h": 7168, "ffn": 2048, "heads": 128, "ep": 256, "k": 8, "s": 8192, "layers": 61,
+                "shared": 1, "first_k_dense": 3, "dense_ffn": 18432, "expert_interval": 1,
+                "norm": "rmsnorm", "norm_eps": 1e-06, "bias": False, "swiglu": True,
+                "untie_embeddings": True, "vocab": 129280,
+                "tokenizer_type": "NullTokenizer", "null_vocab": 129279, "rotary_base": 10000,
+                "v3": {"q_lora_rank": 1536, "kv_lora_rank": 512, "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+                       "scoring_func": "sigmoid", "topk_method": "noaux_tc", "n_group": 8, "topk_group": 4, "norm_topk_prob": True,
+                       "routed_scaling_factor": 2.5, "moe_router_bias_update_speed": 0.001, "moe_seq_balance_coeff": 0.0,
+                       "num_nextn_predict_layers": 0,
+                       "rope_scaling": {"factor": 40, "original_max_position_embeddings": 4096, "beta_fast": 32, "beta_slow": 1, "mscale": 1.0, "mscale_all_dim": 1.0}}},
     # moonshotai/Moonlight-16B-A3B (2026-09-12, the HF comparison milestone): the released DeepSeek-V3 architecture at 16B, every
     # value from its config.json (hidden 2048, 27 layers, 16 heads, kv_lora 512 and no q_lora, 64 routed + 2 shared experts, top 6,
     # sigmoid gate with the bias, one group, scaling 2.446, dense first layer 11264, rope theta
