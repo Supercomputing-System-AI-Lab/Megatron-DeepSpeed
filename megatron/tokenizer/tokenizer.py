@@ -2,6 +2,7 @@
 
 """Megatron tokenizers."""
 
+import os
 from abc import ABC
 from abc import abstractmethod
 
@@ -16,7 +17,15 @@ def build_tokenizer(args):
               flush=True)
 
     # Select and instantiate the tokenizer.
-    if args.tokenizer_type == 'BertWordPieceLowerCase':
+    if os.getenv('XMOE_NULL_TOKENIZER') == '1':
+        # [2026-09-12, the HF comparison] the run tokenizes nothing (the data is pre-tokenized, the prompts arrive as ids through
+        # XMOE_FIXED_TOKENS): a null tokenizer sized by --vocab-size, whatever --tokenizer-type the launch line carries (the
+        # template's data options name the HF tokenizer after every model flag, so a registry entry cannot override them).
+        assert args.vocab_size is not None, 'XMOE_NULL_TOKENIZER=1 needs --vocab-size (the registry field null_vocab)'
+        if args.rank == 0:
+            print(f' > XMOE_NULL_TOKENIZER=1: a null tokenizer of size {args.vocab_size} + 1 replaces {args.tokenizer_type}', flush=True)
+        tokenizer = _NullTokenizer(args.vocab_size)
+    elif args.tokenizer_type == 'BertWordPieceLowerCase':
         assert args.vocab_file is not None
         tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
                                             lower_case=True,

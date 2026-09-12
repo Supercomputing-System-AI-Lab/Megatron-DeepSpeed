@@ -406,6 +406,40 @@ def build_intra_doc_cu_seqlens(tokens, eod_token, pad_to_full=False):
     return cu_seqlens
 
 
+_FIXED_TOKENS = {}
+
+
+def _fixed_tokens(tokens_):
+    """[2026-09-12, the HF comparison milestone] XMOE_FIXED_TOKENS=<file.pt>: a list of 1-D LongTensors (the prompts). The k-th
+    call (the k-th micro-batch of this process) replaces the batch's first row with prompt k mod len, padded to the batch's width
+    with XMOE_FIXED_PAD (default: the prompt's last id); the other rows are untouched. Every rank of a data-parallel group sees the
+    same prompt, the first and the last pipeline stage count their calls alike. Off without the variable; nothing else changes."""
+    path = os.getenv('XMOE_FIXED_TOKENS')
+    if not path:
+        return tokens_
+    if 'prompts' not in _FIXED_TOKENS:
+        _FIXED_TOKENS['prompts'] = [torch.as_tensor(p).long().flatten() for p in torch.load(path, map_location='cpu')]
+        _FIXED_TOKENS['calls'] = 0
+    k = _FIXED_TOKENS['calls']
+    _FIXED_TOKENS['calls'] = k + 1
+    try:
+        from megatron.model import act_dump
+        act_dump.MICRO_BATCH_INDEX = k       # the activation dump saves each module once per micro-batch (not per recompute)
+    except Exception:
+        pass
+    prompt = _FIXED_TOKENS['prompts'][k % len(_FIXED_TOKENS['prompts'])]
+    width = tokens_.shape[1]
+    pad = int(os.getenv('XMOE_FIXED_PAD', str(int(prompt[-1]))))
+    row = torch.full((width,), pad, dtype=tokens_.dtype, device=tokens_.device)
+    n = min(width, prompt.numel())
+    row[:n] = prompt[:n].to(tokens_.device)
+    tokens_ = tokens_.clone()
+    tokens_[0] = row
+    if k < len(_FIXED_TOKENS['prompts']) and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0):
+        print(f'[fixed tokens] micro-batch {k}: row 0 = prompt {k % len(_FIXED_TOKENS["prompts"])} ({n} tokens, pad {pad})', flush=True)
+    return tokens_
+
+
 def get_batch(data_iterator):
     """Generate a batch"""
     args = get_args()
@@ -423,7 +457,7 @@ def get_batch(data_iterator):
     data_b = tensor_parallel.broadcast_data(keys, data, datatype)
 
     # Unpack.
-    tokens_ = data_b['text'].long()
+    tokens_ = _fixed_tokens(data_b['text'].long())
     labels = tokens_[:, 1:].contiguous()
     tokens = tokens_[:, :-1].contiguous()
     # SFT: shift the answer mask [:, 1:] so it aligns with labels, not tokens.
@@ -526,7 +560,7 @@ def get_batch_pipe(data):
     data_b = tensor_parallel.broadcast_data(keys, data, datatype)
 
     # Unpack.
-    tokens_ = data_b['text'].long()
+    tokens_ = _fixed_tokens(data_b['text'].long())
     labels = tokens_[:, 1:].contiguous()
     tokens = tokens_[:, :-1].contiguous()
     # SFT: shift the answer mask [:, 1:] so it aligns with labels, not tokens.

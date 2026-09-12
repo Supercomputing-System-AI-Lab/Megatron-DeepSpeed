@@ -44,6 +44,21 @@ MODEL_SPECS = {
                      "eod_token": "<｜end▁of▁sentence｜>",
                      "softmax_before_topk": True},
 
+    # moonshotai/Moonlight-16B-A3B (2026-09-12, the HF comparison milestone): the released DeepSeek-V3 architecture at 16B, every
+    # value from its config.json (hidden 2048, 27 layers, 16 heads, kv_lora 512 and no q_lora, 64 routed + 2 shared experts, top 6,
+    # sigmoid gate with the bias, one group, scaling 2.446, dense first layer 11264, rope theta
+    # 50000, eps 1e-05, vocabulary 163840). The run tokenizes nothing (NullTokenizer sized to the
+    # embedding's 163840 rows: --vocab-size 163839, EOD = 163839); the prompts arrive as token ids
+    # through the XMOE_FIXED_TOKENS rider. Weights: tools/convert_checkpoint/hf_to_ds_moe.py --emit universal.
+    "Moonlight_16B_A3B": {"h": 2048, "ffn": 1408, "heads": 16, "ep": 64, "k": 6, "s": 8192, "layers": 27,
+                "shared": 2, "first_k_dense": 1, "dense_ffn": 11264, "expert_interval": 1,
+                "norm": "rmsnorm", "norm_eps": 1e-05, "bias": False, "swiglu": True,
+                "untie_embeddings": True, "vocab": 163840,
+                "tokenizer_type": "NullTokenizer", "null_vocab": 163839, "rotary_base": 50000,
+                "v3": {"q_lora_rank": None, "kv_lora_rank": 512, "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+                       "scoring_func": "sigmoid", "topk_method": "noaux_tc", "n_group": 1, "topk_group": 1, "norm_topk_prob": True,
+                       "routed_scaling_factor": 2.446, "moe_router_bias_update_speed": 0.001, "moe_seq_balance_coeff": 0.0,
+                       "num_nextn_predict_layers": 0, "rope_scaling": None}},
     # DeepSeek-V3 in the 16B shape (blueprint decision V1): DeepSeek-V2-Lite's outer shape with V3's attention and router fields.
     # The "v3" sub-dict uses the released config.json keys; get_v3_flags renders it. rope_scaling None until an extension stage
     # (CS4) sets {"factor": 40, "original_max_position_embeddings": 4096, "beta_fast": 32, "beta_slow": 1, "mscale": 1.0, "mscale_all_dim": 1.0}.
@@ -282,6 +297,11 @@ def get_arch_flags(spec):
         flags.append(f"--dense-ffn-hidden-size {spec['dense_ffn']}")
     if spec.get("tokenizer_type"):
         flags.append(f"--tokenizer-type {spec['tokenizer_type']}")
+    if spec.get("null_vocab") is not None:
+        # NullTokenizer's size (2026-09-12): the run tokenizes nothing; Megatron pads this + 1 to the embedding's rows
+        flags.append(f"--vocab-size {spec['null_vocab']}")
+    if spec.get("rotary_base") is not None:
+        flags.append(f"--rotary-base {spec['rotary_base']}")
     if spec.get("eod_token"):
         # Single-quoted: the token contains < and >. The launcher expands
         # ${megatron_options} INTO a `bash -c "..."` string, which bash then
