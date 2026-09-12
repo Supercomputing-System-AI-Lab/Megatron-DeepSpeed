@@ -22,6 +22,8 @@ The inference cache follows ParallelAttention's contract (inference_params.key_v
 batch_size_offset; the batched ragged decode with row_lengths and kv_extent): keys are cached rotated, values at their own width.
 Not built here (open items of the blueprint): the V3.2 indexer.
 """
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -155,6 +157,8 @@ class DeepSeekV3Attention(MegatronModule):
         self.use_flash = bool(args.use_flash_attn_v2 and not args.use_flash_attn_triton
                               and attn_mask_type == AttnMaskType.causal
                               and get_accelerator().device_name() == 'cuda')
+        self.attn_backend = os.getenv('XMOE_V3_ATTN_BACKEND', 'sdpa')      # see _flash_attention
+        assert self.attn_backend in ('sdpa', 'ck256', 'ck'), self.attn_backend
         if self.use_flash:
             from megatron.model.transformer import FlashSelfAttention
             self.core_attention_flash = FlashSelfAttention(causal=True, softmax_scale=self.softmax_scale,
@@ -163,7 +167,7 @@ class DeepSeekV3Attention(MegatronModule):
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0 and self.layer_number == 1:
             print(f'[deepseek_v3] MLA attention: heads {H} (per TP rank {self.heads_per_partition}), q_lora_rank {self.q_lora_rank}, '
                   f'kv_lora_rank {self.kv_lora_rank}, head dims nope/rope/v {self.qk_nope_head_dim}/{self.qk_rope_head_dim}/{self.v_head_dim}, '
-                  f'softmax scale {self.softmax_scale:.6f}, yarn {self.rotary.yarn}, flash {self.use_flash}, '
+                  f'softmax scale {self.softmax_scale:.6f}, yarn {self.rotary.yarn}, flash {self.use_flash} ({self.attn_backend}), '
                   f'sequence_parallel {self.sequence_parallel}', flush=True)
 
     # ------------------------------------------------------------------ helpers
@@ -215,19 +219,37 @@ class DeepSeekV3Attention(MegatronModule):
         return context.permute(2, 0, 1, 3).reshape(s, b, hp * self.v_head_dim)
 
     def _flash_attention(self, query, key, value, attention_mask):
-        """FlashSelfAttention takes [b, s, heads, d] with one head width for q, k and v: the value is padded to the query width
-        (the released flash path does the same) and the output sliced back."""
+        """The flash kernels take [b, s, heads, d] with one head width for q, k and v: the value is padded to the query width (the
+        released flash path does the same) and the output sliced back. The kernel (2026-09-12, run K1 on one GCD at b 4, s 4,096,
+        16 heads, causal, bf16): the head-dim-192 backward of the CK varlen kernel behind FlashSelfAttention takes 60.1 ms (17 TFLOP/s),
+        torch's scaled_dot_product_attention flash backend (aotriton) 24.7 ms, deterministic and equal to it within bf16 rounding
+        (output 2e-3 at scale 2, gradients within 1e-3), the CK kernel with q, k, v padded to 256 29.2 ms; the forwards are alike
+        (6.1-6.4 ms). So the default is 'sdpa' for causal attention without document boundaries and without dropout, 'ck256' (the
+        CK varlen kernel at width 256) where cu_seqlens or dropout are in play, and 'ck' is the kernel at width 192 as before;
+        XMOE_V3_ATTN_BACKEND selects."""
         s, b, hp, _ = query.shape
         q, k, v = [t.permute(1, 0, 2, 3).contiguous() for t in (query, key, value)]
-        v = F.pad(v, [0, self.qk_head_dim - self.v_head_dim])
-        kwargs = {}
-        if self.intra_document_attention and attention_mask is not None:
-            kwargs['cu_seqlens'] = attention_mask
-        if self.sequence_parallel:
-            context = self.core_attention_flash(q, k, v, **kwargs)
+        cu = attention_mask if (self.intra_document_attention and attention_mask is not None) else None
+        backend = self.attn_backend
+        if backend == 'sdpa' and (cu is not None or self.attention_dropout > 0.0):
+            backend = 'ck256'
+        if backend == 'sdpa':
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+            v = F.pad(v, [0, self.qk_head_dim - self.v_head_dim])
+            with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                context = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True,
+                                                         scale=self.softmax_scale).transpose(1, 2)
         else:
-            with tensor_parallel.get_cuda_rng_tracker().fork():
+            width = 256 if (backend == 'ck256' and self.qk_head_dim < 256) else self.qk_head_dim
+            q = F.pad(q, [0, width - self.qk_head_dim])       # zeros in the extra channels: the scores are unchanged, the scale is explicit
+            k = F.pad(k, [0, width - self.qk_head_dim])
+            v = F.pad(v, [0, width - self.v_head_dim])
+            kwargs = {'cu_seqlens': cu} if cu is not None else {}
+            if self.sequence_parallel:
                 context = self.core_attention_flash(q, k, v, **kwargs)
+            else:
+                with tensor_parallel.get_cuda_rng_tracker().fork():
+                    context = self.core_attention_flash(q, k, v, **kwargs)
         context = context[..., : self.v_head_dim]
         return context.permute(1, 0, 2, 3).reshape(s, b, hp * self.v_head_dim)
 
