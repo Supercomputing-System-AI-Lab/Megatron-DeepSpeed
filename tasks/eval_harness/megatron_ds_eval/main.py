@@ -17,6 +17,14 @@ import os as _os
 # Offline unless the caller says otherwise.
 _os.environ.setdefault('HF_DATASETS_OFFLINE', '1')
 _os.environ.setdefault('HF_HUB_OFFLINE', '1')
+# One HF metrics cache per rank. Every rank runs lm-eval's process_results, and the HF evaluate library keeps one arrow
+# cache file per experiment id under HF_HOME/metrics with a file lock: the 64 ranks of the 671B HumanEval run collided
+# on it (job 5476520, rank 0: "another evaluation module instance is already using the local cache file", rank 11:
+# FileNotFoundError on the file another rank had removed) after every completion was generated; smaller runs had won
+# the race. evaluate reads HF_METRICS_CACHE at import, so it is set here, before anything imports it.
+_os.environ.setdefault('HF_METRICS_CACHE', _os.path.join(
+    _os.environ.get('HF_HOME', _os.path.expanduser('~/.cache/huggingface')), 'metrics',
+    'rank' + (_os.environ.get('RANK') or _os.environ.get('SLURM_PROCID') or '0')))
 from lm_eval import simple_evaluate
 
 # --- host/GPU memory sampler (diagnosis of the 131k host oom-kill, 2026-08-30) ---
