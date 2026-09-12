@@ -539,12 +539,14 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     load_dir = getattr(args, load_arg)
 
     if args.universal_checkpoint and args.finetune:
-        # --finetune forces load_module_only / no optimizer / no LR scheduler and resets the
-        # iteration to 0, which defeats the point of resuming from a universal checkpoint.
-        # (It is still the right flag for a weights-only bootstrap such as an HF import.)
-        print_rank_0('WARNING: --universal-checkpoint combined with --finetune: optimizer state and '
-                     'the LR schedule will NOT be restored and iteration resets to 0. '
-                     'Drop --finetune to resume properly.')
+        # --finetune is the weights-only load: the fp32 master weights (and the persistent buffers) come from the
+        # atoms, exact; the optimizer moments, the step, the parameter groups' hyper-parameters, the LR schedule and
+        # the iteration start fresh (DeepSpeed base_optimizer._load_hp_weights_only, 2026-09-12; before that the
+        # universal path restored the moments and the groups' lr and step regardless of the flag). The right flag for
+        # a bootstrap: an HF import, a checkpoint re-laid out for fine-tuning. Drop it to resume.
+        print_rank_0('--universal-checkpoint with --finetune: the fp32 master weights and the buffers are loaded from '
+                     'the atoms; the optimizer moments, the step, the LR schedule and the iteration start fresh '
+                     '(weights only). Drop --finetune to resume.')
 
     if args.deepspeed:
         if args.finetune:
