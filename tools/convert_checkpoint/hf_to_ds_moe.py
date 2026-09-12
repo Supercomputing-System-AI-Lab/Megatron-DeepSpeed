@@ -270,11 +270,19 @@ class Plan:
         return ops
 
     def ignored_sources(self, meta):
-        """HF tensors that are not weights (derived tables): consumed by nothing, reported, not an error."""
+        """HF tensors that are not weights of the model being converted: the rotary inv_freq tables (derived), the fp8 block
+        scales (weight_scale_inv: consumed by their weight's dequantization, see dequant_fp8), and the prediction head's
+        layers (model.layers.{num_hidden_layers + i}: the released DeepSeek-V3 ships one; the forward comparison and
+        transformers' own class leave it out). Reported, not an error."""
         out = []
         for L in range(self.layers + self.mtp_layers):
             k = f"model.layers.{L}.self_attn.rotary_emb.inv_freq"
             if k in meta:
+                out.append(k)
+        for k in meta:
+            if k.endswith("_scale_inv"):
+                out.append(k)
+            elif self.mtp_layers and any(k.startswith(f"model.layers.{self.layers + i}.") for i in range(self.mtp_layers)):
                 out.append(k)
         return out
 
@@ -426,15 +434,19 @@ def write_universal_model_states(out_dir, plan, num_moe_layers):
     print(f"  {MP_RANK_FILE}  (no module payload; the atoms carry the weights)")
 
 
-def write_universal(out_dir, all_ops, get, plan, ds_version, atom_dtype):
-    """Write <out_dir>/zero/<name>/fp32.pt for every parameter, plus optimizer_state.pt."""
+def write_universal(out_dir, all_ops, get, plan, ds_version, atom_dtype, shard=(0, 1)):
+    """Write <out_dir>/zero/<name>/fp32.pt for every parameter, plus optimizer_state.pt. shard = (k, n): this process takes
+    every n-th op starting at k; the small files are written by k = 0."""
     import torch
 
     zero_dir = os.path.join(out_dir, "zero")
     os.makedirs(zero_dir, exist_ok=True)
+    k_shard, n_shard = shard
 
     n_buffers = 0
     for i, (dst, op, srcs) in enumerate(all_ops, 1):
+        if (i - 1) % n_shard != k_shard:
+            continue
         tensor = apply_op(op, [get(s) for s in srcs], plan)
         if op == "buffer":
             # the router's bias: one buffer atom under the module-path name and one under the pipe name (the engine's
@@ -454,6 +466,9 @@ def write_universal(out_dir, all_ops, get, plan, ds_version, atom_dtype):
             print(f"  atoms: {i}/{len(all_ops)}")
     if n_buffers:
         print(f"  buffer atoms: {n_buffers} (each under the module-path name and the pipe name)")
+    if k_shard != 0:
+        print(f"  shard {k_shard}/{n_shard} done (the small files are shard 0's)")
+        return
 
     # The loader reads this file before any atom. It needs ds_version (asserted non-empty,
     # and required to be >= 0.3.17 for ZeRO stage 1); everything else it takes with a
@@ -463,6 +478,17 @@ def write_universal(out_dir, all_ops, get, plan, ds_version, atom_dtype):
     torch.save({"ds_version": ds_version, "param_groups": []},
                os.path.join(zero_dir, "optimizer_state.pt"))
     print(f"  zero/optimizer_state.pt  (param_groups=[], fresh optimizer)")
+
+
+def dequant_fp8(w, scale_inv, block=128):
+    """The released DeepSeek-V3 stores a weight as fp8 (e4m3) blocks of 128 x 128 with one fp32 scale per block
+    (weight_scale_inv [ceil(out / 128), ceil(in / 128)]): bf16 = fp8 x scale, the block scale broadcast over its rows and
+    columns (inference/kernel.py weight_dequant of the release, on the CPU here)."""
+    import torch
+    out_dim, in_dim = w.shape
+    s = scale_inv.float()
+    s = s.repeat_interleave(block, 0)[:out_dim].repeat_interleave(block, 1)[:, :in_dim]
+    return (w.float() * s).to(torch.bfloat16)
 
 
 def apply_op(op, tensors, plan):
@@ -608,6 +634,10 @@ def main():
                          "'1.word_embeddings.weight' style and reshard across any PP degree. "
                          "gptmodel = runs WITH --no-pipeline-parallel (PP=1 only); names are "
                          "'language_model.encoder.layers.N...' and CANNOT be loaded at PP>1.")
+    ap.add_argument("--shard", default=None,
+                    help="k/n (universal emit only): this process writes atoms k, k+n, k+2n, ... of the op list and, for k=0, the "
+                         "small files; n processes on one node convert a large release (DeepSeek-V3: 30,486 atoms, 1.37 TB) in "
+                         "parallel. Every process reads the same headers and plans the same list.")
     ap.add_argument("--dry-run", action="store_true",
                     help="Validate the full mapping + shapes from safetensors headers and print "
                          "the plan. Requires no torch and writes nothing.")
@@ -735,7 +765,8 @@ def main():
     print()
     print(f"Coverage:")
     print(f"  HF tensors consumed : {len(used)} / {len(meta)}"
-          + (f"  (of which {len(ignored)} derived tables skipped: rotary inv_freq)" if ignored else ""))
+          + (f"  (of which {len(ignored)} skipped: rotary inv_freq tables, fp8 block scales consumed by their weight, "
+             f"prediction-head layers)" if ignored else ""))
     print(f"  missing sources     : {len(set(missing))}")
     print(f"  shape problems      : {len(bad)}")
     if missing:
@@ -783,7 +814,13 @@ def main():
                                        framework="pt", device="cpu")
 
     def get(key):
-        return handles[meta[key][2]].get_tensor(key)
+        t = handles[meta[key][2]].get_tensor(key)
+        if t.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2):
+            scale_key = key + "_scale_inv"
+            if scale_key not in meta:
+                raise SystemExit(f"{key} is fp8 but has no {scale_key}")
+            t = dequant_fp8(t, handles[meta[scale_key][2]].get_tensor(scale_key))
+        return t
 
     # ---- universal: one directory per parameter, loadable at any TP/EP/PP ----
     if args.emit in ("universal", "both"):
@@ -807,10 +844,17 @@ def main():
         print(f"  vocabulary stored unpadded at {tok_vocab} rows "
               f"(a run pads it to its own multiple of {args.make_vocab_size_divisible_by} x TP)")
         print(f"\nWriting universal checkpoint to {uni_dir}  ({len(all_ops)} atoms, {args.atom_dtype})")
-        write_universal(uni_dir, all_ops, get, plan, ds_version_string(), dtype)
+        shard = (0, 1)
+        if args.shard:
+            k, n = (int(x) for x in args.shard.split("/"))
+            assert 0 <= k < n, args.shard
+            shard = (k, n)
+        write_universal(uni_dir, all_ops, get, plan, ds_version_string(), dtype, shard=shard)
+        plan.padded_vocab = padded_for_ds
+        if shard[0] != 0:
+            return 0
         write_universal_model_states(
             uni_dir, plan, sum(1 for L in range(plan.layers) if plan.is_moe_layer(L)))
-        plan.padded_vocab = padded_for_ds
         with open(os.path.join(args.output_folder, "latest_universal"), "w") as f:
             f.write(uni_tag)
         print(f"  latest_universal -> {uni_tag}")
