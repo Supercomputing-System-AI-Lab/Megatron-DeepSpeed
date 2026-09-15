@@ -53,8 +53,9 @@ def load_registry():
 
 class Shapes:
     """the per-layer parameter and activation shapes of one model entry"""
-    def __init__(self, entry, tp=1):
-        e = entry; self.e = e
+    def __init__(self, entry, tp=1, sp=False, expert_tp=False):
+        e = entry; self.e = e; self.sp = bool(sp) and tp > 1   # Megatron sequence parallelism shards the residual stream by tp
+        self.expert_tp = bool(expert_tp) and tp > 1              # default off: the sequence-sharded MoE block keeps whole experts on every tp rank and gives each one tp-th of the tokens
         self.h = e['h']; self.layers = e['layers']; self.heads = e['heads']; self.E = e['ep']; self.k = e['k']
         self.I = e['ffn']; self.shared = e.get('shared', 0); self.first_dense = e.get('first_k_dense', 0)
         self.dense_I = e.get('dense_ffn', 4 * self.h); self.vocab = e['vocab']; self.untied = e.get('untie_embeddings', True)
@@ -104,49 +105,64 @@ class Shapes:
         return n
 
     # ---- activations kept for the backward, per token, per layer, when the layer is NOT checkpointed (bytes) ----
+    def _res(self):
+        """the residual stream and the norm outputs: whole on every tensor-parallel rank, or one tp-th under sequence parallelism"""
+        return self.tp if self.sp else 1
+
     def attn_act_per_token(self):
         """the M1 frames: the two norm outputs (bf16), the latent projections and their norms, q/k/v padded to the query width
-        for the flash kernel plus its output and log-sum-exp, the o_proj input, and the residual add in fp32"""
-        h, H = self.h, self.heads
-        b = h * BF16                                              # input norm output
+        for the flash kernel plus its output and log-sum-exp, the o_proj input, and the residual add in fp32. Tensor parallelism
+        slices the heads (q_b, kv_b, the flash tensors, the o_proj input) by tp; the latent projections q_a and kv_a are replicated;
+        sequence parallelism shards the norm output and the residual by tp."""
+        h, H, tp, r = self.h, self.heads, self.tp, self._res()
+        b = h * BF16 / r                                          # input norm output
         if self.v3:
-            b += (self.q_lora or 0) * BF16 * 2                    # q_a out + its norm
-            b += (self.kv_lora + self.d_rope) * BF16 * 2          # kv_a out + its norm
-            b += H * self.d_qk * BF16                             # q_b out
-            b += H * (self.d_nope + self.d_v) * BF16              # kv_b out
-            b += 3 * H * self.d_qk * BF16                         # q, k, v (v padded to the query width) for the flash kernel
-            b += H * self.d_qk * BF16 + H * ATTN_LSE              # flash output (padded) + the log-sum-exp
-            b += H * self.d_v * BF16                              # the o_proj input
+            b += (self.q_lora or 0) * BF16 * 2 / r                # q_a out + its norm (replicated, on the sequence shard under SP)
+            b += (self.kv_lora + self.d_rope) * BF16 * 2 / r      # kv_a out + its norm
+            b += H * self.d_qk * BF16 / tp                        # q_b out (heads / tp)
+            b += H * (self.d_nope + self.d_v) * BF16 / tp         # kv_b out
+            b += 3 * H * self.d_qk * BF16 / tp                    # q, k, v (v padded to the query width) for the flash kernel
+            b += H * self.d_qk * BF16 / tp + H * ATTN_LSE / tp    # flash output (padded) + the log-sum-exp
+            b += H * self.d_v * BF16 / tp                         # the o_proj input
         else:
-            b += 3 * h * BF16 + h * BF16 + H * ATTN_LSE + h * BF16
-        b += h * FP32                                             # the residual add (fp32 residual stream)
+            b += (3 * h * BF16 + h * BF16 + H * ATTN_LSE + h * BF16) / tp
+        b += h * FP32 / r                                         # the residual add (fp32 residual stream)
+        if tp > 1 and not self.sp:
+            b += h * BF16                                         # the all-reduced attention output kept for the backward
         return b
 
     def moe_act_per_token(self):
         """post-attention norm output, the router scores (fp32), the dispatched tokens (k copies, bf16) for the expert GEMMs,
-        the all-to-all buffer, the SwiGLU inputs of the routed and shared experts, the combine output (fp32), the residual add"""
-        h, k, I = self.h, self.k, self.I
-        b = h * BF16                                              # norm output
-        b += self.E * FP32 * 2                                    # router logits and scores
-        b += k * h * BF16                                         # the dispatched tokens (expert GEMM inputs)
-        b += k * h * BF16                                         # the all-to-all output buffer
-        b += k * (2 if self.swiglu else 1) * I * BF16             # SwiGLU inputs of the routed experts
-        b += k * I * BF16                                         # the expert down-projection input
+        the all-to-all buffer, the SwiGLU inputs of the routed and shared experts, the combine output (fp32), the residual add.
+        With tp > 1 the sequence-sharded MoE block gives every tensor-parallel rank one tp-th of the tokens (the router, the
+        dispatch, the all-to-all, the experts, the combine all shrink by tp); the shared experts are column-parallel (their
+        intermediates / tp); the residual is whole unless sequence-parallel."""
+        h, k, I, tp, r = self.h, self.k, self.I, self.tp, self._res()
+        b = h * BF16 / r                                          # norm output
+        b += self.E * FP32 * 2 / tp                               # router logits and scores
+        b += k * h * BF16 / tp                                    # the dispatched tokens (expert GEMM inputs)
+        b += k * h * BF16 / tp                                    # the all-to-all output buffer
+        b += k * (2 if self.swiglu else 1) * I * BF16 / tp        # SwiGLU inputs of the routed experts
+        b += k * I * BF16 / tp                                    # the expert down-projection input
         if self.shared:
-            b += (2 if self.swiglu else 1) * I * self.shared * BF16 + I * self.shared * BF16
-        b += h * FP32                                             # the combine output in fp32
-        b += h * FP32                                             # the residual add
+            b += ((2 if self.swiglu else 1) * I * self.shared * BF16 + I * self.shared * BF16) / tp
+        b += h * FP32 / tp                                        # the combine output in fp32 (on the token shard)
+        b += h * FP32 / r                                         # the residual add
+        if tp > 1 and not self.sp:
+            b += h * BF16                                         # the all-gathered block output
         return b
 
     def dense_mlp_act_per_token(self):
-        return self.h * BF16 + (2 if self.swiglu else 1) * self.dense_I * BF16 + self.dense_I * BF16 + self.h * FP32
+        tp, r = self.tp, self._res()
+        return self.h * BF16 / r + ((2 if self.swiglu else 1) * self.dense_I * BF16 + self.dense_I * BF16) / tp + self.h * FP32 / r
 
 
 class MemoryModel:
     def __init__(self, model, nodes, pp, ep, mbs, gbs, seq, ckpt='full', tp=1, gpus_per_node=8, zero=1, partition=None,
-                 recompute_layers=None, chunked_ce=None, registry=None):
+                 recompute_layers=None, chunked_ce=None, registry=None, sp=False, expert_tp=False):
         reg = registry or load_registry()
-        self.name = model; self.entry = reg[model]; self.S = Shapes(self.entry, tp)
+        self.sp = bool(sp) and tp > 1; self.expert_tp = bool(expert_tp) and tp > 1
+        self.name = model; self.entry = reg[model]; self.S = Shapes(self.entry, tp, self.sp, self.expert_tp)
         self.nodes, self.pp, self.ep, self.tp, self.mbs, self.gbs, self.seq = nodes, pp, ep, tp, mbs, gbs, seq
         self.ckpt = ckpt; self.zero = zero; self.chunked_ce = chunked_ce
         self.world = nodes * gpus_per_node
@@ -182,7 +198,7 @@ class MemoryModel:
         for l in layers:
             dense += S.attn_params() / self.tp + S.norms_params()
             if S.is_moe(l):
-                expert += S.E / self.ep * S.expert_params() / self.tp
+                expert += S.E / self.ep * S.expert_params() / (self.tp if S.expert_tp else 1)
                 dense += S.shared_params() / self.tp + S.router_params()
             else:
                 dense += S.dense_mlp_params() / self.tp
@@ -206,9 +222,10 @@ class MemoryModel:
             full = S.attn_act_per_token() + (S.moe_act_per_token() if S.is_moe(l) else S.dense_mlp_act_per_token())
             per_layer_full.append(full * T)
             per_layer_ckpt.append(self.layer_ckpt(l))
-        kept = sum((S.h * FP32 * T) if c else f for f, c in zip(per_layer_full, per_layer_ckpt))   # a checkpointed layer keeps its fp32 input
+        rshard = self.tp if self.sp else 1                        # the residual stream per rank under sequence parallelism
+        kept = sum((S.h * FP32 * T / rshard) if c else f for f, c in zip(per_layer_full, per_layer_ckpt))   # a checkpointed layer keeps its fp32 input
         if self.pp > 1:
-            kept += S.h * FP32 * T                                # the stage's output stays in pipe_buffers['outputs'] until its backward
+            kept += S.h * FP32 * T / rshard                       # the stage's output stays in pipe_buffers['outputs'] until its backward
         out['_act_kept_per_microbatch'] = kept                    # informational (underscored keys are not summed)
         out['act_kept_inflight'] = kept * inflight
         # the recompute of one checkpointed layer during its backward: its full activations once, plus the layer's gradients
@@ -231,8 +248,9 @@ class MemoryModel:
             out['logits_fp32'] = 0
         out['embedding_act'] = (T * S.h * BF16) if s == 0 else 0
         # pipeline send/receive buffers (the fp32 residual crosses the stages) and the expert all-to-all send buffer
-        out['pipe_buffers'] = (2 * T * S.h * FP32) if self.pp > 1 else 0
-        out['a2a_send'] = T * S.k * S.h * BF16 if any(S.is_moe(l) for l in layers) else 0
+        out['pipe_buffers'] = (2 * T * S.h * FP32 / rshard) if self.pp > 1 else 0
+        out['a2a_send'] = T * S.k * S.h * BF16 / self.tp if any(S.is_moe(l) for l in layers) else 0
+        out['tp_allreduce'] = (2 * T * S.h * BF16) if (self.tp > 1 and not self.sp) else ((2 * T * S.h * BF16 / self.tp) if self.tp > 1 else 0)   # the all-reduce (or reduce-scatter / all-gather) buffers of one layer
         alloc = sum(v for k, v in out.items() if not k.startswith('_') and k not in ('params_dense', 'params_expert'))
         out['allocated_peak'] = alloc
         out['reserved_est'] = alloc + max(ALLOC_SLACK * alloc, SLACK_FLOOR)       # the busiest rank of the stage (the allocated peak is the same on every rank of a stage)
@@ -249,7 +267,7 @@ class MemoryModel:
                              params_B=(r['params_dense'] + r['params_expert']) / 1e9,
                              state_GiB=(r['weights_bf16'] + r['grads_bf16'] + r['master_fp32'] + r['adam_fp32']) / GiB,
                              act_GiB=(r['act_kept_inflight'] + r['act_recompute_transient'] + r['act_backward_transient'] + r['logits_fp32'] + r['embedding_act']) / GiB,
-                             buffers_GiB=(r['zero_buckets'] + r['pipe_buffers'] + r['a2a_send']) / GiB,
+                             buffers_GiB=(r['zero_buckets'] + r['pipe_buffers'] + r['a2a_send'] + r['tp_allreduce']) / GiB,
                              allocated_GiB=r['allocated_peak'] / GiB, reserved_GiB=r['reserved_est'] / GiB, vram_GiB=r['vram_est'] / GiB, vram_worst_GiB=r['vram_worst'] / GiB))
         return rows
 
@@ -301,7 +319,7 @@ def validate(measured_path):
 if __name__ == '__main__':
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--model'); ap.add_argument('--nodes', type=int); ap.add_argument('--pp', type=int, default=1); ap.add_argument('--ep', type=int, default=8)
-    ap.add_argument('--tp', type=int, default=1); ap.add_argument('--mbs', type=int, default=1); ap.add_argument('--gbs', type=int); ap.add_argument('--seq', type=int)
+    ap.add_argument('--tp', type=int, default=1); ap.add_argument('--expert-tp', action='store_true', help='slice the experts by tp as well (default: the sequence-sharded MoE block, whole experts per tp rank, one tp-th of the tokens)'); ap.add_argument('--sp', action='store_true', help='Megatron sequence parallelism with tp > 1: the residual stream, norms, checkpoint inputs and pipe buffers shard by tp'); ap.add_argument('--mbs', type=int, default=1); ap.add_argument('--gbs', type=int); ap.add_argument('--seq', type=int)
     ap.add_argument('--ckpt', default='full', choices=['full', 'none', 'block']); ap.add_argument('--recompute-layers', default='', help='block: e.g. 0-8')
     ap.add_argument('--chunked-ce', type=int, default=None); ap.add_argument('--partition', default=None, help='layers per stage, e.g. 2,2,...,1')
     ap.add_argument('--json', default=None); ap.add_argument('--validate', action='store_true'); ap.add_argument('--measured', default=os.path.join(HERE, 'v3_memory_measured.json'))
@@ -312,8 +330,8 @@ if __name__ == '__main__':
     if a.recompute_layers:
         lo, hi = a.recompute_layers.split('-'); rl = range(int(lo), int(hi) + 1)
     part = [int(x) for x in a.partition.split(',')] if a.partition else None
-    mm = MemoryModel(a.model, a.nodes, a.pp, a.ep, a.mbs, a.gbs, a.seq, a.ckpt, tp=a.tp, partition=part, recompute_layers=rl, chunked_ce=a.chunked_ce)
-    print(f"{a.model}: {a.nodes} nodes, PP {a.pp} x EP {a.ep} x TP {a.tp}, dp_non_moe {mm.dp_non_moe}, dp_moe {mm.dp_moe}, mbs {a.mbs}, GBS {a.gbs} -> {mm.micro_batches} micro-batches per pipeline, seq {a.seq}, ckpt {a.ckpt}")
+    mm = MemoryModel(a.model, a.nodes, a.pp, a.ep, a.mbs, a.gbs, a.seq, a.ckpt, tp=a.tp, partition=part, recompute_layers=rl, chunked_ce=a.chunked_ce, sp=a.sp, expert_tp=a.expert_tp)
+    print(f"{a.model}: {a.nodes} nodes, PP {a.pp} x EP {a.ep} x TP {a.tp}{' + SP' if mm.sp else ''}{' + expert TP' if mm.expert_tp else ''}, dp_non_moe {mm.dp_non_moe}, dp_moe {mm.dp_moe}, mbs {a.mbs}, GBS {a.gbs} -> {mm.micro_batches} micro-batches per pipeline, seq {a.seq}, ckpt {a.ckpt}")
     rows = mm.table(); print(fmt_table(rows))
     print(f"heaviest stage: {max(rows, key=lambda r: r['vram_GiB'])['stage']} at {max(r['vram_GiB'] for r in rows):.1f} GiB VRAM, {max(r['vram_worst_GiB'] for r in rows):.1f} at the worst slack (64 GiB per GCD)")
     if a.json:
