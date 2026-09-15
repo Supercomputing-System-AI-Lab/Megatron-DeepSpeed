@@ -31,7 +31,9 @@ def non_torch_vram(world):
     """interpolated in log2(world) between the two measurements; a measured constant, not a formula"""
     lo, hi = math.log2(8), math.log2(512); x = min(max(math.log2(max(world, 8)), lo), hi)
     return NON_TORCH_VRAM_1NODE + (NON_TORCH_VRAM_512 - NON_TORCH_VRAM_1NODE) * (x - lo) / (hi - lo)
-ALLOC_SLACK = 0.15                # reserved / allocated - 1 at the peak without expandable segments: M1 58.7 / 51.1 (the caching allocator's fragmentation)
+ALLOC_SLACK = 0.18                # reserved / allocated - 1 on a typical rank without expandable segments: M1 60.2 / 51.3 = 0.173 (block recompute), R16f 52.6 / 44.1 = 0.195 (every layer checkpointed); the caching allocator's fragmentation
+SLACK_FLOOR = 10 * GiB            # the busiest rank of a stage: R671b (512 ranks, every rank's never-reset maximum) reserved minus allocated 8.4-15.7 GiB per stage at the worst rank while the allocated peak differs by 0.7 GiB across a stage's 16 ranks
+SLACK_WORST = 16 * GiB            # the largest slack seen (R671b stage 24: 15.7 GiB); the out-of-memory line is allocated + this + the non-torch part
 ZERO_BUCKET = 5e8                 # DeepSpeed reduce_bucket_size elements (the job config); two bf16 buckets live at the backward's peak (M1 frames :2068/:2075)
 ATTN_LSE = 4                      # flash attention keeps the log-sum-exp per query per head in fp32
 
@@ -233,8 +235,9 @@ class MemoryModel:
         out['a2a_send'] = T * S.k * S.h * BF16 if any(S.is_moe(l) for l in layers) else 0
         alloc = sum(v for k, v in out.items() if not k.startswith('_') and k not in ('params_dense', 'params_expert'))
         out['allocated_peak'] = alloc
-        out['reserved_est'] = alloc * (1 + ALLOC_SLACK)
+        out['reserved_est'] = alloc + max(ALLOC_SLACK * alloc, SLACK_FLOOR)       # the busiest rank of the stage (the allocated peak is the same on every rank of a stage)
         out['vram_est'] = out['reserved_est'] + non_torch_vram(self.world)
+        out['vram_worst'] = alloc + SLACK_WORST + non_torch_vram(self.world)       # the out-of-memory line: the largest allocator slack ever measured on top of the allocated peak
         out['layers'] = layers; out['inflight'] = inflight
         return out
 
@@ -247,7 +250,7 @@ class MemoryModel:
                              state_GiB=(r['weights_bf16'] + r['grads_bf16'] + r['master_fp32'] + r['adam_fp32']) / GiB,
                              act_GiB=(r['act_kept_inflight'] + r['act_recompute_transient'] + r['act_backward_transient'] + r['logits_fp32'] + r['embedding_act']) / GiB,
                              buffers_GiB=(r['zero_buckets'] + r['pipe_buffers'] + r['a2a_send']) / GiB,
-                             allocated_GiB=r['allocated_peak'] / GiB, reserved_GiB=r['reserved_est'] / GiB, vram_GiB=r['vram_est'] / GiB))
+                             allocated_GiB=r['allocated_peak'] / GiB, reserved_GiB=r['reserved_est'] / GiB, vram_GiB=r['vram_est'] / GiB, vram_worst_GiB=r['vram_worst'] / GiB))
         return rows
 
     def query_stage_memory(self, stage_id, num_layers, num_ckpt_layers, micro_batch_size):
@@ -267,10 +270,10 @@ class MemoryModel:
 
 
 def fmt_table(rows):
-    head = f"{'stage':>5} {'layers':>8} {'inflight':>8} {'params B':>9} {'state':>7} {'act':>7} {'buffers':>8} {'alloc':>7} {'reserved':>9} {'VRAM':>7}  (GiB per GCD)"
+    head = f"{'stage':>5} {'layers':>8} {'inflight':>8} {'params B':>9} {'state':>7} {'act':>7} {'buffers':>8} {'alloc':>7} {'reserved':>9} {'VRAM':>7} {'worst':>7}  (GiB per GCD; worst = allocated + the largest slack + non-torch, the out-of-memory line)"
     lines = [head]
     for r in rows:
-        lines.append(f"{r['stage']:>5} {r['layers']:>8} {r['inflight']:>8} {r['params_B']:>9.2f} {r['state_GiB']:>7.1f} {r['act_GiB']:>7.1f} {r['buffers_GiB']:>8.1f} {r['allocated_GiB']:>7.1f} {r['reserved_GiB']:>9.1f} {r['vram_GiB']:>7.1f}")
+        lines.append(f"{r['stage']:>5} {r['layers']:>8} {r['inflight']:>8} {r['params_B']:>9.2f} {r['state_GiB']:>7.1f} {r['act_GiB']:>7.1f} {r['buffers_GiB']:>8.1f} {r['allocated_GiB']:>7.1f} {r['reserved_GiB']:>9.1f} {r['vram_GiB']:>7.1f} {r['vram_worst_GiB']:>7.1f}")
     return '\n'.join(lines)
 
 
@@ -281,9 +284,9 @@ def validate(measured_path):
         mm = MemoryModel(**p['layout'])
         print(f"== {p['label']}: {p['what']}")
         for s, meas in p['measured'].items():
-            r = mm.stage(int(s)); pred = r['vram_est'] / GiB if 'vram_GB' in meas else r['allocated_peak'] / GiB
-            key = 'vram_GB' if 'vram_GB' in meas else 'allocated_GiB'
-            ref = meas[key] * (1e9 / GiB if key == 'vram_GB' else 1)
+            r = mm.stage(int(s)); pred = r['vram_est'] / GiB if 'vram_GiB' in meas else r['allocated_peak'] / GiB
+            key = 'vram_GiB' if 'vram_GiB' in meas else 'allocated_GiB'
+            ref = meas[key]
             err = 100 * (pred - ref) / ref; worst = max(worst, abs(err))
             results.append(dict(label=p['label'], stage=int(s), predicted=pred, measured=ref, key=key, err_pct=err, alloc=r['allocated_peak'] / GiB, state=(r['weights_bf16'] + r['grads_bf16'] + r['master_fp32'] + r['adam_fp32']) / GiB, act=(r['act_kept_inflight'] + r['act_recompute_transient'] + r['act_backward_transient'] + r['logits_fp32']) / GiB, components={c: dict(predicted=r[c] / GiB, measured=v) for c, v in meas.get('components_GiB', {}).items() if c in r}))
             print(f"   stage {s:>2}: predicted {pred:6.1f} GiB  measured {ref:6.1f} GiB ({key})  {err:+5.1f} %   [alloc {r['allocated_peak']/GiB:.1f}, state {(r['weights_bf16']+r['grads_bf16']+r['master_fp32']+r['adam_fp32'])/GiB:.1f}, act {(r['act_kept_inflight']+r['act_recompute_transient']+r['act_backward_transient']+r['logits_fp32'])/GiB:.1f}]")
@@ -312,6 +315,6 @@ if __name__ == '__main__':
     mm = MemoryModel(a.model, a.nodes, a.pp, a.ep, a.mbs, a.gbs, a.seq, a.ckpt, tp=a.tp, partition=part, recompute_layers=rl, chunked_ce=a.chunked_ce)
     print(f"{a.model}: {a.nodes} nodes, PP {a.pp} x EP {a.ep} x TP {a.tp}, dp_non_moe {mm.dp_non_moe}, dp_moe {mm.dp_moe}, mbs {a.mbs}, GBS {a.gbs} -> {mm.micro_batches} micro-batches per pipeline, seq {a.seq}, ckpt {a.ckpt}")
     rows = mm.table(); print(fmt_table(rows))
-    print(f"heaviest stage: {max(rows, key=lambda r: r['vram_GiB'])['stage']} at {max(r['vram_GiB'] for r in rows):.1f} GiB VRAM (64 GiB per GCD)")
+    print(f"heaviest stage: {max(rows, key=lambda r: r['vram_GiB'])['stage']} at {max(r['vram_GiB'] for r in rows):.1f} GiB VRAM, {max(r['vram_worst_GiB'] for r in rows):.1f} at the worst slack (64 GiB per GCD)")
     if a.json:
         json.dump(dict(layout=vars(a), rows=rows, stages=[mm.stage(s) for s in range(a.pp)]), open(a.json, 'w'), indent=1, default=list); print('wrote', a.json)

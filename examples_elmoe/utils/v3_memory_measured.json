@@ -1,15 +1,359 @@
 {
- "note": "the measured points of 2026-09-14; VRAM = rocm-smi 'VRAM used' from a-monitor.txt (HBM% x 64 GiB, in GB = 1e9), the log's 'max reserved' is the allocator pool at the last peak-counter reset (transformer.py TIMING=1 resets every layer), the memsnap peak is the allocator's true allocated maximum",
+ "note": "the measured points of 2026-09-14; vram_GiB = rocm-smi 'VRAM used' from a-monitor.txt (its HBM% column times the GCD's 64 GiB), the log's 'max reserved' is the allocator pool at the last peak-counter reset (transformer.py TIMING=1 resets every layer), the memsnap peak is the allocator's true allocated maximum; every number is GiB",
  "points": [
-  {"label": "M1 5485255", "what": "V3S_16B, 1 node EP8 DP8 PP1, mbs 1, GBS 64, seq 4096, block recompute of layers 0-8, chunked CE 1024; memsnap (bin/memsnap) = the true allocated peak with its live allocations by frame",
-   "layout": {"model": "V3S_16B", "nodes": 1, "pp": 1, "ep": 8, "mbs": 1, "gbs": 64, "seq": 4096, "ckpt": "block", "recompute_layers": [0,1,2,3,4,5,6,7,8], "chunked_ce": 1024},
-   "measured": {"0": {"allocated_GiB": 51.08, "reserved_GiB": 58.71,
-     "components_GiB": {"weights_bf16": 5.593, "grads_bf16": 5.474, "master_fp32": 7.263, "adam_fp32": 14.526, "zero_buckets": 1.862, "logits_fp32": 0.764}}}},
-  {"label": "W2 5483732", "what": "V3S_16B, 1 node EP8 DP8 PP1, mbs 1, GBS 2048, seq 4096, every layer checkpointed (DeepSpeed checkpoint_activations), full logits; a-monitor peak 81 % of 64 GiB; the log's max reserved 49.1 GB after the per-layer resets",
-   "layout": {"model": "V3S_16B", "nodes": 1, "pp": 1, "ep": 8, "mbs": 1, "gbs": 2048, "seq": 4096, "ckpt": "full"},
-   "measured": {"0": {"vram_GB": 51.8}}},
-  {"label": "P64 5483075", "what": "DeepSeek_V3_671B, 64 nodes PP32 EP8 TP1 (dp_non_moe 16, dp_moe 2), mbs 1, GBS 4096, seq 4096, every layer checkpointed, full logits; a-monitor peak per stage (16 ranks each) in GB; the log's max reserved: rank 0 32.0, rank 511 33.5",
-   "layout": {"model": "DeepSeek_V3_671B", "nodes": 64, "pp": 32, "ep": 8, "mbs": 1, "gbs": 4096, "seq": 4096, "ckpt": "full"},
-   "measured": {"0": {"vram_GB": 35.2}, "1": {"vram_GB": 53.1}, "2": {"vram_GB": 58.9}, "3": {"vram_GB": 58.2}, "4": {"vram_GB": 60.2}, "5": {"vram_GB": 61.4}, "6": {"vram_GB": 62.1}, "7": {"vram_GB": 58.2}, "8": {"vram_GB": 57.0}, "9": {"vram_GB": 55.0}, "10": {"vram_GB": 57.6}, "15": {"vram_GB": 56.3}, "20": {"vram_GB": 48.6}, "25": {"vram_GB": 51.8}, "28": {"vram_GB": 49.3}, "29": {"vram_GB": 38.4}, "30": {"vram_GB": 35.2}, "31": {"vram_GB": 37.8}}}
+  {
+   "label": "M1 5485255",
+   "what": "V3S_16B, 1 node EP8 DP8 PP1, mbs 1, GBS 64, seq 4096, block recompute of layers 0-8, chunked CE 1024; memsnap (bin/memsnap) = the true allocated peak with its live allocations by frame",
+   "layout": {
+    "model": "V3S_16B",
+    "nodes": 1,
+    "pp": 1,
+    "ep": 8,
+    "mbs": 1,
+    "gbs": 64,
+    "seq": 4096,
+    "ckpt": "block",
+    "recompute_layers": [
+     0,
+     1,
+     2,
+     3,
+     4,
+     5,
+     6,
+     7,
+     8
+    ],
+    "chunked_ce": 1024
+   },
+   "measured": {
+    "0": {
+     "allocated_GiB": 51.08,
+     "reserved_GiB": 58.71,
+     "components_GiB": {
+      "weights_bf16": 5.593,
+      "grads_bf16": 5.474,
+      "master_fp32": 7.263,
+      "adam_fp32": 14.526,
+      "zero_buckets": 1.862,
+      "logits_fp32": 0.764
+     }
+    }
+   }
+  },
+  {
+   "label": "W2 5483732",
+   "what": "V3S_16B, 1 node EP8 DP8 PP1, mbs 1, GBS 2048, seq 4096, every layer checkpointed (DeepSpeed checkpoint_activations), full logits; a-monitor peak 81 % of 64 GiB; the log's max reserved 49.1 GB after the per-layer resets",
+   "layout": {
+    "model": "V3S_16B",
+    "nodes": 1,
+    "pp": 1,
+    "ep": 8,
+    "mbs": 1,
+    "gbs": 2048,
+    "seq": 4096,
+    "ckpt": "full"
+   },
+   "measured": {
+    "0": {
+     "vram_GiB": 51.8
+    }
+   }
+  },
+  {
+   "label": "P64 5483075",
+   "what": "DeepSeek_V3_671B, 64 nodes PP32 EP8 TP1 (dp_non_moe 16, dp_moe 2), mbs 1, GBS 4096, seq 4096, every layer checkpointed, full logits; a-monitor peak per stage (16 ranks each) in GB; the log's max reserved: rank 0 32.0, rank 511 33.5",
+   "layout": {
+    "model": "DeepSeek_V3_671B",
+    "nodes": 64,
+    "pp": 32,
+    "ep": 8,
+    "mbs": 1,
+    "gbs": 4096,
+    "seq": 4096,
+    "ckpt": "full"
+   },
+   "measured": {
+    "0": {
+     "vram_GiB": 35.2
+    },
+    "1": {
+     "vram_GiB": 53.1
+    },
+    "2": {
+     "vram_GiB": 58.9
+    },
+    "3": {
+     "vram_GiB": 58.2
+    },
+    "4": {
+     "vram_GiB": 60.2
+    },
+    "5": {
+     "vram_GiB": 61.4
+    },
+    "6": {
+     "vram_GiB": 62.1
+    },
+    "7": {
+     "vram_GiB": 58.2
+    },
+    "8": {
+     "vram_GiB": 57.0
+    },
+    "9": {
+     "vram_GiB": 55.0
+    },
+    "10": {
+     "vram_GiB": 57.6
+    },
+    "15": {
+     "vram_GiB": 56.3
+    },
+    "20": {
+     "vram_GiB": 48.6
+    },
+    "25": {
+     "vram_GiB": 51.8
+    },
+    "28": {
+     "vram_GiB": 49.3
+    },
+    "29": {
+     "vram_GiB": 38.4
+    },
+    "30": {
+     "vram_GiB": 35.2
+    },
+    "31": {
+     "vram_GiB": 37.8
+    }
+   }
+  },
+  {
+   "label": "R16 5489960",
+   "what": "Moonlight_16B_A3B, 1 node EP8 DP8 PP1, mbs 1, GBS 2048, seq 4096, every layer checkpointed, full logits; a-monitor peak 85-88 % of 64 GiB over the 8 ranks (the maximum rank, as for P64); the snapshot did not fire (only one iteration fit the 30-minute wall at 526 s per iteration)",
+   "layout": {
+    "model": "Moonlight_16B_A3B",
+    "nodes": 1,
+    "pp": 1,
+    "ep": 8,
+    "mbs": 1,
+    "gbs": 2048,
+    "seq": 4096,
+    "ckpt": "full"
+   },
+   "measured": {
+    "0": {
+     "vram_GiB": 56.3,
+     "vram_GiB_min_rank": 54.4
+    }
+   }
+  },
+  {
+   "label": "R16f 5490519",
+   "what": "Moonlight_16B_A3B, 1 node EP8 DP8 PP1, mbs 1, GBS 64 (the snapshot exception; the per-rank peak is per micro-batch), seq 4096, every layer checkpointed, full logits; the memsnap shim (recording from process start, the peak counters never reset): true max allocated 44.08 GiB, max reserved 52.62; the live set at the peak by frame",
+   "layout": {
+    "model": "Moonlight_16B_A3B",
+    "nodes": 1,
+    "pp": 1,
+    "ep": 8,
+    "mbs": 1,
+    "gbs": 64,
+    "seq": 4096,
+    "ckpt": "full"
+   },
+   "measured": {
+    "0": {
+     "allocated_GiB": 44.08,
+     "reserved_GiB": 52.62,
+     "components_GiB": {
+      "weights_bf16": 6.267,
+      "grads_bf16": 5.576,
+      "master_fp32": 7.432,
+      "adam_fp32": 14.864,
+      "zero_buckets": 1.862,
+      "logits_fp32": 5.0,
+      "act_kept_inflight": 0.844
+     }
+    }
+   }
+  },
+  {
+   "label": "R671L2a 5490544",
+   "what": "DeepSeek_V3_671B_L2 (one dense + one MoE layer of the 671B), 1 node EP8 DP8 PP1 (dp_moe 1), mbs 1, GBS 2048, seq 4096, every layer checkpointed, full logits; the memsnap shim on rank 0: true max allocated 43.60 GiB (rank 7: 45.79), max reserved 53.43 (53.69); a-monitor 84-89 % = 53.8-57.0 GiB",
+   "layout": {
+    "model": "DeepSeek_V3_671B_L2",
+    "nodes": 1,
+    "pp": 1,
+    "ep": 8,
+    "mbs": 1,
+    "gbs": 2048,
+    "seq": 4096,
+    "ckpt": "full"
+   },
+   "measured": {
+    "0": {
+     "allocated_GiB": 43.6,
+     "reserved_GiB": 53.43,
+     "vram_GiB_maxrank": 57.0,
+     "components_GiB": {
+      "weights_bf16": 7.598,
+      "grads_bf16": 5.812,
+      "master_fp32": 6.493,
+      "adam_fp32": 12.986,
+      "zero_buckets": 1.862
+     }
+    }
+   }
+  },
+  {
+   "label": "R671L2b 5490658",
+   "what": "DeepSeek_V3_671B_L2, 2 nodes EP8 PP2 (dp_non_moe 8, dp_moe 1), mbs 1, GBS 2048, seq 4096, every layer checkpointed; the memsnap shim on rank 0 (stage 0) and the never-reset peaks of ranks 8 and 15 (stage 1); a-monitor per stage",
+   "layout": {
+    "model": "DeepSeek_V3_671B_L2",
+    "nodes": 2,
+    "pp": 2,
+    "ep": 8,
+    "mbs": 1,
+    "gbs": 2048,
+    "seq": 4096,
+    "ckpt": "full"
+   },
+   "measured": {
+    "0": {
+     "allocated_GiB": 10.75,
+     "reserved_GiB": 15.06,
+     "vram_GiB_maxrank": 19.2
+    },
+    "1": {
+     "allocated_GiB": 39.0,
+     "reserved_GiB": 44.6,
+     "vram_GiB_maxrank": 48.6
+    }
+   }
+  },
+  {
+   "label": "R671 5490692",
+   "what": "DeepSeek_V3_671B on the P64 layout (64 nodes PP32 EP8, dp_non_moe 16, dp_moe 2, mbs 1, GBS 4096, seq 4096, every layer checkpointed), 3 iterations, the memsnap shim on the first rank of stages 0, 1, 6, 29, 31 (never-reset maxima); vram_GiB = that rank's own a-monitor peak; vram_GiB_maxrank = the stage's busiest rank (the expert-parallel spread)",
+   "layout": {
+    "model": "DeepSeek_V3_671B",
+    "nodes": 64,
+    "pp": 32,
+    "ep": 8,
+    "mbs": 1,
+    "gbs": 4096,
+    "seq": 4096,
+    "ckpt": "full"
+   },
+   "measured": {
+    "0": {
+     "allocated_GiB": 22.82,
+     "reserved_GiB": 32.0,
+     "vram_GiB_rank": 34.6,
+     "vram_GiB_maxrank": 35.2
+    },
+    "1": {
+     "allocated_GiB": 35.37,
+     "reserved_GiB": 39.22,
+     "vram_GiB_rank": 42.9,
+     "vram_GiB_maxrank": 48.6
+    },
+    "6": {
+     "allocated_GiB": 44.87,
+     "reserved_GiB": 47.5,
+     "vram_GiB_rank": 51.2,
+     "vram_GiB_maxrank": 62.1
+    },
+    "29": {
+     "allocated_GiB": 20.13,
+     "reserved_GiB": 21.1,
+     "vram_GiB_rank": 24.3,
+     "vram_GiB_maxrank": 32.6
+    },
+    "31": {
+     "allocated_GiB": 28.56,
+     "reserved_GiB": 33.53,
+     "vram_GiB_rank": 37.1,
+     "vram_GiB_maxrank": 37.1
+    }
+   }
+  },
+  {
+   "label": "R671b 5490802",
+   "what": "DeepSeek_V3_671B on the P64 layout, every rank's never-reset maximum from the rank logs (memsnap shim on all ranks): per stage the allocated maximum (spread across a stage's 16 ranks at most 0.7 GiB), the reserved maximum (the busiest rank; the spread up to 13.9 GiB), the a-monitor maximum; the non-torch part (monitor minus reserved) median 3.5, max 3.9 GiB",
+   "layout": {
+    "model": "DeepSeek_V3_671B",
+    "nodes": 64,
+    "pp": 32,
+    "ep": 8,
+    "mbs": 1,
+    "gbs": 4096,
+    "seq": 4096,
+    "ckpt": "full"
+   },
+   "measured": {
+    "0": {
+     "allocated_GiB": 22.816,
+     "reserved_GiB": 32.352,
+     "vram_GiB_maxrank": 35.2
+    },
+    "1": {
+     "allocated_GiB": 35.599,
+     "reserved_GiB": 45.342,
+     "vram_GiB_maxrank": 48.64
+    },
+    "2": {
+     "allocated_GiB": 46.888,
+     "reserved_GiB": 55.137,
+     "vram_GiB_maxrank": 58.88
+    },
+    "6": {
+     "allocated_GiB": 45.112,
+     "reserved_GiB": 58.342,
+     "vram_GiB_maxrank": 62.08
+    },
+    "10": {
+     "allocated_GiB": 43.227,
+     "reserved_GiB": 54.078,
+     "vram_GiB_maxrank": 57.6
+    },
+    "15": {
+     "allocated_GiB": 41.024,
+     "reserved_GiB": 52.688,
+     "vram_GiB_maxrank": 56.32
+    },
+    "20": {
+     "allocated_GiB": 38.801,
+     "reserved_GiB": 44.869,
+     "vram_GiB_maxrank": 48.64
+    },
+    "25": {
+     "allocated_GiB": 36.787,
+     "reserved_GiB": 48.596,
+     "vram_GiB_maxrank": 51.84
+    },
+    "28": {
+     "allocated_GiB": 35.263,
+     "reserved_GiB": 45.455,
+     "vram_GiB_maxrank": 49.28
+    },
+    "29": {
+     "allocated_GiB": 20.23,
+     "reserved_GiB": 29.326,
+     "vram_GiB_maxrank": 32.64
+    },
+    "30": {
+     "allocated_GiB": 19.938,
+     "reserved_GiB": 28.273,
+     "vram_GiB_maxrank": 32.0
+    },
+    "31": {
+     "allocated_GiB": 28.732,
+     "reserved_GiB": 34.143,
+     "vram_GiB_maxrank": 37.12
+    }
+   }
+  }
  ]
 }

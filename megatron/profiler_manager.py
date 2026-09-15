@@ -150,14 +150,22 @@ def _snapshot_rank_allowed():
     return r in allowed
 
 
-def enable_memory_history(max_entries=2_000_000):
+def enable_memory_history(max_entries=None):
     """Start recording CUDA caching-allocator history (for the .pickle snapshot), on the
     ranks selected by mem_snapshot_ranks. Standalone -- no torch.profiler. Returns True if
-    this rank will snapshot."""
+    this rank will snapshot. Two environment knobs (2026-09-14): mem_snapshot_max_entries (the
+    ring of recorded events, default 2,000,000) and mem_snapshot_stacks ('all' = Python and C++
+    frames per event, the default; 'python' = the Python frames only). A 2,000,000-entry ring with
+    both stacks took torch's _snapshot() more than 22 minutes to serialize at the dump (run
+    5490252), with every other rank waiting at the next collective; 100,000 entries still hold
+    several micro-batches, and the Python frames are what the per-module analysis reads."""
     if not _snapshot_rank_allowed():
         return False
+    if max_entries is None:
+        max_entries = int(os.getenv('mem_snapshot_max_entries', '2000000'))
+    stacks = os.getenv('mem_snapshot_stacks', 'all')
     try:
-        torch.cuda.memory._record_memory_history(max_entries=max_entries)
+        torch.cuda.memory._record_memory_history(max_entries=max_entries, stacks=stacks)
         return True
     except AttributeError:
         print("Warning: torch.cuda.memory._record_memory_history not available.")
