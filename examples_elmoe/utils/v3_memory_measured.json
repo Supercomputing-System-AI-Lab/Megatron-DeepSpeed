@@ -354,6 +354,209 @@
      "vram_GiB_maxrank": 37.12
     }
    }
+  },
+  {
+   "label": "R671S 5491089",
+   "what": "DeepSeek_V3_671B_L2 on 2 nodes, PP 1 x EP 8 x TP 2 + Megatron SP (dp_non_moe 8, dp_moe 2), mbs 1, GBS 2,048, seq 8,192, every layer checkpointed, chunked CE 1,024; every rank's never-reset maximum (the memsnap shim on all 16 ranks; ranks 0 and 1 dumped) and the a-monitor peak; the first tensor + sequence-parallel point",
+   "layout": {
+    "model": "DeepSeek_V3_671B_L2",
+    "nodes": 2,
+    "pp": 1,
+    "ep": 8,
+    "mbs": 1,
+    "gbs": 2048,
+    "seq": 8192,
+    "ckpt": "full",
+    "tp": 2,
+    "sp": true,
+    "chunked_ce": 1024
+   },
+   "measured": {
+    "0": {
+     "allocated_GiB": 30.458,
+     "reserved_GiB": 45.678,
+     "vram_GiB_maxrank": 48.64
+    }
+   }
+  },
+  {
+   "label": "R671T4L 5491121",
+   "what": "DeepSeek_V3_671B on 64 nodes, PP 32 x EP 8 x TP 4 + Megatron SP (dp_non_moe 4, dp_moe 2), mbs 1, GBS 4,096, seq 8,192, every layer checkpointed, chunked CE 1,024, 2 iterations (839 s the second); every rank's never-reset maximum (the memsnap shim on all 512 ranks; the first rank of stages 0, 1, 2, 6, 29, 31 dumped) and the a-monitor peak per stage; the first 8k point of the 671B",
+   "layout": {
+    "model": "DeepSeek_V3_671B",
+    "nodes": 64,
+    "pp": 32,
+    "ep": 8,
+    "mbs": 1,
+    "gbs": 4096,
+    "seq": 8192,
+    "ckpt": "full",
+    "tp": 4,
+    "sp": true,
+    "chunked_ce": 1024
+   },
+   "measured": {
+    "0": {
+     "allocated_GiB": 12.532,
+     "reserved_GiB": 19.75,
+     "vram_GiB_maxrank": 22.4
+    },
+    "1": {
+     "allocated_GiB": 25.278,
+     "reserved_GiB": 32.76,
+     "vram_GiB_maxrank": 34.56
+    },
+    "2": {
+     "allocated_GiB": 37.157,
+     "reserved_GiB": 43.738,
+     "vram_GiB_maxrank": 44.8
+    },
+    "3": {
+     "allocated_GiB": 36.847,
+     "reserved_GiB": 42.475,
+     "vram_GiB_maxrank": 43.52
+    },
+    "4": {
+     "allocated_GiB": 36.641,
+     "reserved_GiB": 43.297,
+     "vram_GiB_maxrank": 44.16
+    },
+    "5": {
+     "allocated_GiB": 36.481,
+     "reserved_GiB": 42.326,
+     "vram_GiB_maxrank": 43.52
+    },
+    "6": {
+     "allocated_GiB": 36.127,
+     "reserved_GiB": 43.574,
+     "vram_GiB_maxrank": 44.8
+    },
+    "7": {
+     "allocated_GiB": 35.968,
+     "reserved_GiB": 41.363,
+     "vram_GiB_maxrank": 42.24
+    },
+    "8": {
+     "allocated_GiB": 35.687,
+     "reserved_GiB": 40.936,
+     "vram_GiB_maxrank": 42.24
+    },
+    "9": {
+     "allocated_GiB": 35.567,
+     "reserved_GiB": 41.111,
+     "vram_GiB_maxrank": 42.24
+    },
+    "10": {
+     "allocated_GiB": 35.338,
+     "reserved_GiB": 42.268,
+     "vram_GiB_maxrank": 43.52
+    },
+    "11": {
+     "allocated_GiB": 35.006,
+     "reserved_GiB": 41.238,
+     "vram_GiB_maxrank": 42.24
+    },
+    "12": {
+     "allocated_GiB": 34.827,
+     "reserved_GiB": 40.514,
+     "vram_GiB_maxrank": 41.6
+    },
+    "13": {
+     "allocated_GiB": 34.611,
+     "reserved_GiB": 40.689,
+     "vram_GiB_maxrank": 41.6
+    },
+    "14": {
+     "allocated_GiB": 34.458,
+     "reserved_GiB": 40.186,
+     "vram_GiB_maxrank": 41.6
+    },
+    "15": {
+     "allocated_GiB": 34.363,
+     "reserved_GiB": 40.535,
+     "vram_GiB_maxrank": 41.6
+    },
+    "16": {
+     "allocated_GiB": 33.906,
+     "reserved_GiB": 41.029,
+     "vram_GiB_maxrank": 42.24
+    },
+    "17": {
+     "allocated_GiB": 33.749,
+     "reserved_GiB": 40.955,
+     "vram_GiB_maxrank": 42.24
+    },
+    "18": {
+     "allocated_GiB": 33.434,
+     "reserved_GiB": 39.391,
+     "vram_GiB_maxrank": 40.32
+    },
+    "19": {
+     "allocated_GiB": 33.323,
+     "reserved_GiB": 42.936,
+     "vram_GiB_maxrank": 44.16
+    },
+    "20": {
+     "allocated_GiB": 33.121,
+     "reserved_GiB": 39.598,
+     "vram_GiB_maxrank": 40.32
+    },
+    "21": {
+     "allocated_GiB": 32.778,
+     "reserved_GiB": 39.98,
+     "vram_GiB_maxrank": 40.96
+    },
+    "22": {
+     "allocated_GiB": 32.619,
+     "reserved_GiB": 38.959,
+     "vram_GiB_maxrank": 39.68
+    },
+    "23": {
+     "allocated_GiB": 32.371,
+     "reserved_GiB": 40.633,
+     "vram_GiB_maxrank": 41.6
+    },
+    "24": {
+     "allocated_GiB": 32.168,
+     "reserved_GiB": 39.068,
+     "vram_GiB_maxrank": 40.32
+    },
+    "25": {
+     "allocated_GiB": 31.911,
+     "reserved_GiB": 39.99,
+     "vram_GiB_maxrank": 40.96
+    },
+    "26": {
+     "allocated_GiB": 31.837,
+     "reserved_GiB": 39.83,
+     "vram_GiB_maxrank": 40.96
+    },
+    "27": {
+     "allocated_GiB": 31.486,
+     "reserved_GiB": 36.811,
+     "vram_GiB_maxrank": 37.76
+    },
+    "28": {
+     "allocated_GiB": 31.2,
+     "reserved_GiB": 41.41,
+     "vram_GiB_maxrank": 42.24
+    },
+    "29": {
+     "allocated_GiB": 17.207,
+     "reserved_GiB": 25.152,
+     "vram_GiB_maxrank": 26.24
+    },
+    "30": {
+     "allocated_GiB": 17.052,
+     "reserved_GiB": 22.637,
+     "vram_GiB_maxrank": 23.68
+    },
+    "31": {
+     "allocated_GiB": 19.473,
+     "reserved_GiB": 24.123,
+     "vram_GiB_maxrank": 26.88
+    }
+   }
   }
  ]
 }

@@ -214,7 +214,10 @@ class MemoryModel:
         out['master_fp32'] = dense * FP32 / self.dp_non_moe + expert * FP32 / self.dp_moe
         out['adam_fp32'] = 2 * (dense * FP32 / self.dp_non_moe + expert * FP32 / self.dp_moe)
         has_moe = any(S.is_moe(l) for l in layers)
-        out['zero_buckets'] = 2 * ZERO_BUCKET * BF16 * (2 if (has_moe and self.dp_moe > 1) else 1)   # the expert gradients get their own reduce buckets when dp_moe > 1 (none needed at dp_moe 1: M1 had two buckets)
+        # the two bf16 reduce buckets (M1 frames :2068/:2075, R671S) are live at the peak only without a pipeline: in a pipelined
+        # backward the reduce runs after the last backward, when the in-flight activations are gone (R671 rank 16, every group of the
+        # unwrapped snapshot at the peak: no bucket); the earlier x2-at-dp_moe>1 rule was a compensation for the missing receive buffer
+        out['zero_buckets'] = 2 * ZERO_BUCKET * BF16 if self.pp == 1 else 0
         # activations: in-flight micro-batches under 1F1B = min(pp - s, micro_batches)
         inflight = max(2, min(self.pp - s, self.micro_batches)) if self.pp > 1 else 1   # deepspeed/runtime/pipe/schedule.py TrainSchedule.num_pipe_buffers
         per_layer_full = []; per_layer_ckpt = []
@@ -226,6 +229,10 @@ class MemoryModel:
         kept = sum((S.h * FP32 * T / rshard) if c else f for f, c in zip(per_layer_full, per_layer_ckpt))   # a checkpointed layer keeps its fp32 input
         if self.pp > 1:
             kept += S.h * FP32 * T / rshard                       # the stage's output stays in pipe_buffers['outputs'] until its backward
+            if s > 0:
+                kept += S.h * FP32 * T / rshard                   # the received activation stays in pipe_buffers['inputs'] beside the detached copy the forward runs on (R671 rank 16: 31 + 31 tensors; R671T4L rank 32: 30 + 30)
+            else:
+                kept += self.mbs * self.seq * self.seq            # the first stage keeps every in-flight micro-batch's tuple: the [b, 1, s, s] bool attention mask (R671T4L rank 0: 32 x 64 MiB at 8k)
         out['_act_kept_per_microbatch'] = kept                    # informational (underscored keys are not summed)
         out['act_kept_inflight'] = kept * inflight
         # the recompute of one checkpointed layer during its backward: its full activations once, plus the layer's gradients
@@ -235,10 +242,11 @@ class MemoryModel:
         # and the dispatched-token gradient, the SwiGLU input gradients of the routed and shared experts, the combine and residual
         # gradients in fp32); a dense layer's counterpart is its MLP intermediate gradient
         moe_layers = [l for l in layers if S.is_moe(l)]
+        tt = 1 if S.expert_tp else self.tp                        # the sequence-sharded MoE block routes one tp-th of the tokens per rank; with expert TP every token, sliced experts
         if moe_layers:
-            bwd = T * (2 * S.k * S.h * BF16 + S.k * (2 if S.swiglu else 1) * S.I * BF16 + (2 if S.swiglu else 1) * S.I * S.shared * BF16 + 2 * S.h * FP32)
+            bwd = T / tt * (2 * S.k * S.h * BF16 + S.k * (2 if S.swiglu else 1) * S.I / (self.tp if S.expert_tp else 1) * BF16 + (2 if S.swiglu else 1) * S.I * S.shared / self.tp * BF16) + T * 2 * S.h * FP32 / rshard
         else:
-            bwd = T * ((2 if S.swiglu else 1) * S.dense_I * BF16 + 2 * S.h * FP32)
+            bwd = T * ((2 if S.swiglu else 1) * S.dense_I / self.tp * BF16 + 2 * S.h * FP32 / rshard)
         out['act_backward_transient'] = bwd
         # the head: the logits and their gradient in fp32 (chunked or not) and the embedding's output
         if s == self.pp - 1:
@@ -252,6 +260,10 @@ class MemoryModel:
         out['a2a_send'] = T * S.k * S.h * BF16 / self.tp if any(S.is_moe(l) for l in layers) else 0
         out['tp_allreduce'] = (2 * T * S.h * BF16) if (self.tp > 1 and not self.sp) else ((2 * T * S.h * BF16 / self.tp) if self.tp > 1 else 0)   # the all-reduce (or reduce-scatter / all-gather) buffers of one layer
         alloc = sum(v for k, v in out.items() if not k.startswith('_') and k not in ('params_dense', 'params_expert'))
+        if self.pp > 1:
+            # the second candidate for the peak: after the last backward the in-flight activations are gone and the two reduce
+            # buckets are live beside the state (never the larger one on the measured layouts; kept for a stage with few micro-batches)
+            alloc = max(alloc, out['weights_bf16'] + out['grads_bf16'] + out['master_fp32'] + out['adam_fp32'] + 2 * ZERO_BUCKET * BF16 + out['pipe_buffers'])
         out['allocated_peak'] = alloc
         out['reserved_est'] = alloc + max(ALLOC_SLACK * alloc, SLACK_FLOOR)       # the busiest rank of the stage (the allocated peak is the same on every rank of a stage)
         out['vram_est'] = out['reserved_est'] + non_torch_vram(self.world)
