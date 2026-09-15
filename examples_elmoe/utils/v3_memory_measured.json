@@ -1,0 +1,15 @@
+{
+ "note": "the measured points of 2026-09-14; VRAM = rocm-smi 'VRAM used' from a-monitor.txt (HBM% x 64 GiB, in GB = 1e9), the log's 'max reserved' is the allocator pool at the last peak-counter reset (transformer.py TIMING=1 resets every layer), the memsnap peak is the allocator's true allocated maximum",
+ "points": [
+  {"label": "M1 5485255", "what": "V3S_16B, 1 node EP8 DP8 PP1, mbs 1, GBS 64, seq 4096, block recompute of layers 0-8, chunked CE 1024; memsnap (bin/memsnap) = the true allocated peak with its live allocations by frame",
+   "layout": {"model": "V3S_16B", "nodes": 1, "pp": 1, "ep": 8, "mbs": 1, "gbs": 64, "seq": 4096, "ckpt": "block", "recompute_layers": [0,1,2,3,4,5,6,7,8], "chunked_ce": 1024},
+   "measured": {"0": {"allocated_GiB": 51.08, "reserved_GiB": 58.71,
+     "components_GiB": {"weights_bf16": 5.593, "grads_bf16": 5.474, "master_fp32": 7.263, "adam_fp32": 14.526, "zero_buckets": 1.862, "logits_fp32": 0.764}}}},
+  {"label": "W2 5483732", "what": "V3S_16B, 1 node EP8 DP8 PP1, mbs 1, GBS 2048, seq 4096, every layer checkpointed (DeepSpeed checkpoint_activations), full logits; a-monitor peak 81 % of 64 GiB; the log's max reserved 49.1 GB after the per-layer resets",
+   "layout": {"model": "V3S_16B", "nodes": 1, "pp": 1, "ep": 8, "mbs": 1, "gbs": 2048, "seq": 4096, "ckpt": "full"},
+   "measured": {"0": {"vram_GB": 51.8}}},
+  {"label": "P64 5483075", "what": "DeepSeek_V3_671B, 64 nodes PP32 EP8 TP1 (dp_non_moe 16, dp_moe 2), mbs 1, GBS 4096, seq 4096, every layer checkpointed, full logits; a-monitor peak per stage (16 ranks each) in GB; the log's max reserved: rank 0 32.0, rank 511 33.5",
+   "layout": {"model": "DeepSeek_V3_671B", "nodes": 64, "pp": 32, "ep": 8, "mbs": 1, "gbs": 4096, "seq": 4096, "ckpt": "full"},
+   "measured": {"0": {"vram_GB": 35.2}, "1": {"vram_GB": 53.1}, "2": {"vram_GB": 58.9}, "3": {"vram_GB": 58.2}, "4": {"vram_GB": 60.2}, "5": {"vram_GB": 61.4}, "6": {"vram_GB": 62.1}, "7": {"vram_GB": 58.2}, "8": {"vram_GB": 57.0}, "9": {"vram_GB": 55.0}, "10": {"vram_GB": 57.6}, "15": {"vram_GB": 56.3}, "20": {"vram_GB": 48.6}, "25": {"vram_GB": 51.8}, "28": {"vram_GB": 49.3}, "29": {"vram_GB": 38.4}, "30": {"vram_GB": 35.2}, "31": {"vram_GB": 37.8}}}
+ ]
+}

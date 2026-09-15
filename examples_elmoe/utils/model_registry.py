@@ -67,6 +67,18 @@ MODEL_SPECS = {
     # 50000, eps 1e-05, vocabulary 163840). The run tokenizes nothing (NullTokenizer sized to the
     # embedding's 163840 rows: --vocab-size 163839, EOD = 163839); the prompts arrive as token ids
     # through the XMOE_FIXED_TOKENS rider. Weights: tools/convert_checkpoint/hf_to_ds_moe.py --emit universal.
+    # The released 671B cut to two layers (2026-09-14, the memory workflow's second reference: one dense layer, layer 0, and one
+    # MoE layer, layer 1, every other value the 671B's): the calculator's prediction for a 1-2 node run is checked against the
+    # memory snapshot before the full model is touched. Random init, the null tokenizer; no checkpoint matches this shape.
+    "DeepSeek_V3_671B_L2": {"h": 7168, "ffn": 2048, "heads": 128, "ep": 256, "k": 8, "s": 4096, "layers": 2,
+                "shared": 1, "first_k_dense": 1, "dense_ffn": 18432, "expert_interval": 1,
+                "norm": "rmsnorm", "norm_eps": 1e-06, "bias": False, "swiglu": True,
+                "untie_embeddings": True, "vocab": 129280,
+                "tokenizer_type": "NullTokenizer", "null_vocab": 129279, "rotary_base": 10000,
+                "v3": {"q_lora_rank": 1536, "kv_lora_rank": 512, "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+                       "scoring_func": "sigmoid", "topk_method": "noaux_tc", "n_group": 8, "topk_group": 4, "norm_topk_prob": True,
+                       "routed_scaling_factor": 2.5, "moe_router_bias_update_speed": 0.001, "moe_seq_balance_coeff": 0.0,
+                       "num_nextn_predict_layers": 0, "rope_scaling": None}},
     "Moonlight_16B_A3B": {"h": 2048, "ffn": 1408, "heads": 16, "ep": 64, "k": 6, "s": 8192, "layers": 27,
                 "shared": 2, "first_k_dense": 1, "dense_ffn": 11264, "expert_interval": 1,
                 "norm": "rmsnorm", "norm_eps": 1e-05, "bias": False, "swiglu": True,
