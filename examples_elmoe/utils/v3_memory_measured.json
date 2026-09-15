@@ -557,6 +557,185 @@
      "vram_GiB_maxrank": 26.88
     }
    }
+  },
+  {
+   "label": "R671T8L 5491241",
+   "what": "DeepSeek_V3_671B on 64 nodes, PP 32 x EP 8 x TP 8 + Megatron SP (dp_non_moe 2, dp_moe 2), mbs 1, GBS 2,048, seq 16,384, every layer checkpointed, chunked CE 1,024, 2 iterations (2,239 and 1,980 s); every rank's never-reset maximum (the memsnap shim on all 512 ranks) and the a-monitor peak per stage; the 16k point, the out-of-sample test of the corrected model (its prediction written 03:34)",
+   "layout": {
+    "model": "DeepSeek_V3_671B",
+    "nodes": 64,
+    "pp": 32,
+    "ep": 8,
+    "mbs": 1,
+    "gbs": 2048,
+    "seq": 16384,
+    "ckpt": "full",
+    "tp": 8,
+    "sp": true,
+    "chunked_ce": 1024
+   },
+   "measured": {
+    "0": {
+     "allocated_GiB": 18.28,
+     "reserved_GiB": 20.988,
+     "vram_GiB_maxrank": 23.04
+    },
+    "1": {
+     "allocated_GiB": 25.263,
+     "reserved_GiB": 29.721,
+     "vram_GiB_maxrank": 30.08
+    },
+    "2": {
+     "allocated_GiB": 37.711,
+     "reserved_GiB": 44.393,
+     "vram_GiB_maxrank": 45.44
+    },
+    "3": {
+     "allocated_GiB": 37.654,
+     "reserved_GiB": 44.684,
+     "vram_GiB_maxrank": 45.44
+    },
+    "4": {
+     "allocated_GiB": 37.131,
+     "reserved_GiB": 43.422,
+     "vram_GiB_maxrank": 44.16
+    },
+    "5": {
+     "allocated_GiB": 37.139,
+     "reserved_GiB": 45.676,
+     "vram_GiB_maxrank": 46.08
+    },
+    "6": {
+     "allocated_GiB": 36.738,
+     "reserved_GiB": 44.904,
+     "vram_GiB_maxrank": 46.08
+    },
+    "7": {
+     "allocated_GiB": 36.486,
+     "reserved_GiB": 43.922,
+     "vram_GiB_maxrank": 44.8
+    },
+    "8": {
+     "allocated_GiB": 36.339,
+     "reserved_GiB": 44.062,
+     "vram_GiB_maxrank": 44.16
+    },
+    "9": {
+     "allocated_GiB": 36.18,
+     "reserved_GiB": 41.135,
+     "vram_GiB_maxrank": 42.24
+    },
+    "10": {
+     "allocated_GiB": 35.809,
+     "reserved_GiB": 43.703,
+     "vram_GiB_maxrank": 44.8
+    },
+    "11": {
+     "allocated_GiB": 35.617,
+     "reserved_GiB": 42.436,
+     "vram_GiB_maxrank": 43.52
+    },
+    "12": {
+     "allocated_GiB": 35.289,
+     "reserved_GiB": 42.031,
+     "vram_GiB_maxrank": 42.88
+    },
+    "13": {
+     "allocated_GiB": 35.114,
+     "reserved_GiB": 41.879,
+     "vram_GiB_maxrank": 42.88
+    },
+    "14": {
+     "allocated_GiB": 35.219,
+     "reserved_GiB": 42.15,
+     "vram_GiB_maxrank": 42.88
+    },
+    "15": {
+     "allocated_GiB": 34.646,
+     "reserved_GiB": 42.109,
+     "vram_GiB_maxrank": 42.88
+    },
+    "16": {
+     "allocated_GiB": 34.401,
+     "reserved_GiB": 40.715,
+     "vram_GiB_maxrank": 41.6
+    },
+    "17": {
+     "allocated_GiB": 34.378,
+     "reserved_GiB": 42.25,
+     "vram_GiB_maxrank": 42.88
+    },
+    "18": {
+     "allocated_GiB": 34.005,
+     "reserved_GiB": 39.828,
+     "vram_GiB_maxrank": 40.96
+    },
+    "19": {
+     "allocated_GiB": 33.78,
+     "reserved_GiB": 38.506,
+     "vram_GiB_maxrank": 39.68
+    },
+    "20": {
+     "allocated_GiB": 33.571,
+     "reserved_GiB": 39.918,
+     "vram_GiB_maxrank": 40.96
+    },
+    "21": {
+     "allocated_GiB": 33.354,
+     "reserved_GiB": 38.898,
+     "vram_GiB_maxrank": 39.68
+    },
+    "22": {
+     "allocated_GiB": 33.112,
+     "reserved_GiB": 40.613,
+     "vram_GiB_maxrank": 41.6
+    },
+    "23": {
+     "allocated_GiB": 32.854,
+     "reserved_GiB": 40.682,
+     "vram_GiB_maxrank": 41.6
+    },
+    "24": {
+     "allocated_GiB": 33.14,
+     "reserved_GiB": 38.912,
+     "vram_GiB_maxrank": 39.68
+    },
+    "25": {
+     "allocated_GiB": 32.453,
+     "reserved_GiB": 38.816,
+     "vram_GiB_maxrank": 39.04
+    },
+    "26": {
+     "allocated_GiB": 32.268,
+     "reserved_GiB": 40.037,
+     "vram_GiB_maxrank": 40.96
+    },
+    "27": {
+     "allocated_GiB": 32.011,
+     "reserved_GiB": 37.533,
+     "vram_GiB_maxrank": 38.4
+    },
+    "28": {
+     "allocated_GiB": 31.824,
+     "reserved_GiB": 38.877,
+     "vram_GiB_maxrank": 39.68
+    },
+    "29": {
+     "allocated_GiB": 17.687,
+     "reserved_GiB": 23.547,
+     "vram_GiB_maxrank": 23.04
+    },
+    "30": {
+     "allocated_GiB": 17.827,
+     "reserved_GiB": 26.248,
+     "vram_GiB_maxrank": 25.6
+    },
+    "31": {
+     "allocated_GiB": 19.551,
+     "reserved_GiB": 23.754,
+     "vram_GiB_maxrank": 24.32
+    }
+   }
   }
  ]
 }
