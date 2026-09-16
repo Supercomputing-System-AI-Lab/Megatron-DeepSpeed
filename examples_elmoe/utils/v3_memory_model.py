@@ -159,15 +159,18 @@ class Shapes:
 
 class MemoryModel:
     def __init__(self, model, nodes, pp, ep, mbs, gbs, seq, ckpt='full', tp=1, gpus_per_node=8, zero=1, partition=None,
-                 recompute_layers=None, chunked_ce=None, registry=None, sp=False, expert_tp=False):
+                 recompute_layers=None, chunked_ce=None, registry=None, sp=False, expert_tp=False, mask=True, seq_div=1):
         reg = registry or load_registry()
+        self.seq_div = int(seq_div)                               # a further division of every rank's sequence beyond tp (a context-parallel or Ulysses degree): the activation terms shrink by it, the weights do not; NOT a mechanism of this tree today, a what-if knob
+        self.mask = bool(mask)                                    # the first stage keeps each in-flight micro-batch's [b, 1, s, s] bool attention mask (the code today); False = the mask no longer materialised
         self.sp = bool(sp) and tp > 1; self.expert_tp = bool(expert_tp) and tp > 1
         self.name = model; self.entry = reg[model]; self.S = Shapes(self.entry, tp, self.sp, self.expert_tp)
         self.nodes, self.pp, self.ep, self.tp, self.mbs, self.gbs, self.seq = nodes, pp, ep, tp, mbs, gbs, seq
         self.ckpt = ckpt; self.zero = zero; self.chunked_ce = chunked_ce
         self.world = nodes * gpus_per_node
         assert self.world % (pp * tp) == 0 and self.world % (pp * ep) == 0, (self.world, pp, tp, ep)
-        self.dp_non_moe = self.world // (pp * tp)
+        self.dp_non_moe = self.world // (pp * tp * self.seq_div)
+        assert self.dp_non_moe >= 1, f'{self.world} ranks cannot hold PP {pp} x TP {tp} x seq_div {self.seq_div}'
         self.dp_moe = self.world // (pp * ep)
         assert gbs % (mbs * self.dp_non_moe) == 0, f'GBS {gbs} is not a multiple of mbs {mbs} x dp_non_moe {self.dp_non_moe}'
         self.micro_batches = gbs // (mbs * self.dp_non_moe)       # per pipeline (the gradient-accumulation steps)
@@ -232,7 +235,8 @@ class MemoryModel:
             if s > 0:
                 kept += S.h * FP32 * T / rshard                   # the received activation stays in pipe_buffers['inputs'] beside the detached copy the forward runs on (R671 rank 16: 31 + 31 tensors; R671T4L rank 32: 30 + 30)
             else:
-                kept += self.mbs * self.seq * self.seq            # the first stage keeps every in-flight micro-batch's tuple: the [b, 1, s, s] bool attention mask (R671T4L rank 0: 32 x 64 MiB at 8k)
+                if self.mask:
+                    kept += self.mbs * self.seq * self.seq        # the first stage keeps every in-flight micro-batch's tuple: the [b, 1, s, s] bool attention mask (R671T4L rank 0: 32 x 64 MiB at 8k)
         out['_act_kept_per_microbatch'] = kept                    # informational (underscored keys are not summed)
         out['act_kept_inflight'] = kept * inflight
         # the recompute of one checkpointed layer during its backward: its full activations once, plus the layer's gradients
@@ -259,6 +263,9 @@ class MemoryModel:
         out['pipe_buffers'] = (2 * T * S.h * FP32 / rshard) if self.pp > 1 else 0
         out['a2a_send'] = T * S.k * S.h * BF16 / self.tp if any(S.is_moe(l) for l in layers) else 0
         out['tp_allreduce'] = (2 * T * S.h * BF16) if (self.tp > 1 and not self.sp) else ((2 * T * S.h * BF16 / self.tp) if self.tp > 1 else 0)   # the all-reduce (or reduce-scatter / all-gather) buffers of one layer
+        if self.seq_div > 1:
+            for k in ('act_kept_inflight', 'act_recompute_transient', 'act_backward_transient', 'logits_fp32', 'embedding_act', 'pipe_buffers', 'a2a_send', 'tp_allreduce'):
+                out[k] = out.get(k, 0) / self.seq_div          # the what-if sequence division: every activation term per rank shrinks by it
         alloc = sum(v for k, v in out.items() if not k.startswith('_') and k not in ('params_dense', 'params_expert'))
         if self.pp > 1:
             # the second candidate for the peak: after the last backward the in-flight activations are gone and the two reduce
@@ -331,7 +338,7 @@ def validate(measured_path):
 if __name__ == '__main__':
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--model'); ap.add_argument('--nodes', type=int); ap.add_argument('--pp', type=int, default=1); ap.add_argument('--ep', type=int, default=8)
-    ap.add_argument('--tp', type=int, default=1); ap.add_argument('--expert-tp', action='store_true', help='slice the experts by tp as well (default: the sequence-sharded MoE block, whole experts per tp rank, one tp-th of the tokens)'); ap.add_argument('--sp', action='store_true', help='Megatron sequence parallelism with tp > 1: the residual stream, norms, checkpoint inputs and pipe buffers shard by tp'); ap.add_argument('--mbs', type=int, default=1); ap.add_argument('--gbs', type=int); ap.add_argument('--seq', type=int)
+    ap.add_argument('--tp', type=int, default=1); ap.add_argument('--expert-tp', action='store_true', help='slice the experts by tp as well (default: the sequence-sharded MoE block, whole experts per tp rank, one tp-th of the tokens)'); ap.add_argument('--sp', action='store_true', help='Megatron sequence parallelism with tp > 1: the residual stream, norms, checkpoint inputs and pipe buffers shard by tp'); ap.add_argument('--seq-div', type=int, default=1, help='what-if: a further division of the sequence per rank beyond tp (a context-parallel or Ulysses degree); not a mechanism of this tree today'); ap.add_argument('--no-mask', action='store_true', help='the first stage no longer keeps the [s, s] attention mask per in-flight micro-batch (a code change; the default is the code as it is)'); ap.add_argument('--mbs', type=int, default=1); ap.add_argument('--gbs', type=int); ap.add_argument('--seq', type=int)
     ap.add_argument('--ckpt', default='full', choices=['full', 'none', 'block']); ap.add_argument('--recompute-layers', default='', help='block: e.g. 0-8')
     ap.add_argument('--chunked-ce', type=int, default=None); ap.add_argument('--partition', default=None, help='layers per stage, e.g. 2,2,...,1')
     ap.add_argument('--json', default=None); ap.add_argument('--validate', action='store_true'); ap.add_argument('--measured', default=os.path.join(HERE, 'v3_memory_measured.json'))
@@ -342,7 +349,7 @@ if __name__ == '__main__':
     if a.recompute_layers:
         lo, hi = a.recompute_layers.split('-'); rl = range(int(lo), int(hi) + 1)
     part = [int(x) for x in a.partition.split(',')] if a.partition else None
-    mm = MemoryModel(a.model, a.nodes, a.pp, a.ep, a.mbs, a.gbs, a.seq, a.ckpt, tp=a.tp, partition=part, recompute_layers=rl, chunked_ce=a.chunked_ce, sp=a.sp, expert_tp=a.expert_tp)
+    mm = MemoryModel(a.model, a.nodes, a.pp, a.ep, a.mbs, a.gbs, a.seq, a.ckpt, tp=a.tp, partition=part, recompute_layers=rl, chunked_ce=a.chunked_ce, sp=a.sp, expert_tp=a.expert_tp, mask=not a.no_mask, seq_div=a.seq_div)
     print(f"{a.model}: {a.nodes} nodes, PP {a.pp} x EP {a.ep} x TP {a.tp}{' + SP' if mm.sp else ''}{' + expert TP' if mm.expert_tp else ''}, dp_non_moe {mm.dp_non_moe}, dp_moe {mm.dp_moe}, mbs {a.mbs}, GBS {a.gbs} -> {mm.micro_batches} micro-batches per pipeline, seq {a.seq}, ckpt {a.ckpt}")
     rows = mm.table(); print(fmt_table(rows))
     print(f"heaviest stage: {max(rows, key=lambda r: r['vram_GiB'])['stage']} at {max(r['vram_GiB'] for r in rows):.1f} GiB VRAM, {max(r['vram_worst_GiB'] for r in rows):.1f} at the worst slack (64 GiB per GCD)")
