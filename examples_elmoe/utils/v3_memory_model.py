@@ -234,11 +234,12 @@ class MemoryModel:
             kept += S.h * FP32 * T / rshard                       # the stage's output stays in pipe_buffers['outputs'] until its backward
             if s > 0:
                 kept += S.h * FP32 * T / rshard                   # the received activation stays in pipe_buffers['inputs'] beside the detached copy the forward runs on (R671 rank 16: 31 + 31 tensors; R671T4L rank 32: 30 + 30)
-            else:
-                if self.mask:
-                    kept += self.mbs * self.seq * self.seq        # the first stage keeps every in-flight micro-batch's tuple: the [b, 1, s, s] bool attention mask (R671T4L rank 0: 32 x 64 MiB at 8k)
         out['_act_kept_per_microbatch'] = kept                    # informational (underscored keys are not summed)
         out['act_kept_inflight'] = kept * inflight
+        # the first stage keeps every in-flight micro-batch's tuple: the [b, 1, s, s] bool attention mask (R671T4L rank 0: 32 x 64 MiB at
+        # 8k). It is NOT divided by seq_div: get_batch builds the whole-sequence mask on every sequence rank (R671U2b rank 0, 2026-09-17:
+        # 32 x 1 GiB at 32k with the Ulysses degree 2, the pipe's _exec_load_micro_batch copies), so it is a term of its own.
+        out['mask_inflight'] = (self.mbs * self.seq * self.seq * inflight) if (self.pp > 1 and s == 0 and self.mask) else 0
         # the recompute of one checkpointed layer during its backward: its full activations once, plus the layer's gradients
         recompute = max((f for f, c in zip(per_layer_full, per_layer_ckpt) if c), default=0)
         out['act_recompute_transient'] = recompute
