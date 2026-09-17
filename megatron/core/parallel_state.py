@@ -48,6 +48,8 @@ _SEQUENCE_PARALLEL_GROUP = None
 _SEQUENCE_PARALLEL_WORLD_SIZE = None
 _SEQUENCE_PARALLEL_RANK = None
 _SEQUENCE_PARALLEL_GLOBAL_RANKS = None   # [X-MoE 2026-09-17] the group's ranks (stride TP); the source rank of the batch broadcast
+_DATA_BROADCAST_GROUP = None   # [X-MoE 2026-09-17] the TP x P ranks of one (pp, d) that share a sample; the loader lives on its first rank
+_DATA_BROADCAST_GLOBAL_RANKS = None
 
 # This group includes processes for both data and sequence parallelisms.
 # We use this group to reduce gradients and shard parameters and optimizer stages for ZeRO.
@@ -223,10 +225,41 @@ def initialize_model_parallel(
     assert _SEQUENCE_DATA_PARALLEL_GROUP is None, \
         'sequence data parallel group is already initialized'
     all_data_sequence_parallel_group_ranks = []
-    if enable_ds_sequence_parallel:
-        for i in range(num_sequence_data_parallel_groups):
-            ranks = range(i * sequence_data_parallel_size,
-                        (i + 1) * sequence_data_parallel_size)
+    for p in range(pp_):
+        for t in range(tp_):
+            ranks = [rank_of(p, d, c, t) for d in range(dp_) for c in range(cp_)]      # ordered (d, c): the pipe grid's data coordinate
+            all_data_sequence_parallel_group_ranks.append(ranks)
+            if enable_ds_sequence_parallel:
+                group = torch.distributed.new_group(ranks)
+                if rank in ranks:
+                    _SEQUENCE_DATA_PARALLEL_GROUP = group
+            for d in range(dp_):
+                ranks = [rank_of(p, d, c, t) for c in range(cp_)]
+                group = torch.distributed.new_group(ranks)
+                if rank in ranks:
+                    _SEQUENCE_PARALLEL_GROUP = group
+                    _SEQUENCE_PARALLEL_GLOBAL_RANKS = ranks
+            for c in range(cp_):
+                ranks = [rank_of(p, d, c, t) for d in range(dp_)]
+                all_data_parallel_group_ranks.append(ranks)
+                group = torch.distributed.new_group(ranks)
+                if use_distributed_optimizer:
+                    group_gloo = torch.distributed.new_group(ranks, backend="gloo")
+                else:
+                    group_gloo = None
+                if rank in ranks:
+                    _DATA_PARALLEL_GROUP = group
+                    _DATA_PARALLEL_GROUP_GLOO = group_gloo
+                    _DATA_PARALLEL_GLOBAL_RANKS = ranks
+    if not enable_ds_sequence_parallel:
+        _SEQUENCE_DATA_PARALLEL_GROUP = _DATA_PARALLEL_GROUP
+    # [X-MoE 2026-09-17] the data-broadcast group: the TP x P ranks of one (p, d), contiguous; one loader per group (its first rank,
+    # t = 0 and c = 0), the batch broadcast to the rest (tensor_parallel/data.py). With P = 1 it is the TP group.
+    global _DATA_BROADCAST_GROUP
+    global _DATA_BROADCAST_GLOBAL_RANKS
+    for p in range(pp_):
+        for d in range(dp_):
+            ranks = [rank_of(p, d, c, t) for c in range(cp_) for t in range(tp_)]
             group = torch.distributed.new_group(ranks)
             all_data_sequence_parallel_group_ranks.append(list(ranks))
             if rank in ranks:
@@ -402,6 +435,23 @@ def sequence_parallel_is_initialized():
     if _SEQUENCE_PARALLEL_GROUP is None or \
         _DATA_PARALLEL_GROUP is None:
         return False
+def get_data_broadcast_group():
+    """[X-MoE 2026-09-17] the TP x P ranks that share one sample (the group of the batch broadcast)."""
+    assert _DATA_BROADCAST_GROUP is not None, 'data broadcast group is not initialized'
+    return _DATA_BROADCAST_GROUP
+
+
+def get_data_broadcast_src_rank():
+    """the first rank of this rank's data-broadcast group: TP rank 0 and sequence rank 0, the one that owns the loader"""
+    assert _DATA_BROADCAST_GLOBAL_RANKS is not None, 'data broadcast group is not initialized'
+    return _DATA_BROADCAST_GLOBAL_RANKS[0]
+
+
+def get_data_broadcast_rank():
+    assert _DATA_BROADCAST_GLOBAL_RANKS is not None, 'data broadcast group is not initialized'
+    return _DATA_BROADCAST_GLOBAL_RANKS.index(torch.distributed.get_rank())
+
+
     return True
 
 def sequence_data_parallel_is_initialized():
@@ -779,6 +829,10 @@ def get_data_parallel_world_size():
 def get_data_parallel_rank():
     """Return my rank for the data parallel group."""
     return torch.distributed.get_rank(group=get_data_parallel_group())
+    global _SEQUENCE_PARALLEL_GLOBAL_RANKS
+    _SEQUENCE_PARALLEL_GLOBAL_RANKS = None   # [X-MoE 2026-09-17]
+    global _DATA_BROADCAST_GROUP, _DATA_BROADCAST_GLOBAL_RANKS
+    _DATA_BROADCAST_GROUP = None; _DATA_BROADCAST_GLOBAL_RANKS = None   # [X-MoE 2026-09-17]
 
 
 def _set_global_memory_buffer():
@@ -799,8 +853,6 @@ def destroy_global_memory_buffer():
     global _GLOBAL_MEMORY_BUFFER
     _GLOBAL_MEMORY_BUFFER = None
 
-    global _SEQUENCE_PARALLEL_GLOBAL_RANKS
-    _SEQUENCE_PARALLEL_GLOBAL_RANKS = None   # [X-MoE 2026-09-17]
 
 def destroy_model_parallel():
     """Set the groups to none."""

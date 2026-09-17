@@ -1756,7 +1756,9 @@ def build_train_valid_test_data_loaders(
 
     # Data loader only on rank 0 of each model parallel group.
     ds_sequence_parallel = mpu.get_sequence_parallel_world_size() > 1 or args.force_ds_sequence_parallel
-    rank_in_parallel_group = mpu.get_sequence_parallel_rank() if ds_sequence_parallel else mpu.get_tensor_model_parallel_rank()
+    # [X-MoE 2026-09-17, C4] with a sequence degree the loader lives on the first rank of the TP x P block that shares a sample
+    # (TP rank 0 and sequence rank 0): one builder per block, as the dataset's index-cache sync expects (gpt_dataset.py counts)
+    rank_in_parallel_group = mpu.get_data_broadcast_rank() if ds_sequence_parallel else mpu.get_tensor_model_parallel_rank()
     if rank_in_parallel_group == 0:
         # Build datasets.
         train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
@@ -1782,8 +1784,8 @@ def build_train_valid_test_data_loaders(
     # Broadcast num tokens.
     if ds_sequence_parallel:
         torch.distributed.broadcast(flags,
-                                    mpu.get_sequence_parallel_src_rank(),
-                                    group=mpu.get_sequence_parallel_group())
+                                    mpu.get_data_broadcast_src_rank(),
+                                    group=mpu.get_data_broadcast_group())   # [X-MoE 2026-09-17, C4]
     else:
         torch.distributed.broadcast(flags,
                                     mpu.get_tensor_model_parallel_src_rank(),

@@ -85,9 +85,12 @@ def broadcast_data(keys, data, datatype):
     # Build (key, size) and (key, number of elements) dictionaries along
     # with the total number of elements on all ranks.
     if get_sequence_parallel_world_size() > 1:
-        rank = get_sequence_parallel_rank()
-        src_rank = get_sequence_parallel_src_rank()
-        group = get_sequence_parallel_group()
+        # [X-MoE 2026-09-17, the Ulysses blueprint C4] the sample is shared by the TP x P ranks of one (pipe stage, d): the loader
+        # lives on the first of them (TP rank 0, sequence rank 0) and the batch is broadcast to the rest in one collective
+        from megatron.core.parallel_state import get_data_broadcast_group, get_data_broadcast_src_rank, get_data_broadcast_rank
+        rank = get_data_broadcast_rank()
+        src_rank = get_data_broadcast_src_rank()
+        group = get_data_broadcast_group()
     else:
         rank = get_tensor_model_parallel_rank()
         src_rank = get_tensor_model_parallel_src_rank()
