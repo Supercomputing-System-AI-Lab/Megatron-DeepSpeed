@@ -795,6 +795,31 @@ def _dump_losses(losses_bs, labels_bs):
     _LOSS_DUMP_CALLS[0] = k + 1
     os.makedirs(d, exist_ok=True)
     rank = int(os.getenv('RANK', '0'))
+    labels_bs = labels_bs.detach()
+    if mpu.get_sequence_parallel_world_size() > 1:
+        # the labels arrive as this rank's P shard [b, s/P]; the losses are the whole sequence: gather the labels the same way
+        parts = [torch.empty_like(labels_bs) for _ in range(mpu.get_sequence_parallel_world_size())]
+        torch.distributed.all_gather(parts, labels_bs.contiguous(), group=mpu.get_sequence_parallel_group())
+        labels_bs = torch.cat(parts, dim=1)
+    torch.save({'losses': losses_bs.detach().float().cpu(), 'labels': labels_bs.cpu()}, os.path.join(d, f'rank{rank}_call{k}.pt'))
+
+
+_LOSS_DUMP_CALLS = [0]
+
+
+def _dump_losses(losses_bs, labels_bs):
+    """[X-MoE 2026-09-17, the Ulysses blueprint, acceptance L1] with XMOE_LOSS_DUMP=<dir>: the per-token losses [b, s] and the labels
+    [b, s] of the first XMOE_LOSS_DUMP_CALLS (default 8) loss calls of this rank, one file per call, for the comparison of two runs
+    (bin/compare_loss_dumps.py matches the samples by their labels). Off without the variable."""
+    d = os.getenv('XMOE_LOSS_DUMP')
+    if not d:
+        return
+    k = _LOSS_DUMP_CALLS[0]
+    if k >= int(os.getenv('XMOE_LOSS_DUMP_CALLS', '8')):
+        return
+    _LOSS_DUMP_CALLS[0] = k + 1
+    os.makedirs(d, exist_ok=True)
+    rank = int(os.getenv('RANK', '0'))
     torch.save({'losses': losses_bs.detach().float().cpu(), 'labels': labels_bs.detach().cpu()}, os.path.join(d, f'rank{rank}_call{k}.pt'))
 
 
