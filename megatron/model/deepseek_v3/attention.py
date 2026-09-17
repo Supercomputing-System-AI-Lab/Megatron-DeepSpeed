@@ -200,7 +200,7 @@ class DeepSeekV3Attention(MegatronModule):
             return flat if b == 1 else flat.view(b, s).transpose(0, 1).contiguous()
         return torch.arange(s, device=device)
 
-    def _eager_attention(self, query, key, value, query_start=0):
+    def _eager_attention(self, query, key, value, query_start=0, keep_heads=False):   # keep_heads: [X-MoE 2026-09-17] the exchange wants [s, b, h, d]
         """The released eager_attention_forward in the [s, b, heads, d] layout: scores in fp32, causal, softmax in fp32. The
         query rows sit at positions query_start .. query_start + s_q - 1 of the key range (the cached prefix at inference)."""
         s, b, hp, _ = query.shape
@@ -209,6 +209,11 @@ class DeepSeekV3Attention(MegatronModule):
         k = key.permute(1, 2, 0, 3)
         v = value.permute(1, 2, 0, 3)
         scores = torch.matmul(q, k.transpose(-1, -2)).to(torch.float32) * self.softmax_scale
+        P = parallel_state.get_sequence_parallel_world_size()
+        if P > 1:
+            # [X-MoE 2026-09-17, the Ulysses blueprint C5] the gathered shard is this rank's contiguous window of the full sequence
+            r = parallel_state.get_sequence_parallel_rank()
+            return torch.arange(r * s, (r + 1) * s, device=device)
         q_pos = torch.arange(s, device=scores.device) + query_start
         causal = torch.arange(s_k, device=scores.device)[None, :] <= q_pos[:, None]
         scores = scores.masked_fill(~causal, torch.finfo(torch.float32).min)
@@ -216,9 +221,10 @@ class DeepSeekV3Attention(MegatronModule):
         if self.training and self.attention_dropout > 0.0:
             probs = F.dropout(probs, p=self.attention_dropout)
         context = torch.matmul(probs, v)
-        return context.permute(2, 0, 1, 3).reshape(s, b, hp * self.v_head_dim)
+        context = context.permute(2, 0, 1, 3)   # [X-MoE 2026-09-17]
+        return context if keep_heads else context.reshape(s, b, hp * self.v_head_dim)
 
-    def _flash_attention(self, query, key, value, attention_mask):
+    def _flash_attention(self, query, key, value, attention_mask, keep_heads=False):   # keep_heads: [X-MoE 2026-09-17]
         """The flash kernels take [b, s, heads, d] with one head width for q, k and v: the value is padded to the query width (the
         released flash path does the same) and the output sliced back. The kernel (2026-09-12, run K1 on one GCD at b 4, s 4,096,
         16 heads, causal, bf16): the head-dim-192 backward of the CK varlen kernel behind FlashSelfAttention takes 60.1 ms (17 TFLOP/s),
@@ -251,7 +257,8 @@ class DeepSeekV3Attention(MegatronModule):
                 with tensor_parallel.get_cuda_rng_tracker().fork():
                     context = self.core_attention_flash(q, k, v, **kwargs)
         context = context[..., : self.v_head_dim]
-        return context.permute(1, 0, 2, 3).reshape(s, b, hp * self.v_head_dim)
+        context = context.permute(1, 0, 2, 3)   # [X-MoE 2026-09-17]
+        return context if keep_heads else context.reshape(s, b, hp * self.v_head_dim)
 
     # ------------------------------------------------------------------ forward
     # ------------------------------------------------------------------ the inference cache (the same contract as ParallelAttention)
@@ -318,9 +325,19 @@ class DeepSeekV3Attention(MegatronModule):
         compressed = self.kv_a_proj_with_mqa(x)
         latent, k_pe = torch.split(compressed, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         latent = self.kv_a_layernorm(latent)
-        kv, _ = self.kv_b_proj(latent)
-        kv = kv.view(s, b, hp, self.qk_nope_head_dim + self.v_head_dim)
-        k_nope, value = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        # [X-MoE 2026-09-17, the Ulysses blueprint C6b] with a DeepSpeed sequence degree P > 1 in training, the keys and values are
+        # not expanded here: the 576-wide latent (kv latent + rotated rope key) is all-gathered over the P ranks once and expanded
+        # below for this rank's hp/P heads on the whole sequence (the same FLOPs as hp heads on the shard, 5-39 percent fewer bytes
+        # than exchanging k and v). The query goes to heads by all-to-all, the context comes back by one.
+        ulysses = (parallel_state.get_sequence_parallel_world_size() > 1 and cache is None and self.indexer is None and self.training)
+        if ulysses:
+            # the head-sliced expansion below accumulates into kv_b_proj.weight.grad, as every linear of this fork does (the fused
+            # main_grad path is commented out in tensor_parallel/layers.py:391)
+            k_nope = value = None
+        else:
+            kv, _ = self.kv_b_proj(latent)
+            kv = kv.view(s, b, hp, self.qk_nope_head_dim + self.v_head_dim)
+            k_nope, value = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         k_pe = k_pe.view(s, b, 1, self.qk_rope_head_dim)
 
         if row_lengths is not None:

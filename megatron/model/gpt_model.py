@@ -375,8 +375,7 @@ def post_language_model_processing(lm_output, labels, logit_weights,
         labels = labels.transpose(0,1).contiguous()
         ce_chunk = getattr(get_args(), 'seq_chunked_ce', 0) or 0
         if (ce_chunk > 0 and lm_output.size(0) > ce_chunk
-                and not fp16_lm_cross_entropy
-                and mpu.get_sequence_parallel_world_size() == 1):
+                and not fp16_lm_cross_entropy):   # [X-MoE 2026-09-17, C7] also under a sequence degree: per shard, then the gather
             # Dead-store fix (128k S3.2): the full [s, b, vocab] logits used
             # to be materialised unconditionally ABOVE this branch and were
             # never read on it -- 2*vocab B/token = 24.44 GiB at s=131,072
@@ -394,7 +393,9 @@ def post_language_model_processing(lm_output, labels, logit_weights,
             lm_output,
             logit_weights,
             parallel_output)
-        cross_entropy = sequence_parallel.vocab_sequence_parallel_cross_entropy if mpu.get_sequence_parallel_world_size() > 1 \
+        _report_vocab_padding_effect(output)
+        # [X-MoE 2026-09-17, C7] the gathered cross entropy that is correct under TP too (the old one softmaxes over a vocab shard)
+        cross_entropy = sequence_parallel.vocab_and_sequence_parallel_cross_entropy if mpu.get_sequence_parallel_world_size() > 1 \
             else tensor_parallel.vocab_parallel_cross_entropy
         if fp16_lm_cross_entropy:
             assert output.dtype == torch.half
@@ -452,6 +453,8 @@ class GPTModel(MegatronModule):
                 retriever_attn_mask=None,
                 labels=None, tokentype_ids=None, inference_params=None,
                 curriculum_seqlen=None):
+            if mpu.get_sequence_parallel_world_size() > 1:
+                loss = sequence_parallel.gather_sequence_losses(loss)     # [X-MoE 2026-09-17, C7] the shard's losses -> [S, B]
         
         # torch.cuda.synchronize ()
         # s = time.time() 
@@ -776,6 +779,25 @@ def ChunkedCrossEntropy(output, labels):
 def ChunkedCrossEntropyWithMoE(output, labels):
     _pipe_dbg('loss', output)
     if isinstance(output, tuple) and len(output) >= 1 and torch.is_tensor(output[0]):
+_LOSS_DUMP_CALLS = [0]
+
+
+def _dump_losses(losses_bs, labels_bs):
+    """[X-MoE 2026-09-17, the Ulysses blueprint, acceptance L1] with XMOE_LOSS_DUMP=<dir>: the per-token losses [b, s] and the labels
+    [b, s] of the first XMOE_LOSS_DUMP_CALLS (default 8) loss calls of this rank, one file per call, for the comparison of two runs
+    (bin/compare_loss_dumps.py matches the samples by their labels). Off without the variable."""
+    d = os.getenv('XMOE_LOSS_DUMP')
+    if not d:
+        return
+    k = _LOSS_DUMP_CALLS[0]
+    if k >= int(os.getenv('XMOE_LOSS_DUMP_CALLS', '8')):
+        return
+    _LOSS_DUMP_CALLS[0] = k + 1
+    os.makedirs(d, exist_ok=True)
+    rank = int(os.getenv('RANK', '0'))
+    torch.save({'losses': losses_bs.detach().float().cpu(), 'labels': labels_bs.detach().cpu()}, os.path.join(d, f'rank{rank}_call{k}.pt'))
+
+
         # Defensive unwrap; _pipe_dbg above records what actually arrived.
         output = output[0]
     return _fold_pipe_moe_rider(ChunkedCrossEntropy(output, labels))
@@ -792,6 +814,8 @@ class LMHeadChunkedPipe(LMHeadPipe):
     The class name must NOT match 'transformer' (case-insensitive):
     PipelineModule._find_layer_type regex-matches typename.__name__ for
     partition_method='type:transformer', and LMHeadPipe scores 0 there, so
+    if mpu.get_sequence_parallel_world_size() > 1:
+        losses = sequence_parallel.gather_sequence_losses(losses)     # [X-MoE 2026-09-17, C7] [s/P, b] -> [s, b]; the mask is full length
     stage partitioning stays identical.
 
     Mask threading: LMHeadPipe's no-args.attn_mask tuple return
@@ -829,6 +853,8 @@ class GPTModelPipe(PipelineModule,MegatronModule):
     """GPT-2 Language model."""
 
     def __init__(self,
+    if mpu.get_sequence_parallel_world_size() > 1:
+        losses = sequence_parallel.gather_sequence_losses(losses)     # [X-MoE 2026-09-17, C7]
                  config,
                  num_tokentypes=0,
                  parallel_output=True):
@@ -1046,6 +1072,8 @@ class GPTModelPipe(PipelineModule,MegatronModule):
         info[VOCABULARY_PARAMETER_PATTERNS] = _unique(map(_tp_pattern, _vocabulary_names(self)))
         # Tied embeddings live on the first and last stage under one name; the
         # converter dedupes them by skipping pp_index > 0 for these patterns. With
+        # [X-MoE 2026-09-17, the Ulysses blueprint C3] the grid's data axis is the sequence-data group (dp x P): its coordinate is
+        # d x P + c (parallel_state.py, the group ordered (d, c)); ZeRO-1 partitions and the gradient reduction run over it.
         # --untie-embeddings-and-output-weights there are no tied modules and the
         # key is (correctly) absent.
         tied = [name for name, _ in self.named_parameters() if name.startswith('tied_modules.')]
@@ -1057,3 +1085,10 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                                                 group=mpu.get_pipeline_model_parallel_group())
             info = _merge_ucp_info_dicts(gathered)
         return info
+        # [X-MoE 2026-09-17, C3] under a PipelineModule DeepSpeed's mpu is this grid (deepspeed/__init__.py:207, engine.py:1326); its
+        # groups module reads the sequence dimension from the mpu by these names (utils/groups.py:663-716): the grid learns them here,
+        # so ZeRO's divisions and the sequence-data group resolve under the pipe as they do without one.
+        for _name in ('get_sequence_parallel_world_size', 'get_sequence_parallel_rank', 'get_sequence_parallel_group',
+                      'get_sequence_data_parallel_world_size', 'get_sequence_data_parallel_rank', 'get_sequence_data_parallel_group'):
+            setattr(self._grid, _name, getattr(mpu, _name))
+

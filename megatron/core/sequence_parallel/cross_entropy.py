@@ -6,6 +6,7 @@ from megatron.core.parallel_state import (
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size
 )
+from megatron.core import tensor_parallel   # [X-MoE 2026-09-17]
 
 class _VocabSequenceParallelCrossEntropy(torch.autograd.Function):
 
@@ -54,3 +55,43 @@ class _VocabSequenceParallelCrossEntropy(torch.autograd.Function):
 
 def vocab_sequence_parallel_cross_entropy(vocab_parallel_logits, target, label_smoothing=0.0):
     return _VocabSequenceParallelCrossEntropy.apply(vocab_parallel_logits, target, label_smoothing)
+
+
+# [X-MoE 2026-09-17, the Ulysses blueprint C7] the gathered cross entropy that is correct under tensor parallelism too. The class
+# above takes a softmax over the whole last dimension, which is wrong on a vocab-parallel shard [s/P, b, V/TP]; this one composes the
+# TP-correct vocab_parallel_cross_entropy (its all-reduces inside, differentiable) with an all-gather of the per-token losses over the
+# P sequence ranks, in rank order = sequence order (the batch's P slice is contiguous, pretrain_gpt_deepspeed.py). The backward of the
+# gather returns this rank's window of the incoming gradient. At TP 1 it equals the class above; at P 1 the gather is the identity.
+class _GatherSequenceLosses(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, loss):
+        P = get_sequence_parallel_world_size()
+        if P == 1:
+            return loss
+        loss = loss.contiguous()
+        out = torch.empty(loss.size(0) * P, *loss.shape[1:], dtype=loss.dtype, device=loss.device)
+        if version.parse(torch.__version__) >= version.parse('1.13'):
+            torch.distributed.all_gather_into_tensor(out, loss, group=get_sequence_parallel_group())
+        else:
+            torch.distributed._all_gather_base(out, loss, group=get_sequence_parallel_group())
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        P = get_sequence_parallel_world_size()
+        if P == 1:
+            return grad_output
+        n = grad_output.size(0) // P
+        r = get_sequence_parallel_rank()
+        return grad_output[r * n:(r + 1) * n].contiguous()
+
+
+def gather_sequence_losses(loss):
+    """[s/P, b] per-token losses of this rank's shard -> [s, b] of the whole sequence (differentiable)."""
+    return _GatherSequenceLosses.apply(loss)
+
+
+def vocab_and_sequence_parallel_cross_entropy(vocab_parallel_logits, target, label_smoothing=0.0):
+    """logits [s/P, b, V/TP] and targets [s/P, b] of this rank -> the per-token losses [s, b] of the whole sequence."""
+    loss = tensor_parallel.vocab_parallel_cross_entropy(vocab_parallel_logits, target, label_smoothing)
+    return gather_sequence_losses(loss)

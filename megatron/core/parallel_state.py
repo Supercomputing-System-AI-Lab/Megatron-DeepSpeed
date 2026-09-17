@@ -47,6 +47,7 @@ _PIPELINE_GLOBAL_RANKS = None
 _SEQUENCE_PARALLEL_GROUP = None
 _SEQUENCE_PARALLEL_WORLD_SIZE = None
 _SEQUENCE_PARALLEL_RANK = None
+_SEQUENCE_PARALLEL_GLOBAL_RANKS = None   # [X-MoE 2026-09-17] the group's ranks (stride TP); the source rank of the batch broadcast
 
 # This group includes processes for both data and sequence parallelisms.
 # We use this group to reduce gradients and shard parameters and optimizer stages for ZeRO.
@@ -141,6 +142,10 @@ def initialize_model_parallel(
             f"({tensor_model_parallel_size}) x pipeline_model_parallel_size ({pipeline_model_parallel_size})"
         )
 
+    # [X-MoE 2026-09-17, the Ulysses enablement with PP, TP, EP (records/2026-09/0917_2026_ULYSSES_PP_TP_EP_BLUEPRINT.html, C2)]
+    # Four coordinates: rank = ((pp x dp + d) x P + c) x TP + t. TP innermost (the TP all-gathers and DeepSpeed's consecutive-EP
+    # expert groups stay inside the node), the sequence group at stride TP (one rank of each of P nodes at TP 8), the data-parallel
+    # group at stride TP x P, the pipeline at stride TP x P x dp (the existing loop). With P = 1 every group is what it was.
     enable_ds_sequence_parallel = sequence_parallel_size > 1
     if enable_ds_sequence_parallel:
         assert tensor_model_parallel_size == 1 and pipeline_model_parallel_size == 1, \
@@ -722,11 +727,10 @@ def get_tensor_model_parallel_src_rank():
 
 
 def get_sequence_parallel_src_rank():
-    """Calculate the global rank corresponding to the first local rank
-    in the sequence parallel group."""
-    global_rank = torch.distributed.get_rank()
-    local_world_size = get_sequence_parallel_world_size()
-    return (global_rank // local_world_size) * local_world_size
+    """The global rank of the first member of this rank's sequence-parallel group (the source of the batch broadcast). The group
+    is at stride TP since 2026-09-17 (C2 of the Ulysses blueprint); with TP 1 it is the consecutive layout of before."""
+    assert _SEQUENCE_PARALLEL_GLOBAL_RANKS is not None, 'sequence parallel group is not initialized'
+    return _SEQUENCE_PARALLEL_GLOBAL_RANKS[0]
 
 
 def get_data_parallel_src_rank():
@@ -795,6 +799,8 @@ def destroy_global_memory_buffer():
     global _GLOBAL_MEMORY_BUFFER
     _GLOBAL_MEMORY_BUFFER = None
 
+    global _SEQUENCE_PARALLEL_GLOBAL_RANKS
+    _SEQUENCE_PARALLEL_GLOBAL_RANKS = None   # [X-MoE 2026-09-17]
 
 def destroy_model_parallel():
     """Set the groups to none."""

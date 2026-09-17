@@ -650,7 +650,15 @@ def _validate_deepseek_v3_args(args):
     assert args.qk_rope_head_dim % 2 == 0, 'the rotary channels come in pairs'
     assert args.transformer_impl == 'local', 'the latent attention is built for the local transformer implementation'
     assert not args.use_flash_attn_triton, 'the Triton flash path takes no softmax scale'
-    assert args.ds_sequence_parallel_size == 1, 'DeepSpeed-Ulysses shards the sequence itself; not combined with the latent attention'
+    # [X-MoE 2026-09-17, the Ulysses blueprint C1] the degree P with the latent attention: the checks of the enabled path
+    if args.ds_sequence_parallel_size > 1:
+        P, TP = args.ds_sequence_parallel_size, args.tensor_model_parallel_size
+        assert (args.num_attention_heads // TP) % P == 0, \
+            f'Ulysses splits the {args.num_attention_heads // TP} heads of a tensor-parallel rank by P={P}: not divisible'
+        assert args.seq_length % (P * TP) == 0, f'the sequence {args.seq_length} is cut by P={P}, then by TP={TP}: not divisible'
+        assert not args.use_flash_attn_triton, 'the exchange wraps the flash (or eager) core of the latent attention, not the Triton path'
+        assert args.attention_dropout == 0.0, 'no dropout state crosses the exchange'
+        assert not args.intra_document_attention, 'intra-document masks under Ulysses are step 2 of the blueprint (C11)'
     assert not getattr(args, 'retro_add_retriever', False), 'retro is not combined with the latent attention'
     n_experts = args.num_experts[0] if isinstance(args.num_experts, (list, tuple)) else args.num_experts
     if args.scoring_func == 'sigmoid' or args.topk_method == 'noaux_tc':

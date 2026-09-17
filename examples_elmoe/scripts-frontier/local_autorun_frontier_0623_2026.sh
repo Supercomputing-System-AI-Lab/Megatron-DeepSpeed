@@ -383,6 +383,329 @@ for node_key in "${!PP_STRATEGY_MAP[@]}"; do
                     --total_gpus "$EP_PARALLEL_SIZE" \
                     --mbs 1)
                 
+# ==================== 128k additive riders (2026-08-27) =====================
+# All inert unless the corresponding AUTORUN_* env var is set in the submit
+# shell. With none set, the maps above and every rendered job script are
+# byte-identical to the pre-rider launcher (proof:
+# longctx128k/baseline_render/render.diff -- QA Q3 / ACCEPTANCE 1.6).
+# Purpose: launch a probe through THIS entry point without editing the maps,
+# the template, or any file in the tree.
+#
+#   AUTORUN_EP_KEY="N:EP:TP" + AUTORUN_EP_CMD="bs:nbs:iters:MOE:MODEL:ckpt:n:zero"
+#       submit ONLY this EP-loop entry; every other map is cleared for this
+#       invocation only (the script file itself is untouched).
+#   AUTORUN_SEQ_LEN=<tokens>     override the registry SEQ_LEN in the rendered
+#                                job (inserted right after `eval "$CONFIG_VARS"`,
+#                                before any consumer of SEQ_LEN).
+#   AUTORUN_PP_SIZE=<n>          EP-path only: override the EP ladder's PP=1
+#                                pin in the rendered job (the PP_SIZE
+#                                assignment plus the pp1 tag in the SBATCH
+#                                -o/-e and JOB_DIR names, which must stay
+#                                consistent with each other). Everything
+#                                downstream — GBS, PP_STRIDE,
+#                                --pipeline-model-parallel-size vs
+#                                --no-pipeline-parallel — reads $PP_SIZE at
+#                                runtime inside the job. Verified or ABORT.
+#   AUTORUN_NO_CKPT=1            strip --save/--load from the rendered job:
+#                                random init, writes no checkpoint anywhere
+#                                (probe hygiene; cannot touch any lineage dir).
+#   AUTORUN_CAPACITY_ROUTED=1    remove --disable-moe-token-dropping (all
+#                                occurrences): capacity routing at the factor
+#                                already rendered (1.25 last-wins).
+#   AUTORUN_SEQ_CHUNKED_CE=<n>   append --seq-chunked-ce <n> (non-pipe CE path).
+#   AUTORUN_NCCL_DEBUG=<lvl>     replace `export NCCL_DEBUG=INFO` with <lvl>.
+#   AUTORUN_NO_FP32_RESIDUAL=1   remove --fp32-residual-connection from the
+#                                rendered job (checkpoint boundaries drop
+#                                fp32->bf16; R1_DIAGNOSIS.md S6).
+#                                PROHIBITED for submissions: the flag is
+#                                owner-required (directive 2026-08-27).
+#   AUTORUN_CKPT_IN_CPU=1        append --checkpoint-in-cpu (offload the
+#                                activation-checkpoint boundaries to host;
+#                                FLAGKEPT_PRICING.md S4/P1).
+#   AUTORUN_PARTITION_ACT=1      append --partition-activations (TP-partition
+#                                the checkpoint boundaries; FLAGKEPT_PRICING.md
+#                                S4/P2 — requires the S8 arity fix, landed).
+#   AUTORUN_DS_SEQUENCE_PARALLEL_SIZE=<P>  append --ds-sequence-parallel-size <P> (DeepSpeed-Ulysses inside the latent
+#                                attention with PP, TP, EP: the blueprint of 2026-09-17; with TP > 1 set AUTORUN_MEGATRON_SP=1 too).
+#   AUTORUN_MEGATRON_SP=1        companion SP (SP_COMPANION_AUDIT.md S9): append
+#                                --sequence-parallel AND export XMOE_MEGATRON_SP=1
+#                                — BOTH together (flag w/o env re-introduces G2
+#                                double-shard; env w/o flag is a no-op). The
+#                                rider verifies both landed or ABORTS the launch.
+#   AUTORUN_LOAD_DIR=<dir>       point --load at <dir> (replaces the template's
+#                                default LOAD_CHECKPOINT_PATH). Verified or ABORT.
+#   AUTORUN_SAVE_DIR=<dir>       save checkpoints to <dir> (replaces the per-job
+#                                dated CHECKPOINT_PATH). Verified or ABORT.
+#   AUTORUN_UCP_FINETUNE=1       append --universal-checkpoint while KEEPING the
+#                                base --finetune (the stage-transition turn-1
+#                                pairing, ANALYSIS_128K.md S3.6 — deliberately
+#                                NOT the UCP_ENABLE path, which strips
+#                                --finetune). Verifies BOTH flags or ABORTS.
+#   AUTORUN_SAVE_INTERVAL=<n>    replace the template's SAVE_INTERVAL=10 in the
+#                                rendered job (checkpoint cadence; a chained
+#   AUTORUN_EXIT_MINS=<n>        replace EXIT_DURATION=30000000 (--exit-duration-in-mins): the job
+#                                saves and exits cleanly N minutes after launch (chain links).
+#   AUTORUN_PRE_CMD=<cmd>        run <cmd> inside the allocation before the training srun (UCP I/O campaign:
+#                                in-job conversion of the resume checkpoint); AUTORUN_POST_CMD=<cmd> after it.
+#                                pass only makes durable progress in
+#                                SAVE_INTERVAL multiples). Verified or ABORT.
+#   AUTORUN_UCP_RESUME=1         PROPER universal resume: append
+#                                --universal-checkpoint AND strip the base
+#                                --finetune — the exact pair the template's
+#                                UCP_ENABLE=1 path builds (that path is
+#                                unreachable on the EP loop, which pins
+#                                UCP_ENABLE=0 at render). Optimizer state,
+#                                iteration counter and consumed tokens all
+#                                restore (0815 ladder-certification resume
+#                                semantics). Mutually exclusive with
+#                                AUTORUN_UCP_FINETUNE and
+#                                AUTORUN_NATIVE_RESUME. Verified or ABORT.
+#   AUTORUN_NATIVE_RESUME=1      same-topology native resume for chained
+#                                passes: strip the base --finetune only (NO
+#                                --universal-checkpoint, so the in-job
+#                                conversion block stays off) and insert a
+#                                fail-fast guard that aborts the job before
+#                                srun if ${LOAD_CHECKPOINT_PATH}/latest is
+#                                missing — a chained pass must never fall back
+#                                to random init. Mutually exclusive with the
+#                                two UCP riders. Verified or ABORT.
+
+if [ -n "${AUTORUN_EP_KEY:-}" ]; then
+    PP_BATCH_MAP=()
+    EP_BATCH_MAP=()
+    DENSE_BATCH_MAP=()
+    PROFILE_MAP=()
+    EP_BATCH_MAP["${AUTORUN_EP_KEY}"]="${AUTORUN_EP_CMD:?AUTORUN_EP_KEY set but AUTORUN_EP_CMD empty}"
+    echo "[rider] EP-only submission: EP_BATCH_MAP[${AUTORUN_EP_KEY}]='${AUTORUN_EP_CMD}'"
+fi
+
+# Applied to each RENDERED job script after the sed render, before sbatch.
+# No-op when no AUTORUN_* rider is set.
+apply_autorun_riders() {
+    local f="$1"
+    # Resume-mode riders are mutually exclusive: abort before any edit lands.
+    if [ "${AUTORUN_UCP_RESUME:-0}" = "1" ] && { [ "${AUTORUN_UCP_FINETUNE:-0}" = "1" ] || [ "${AUTORUN_NATIVE_RESUME:-0}" = "1" ]; }; then
+        echo "FATAL [rider conflict]: AUTORUN_UCP_RESUME is mutually exclusive with AUTORUN_UCP_FINETUNE / AUTORUN_NATIVE_RESUME — refusing to submit"
+        exit 1
+    fi
+    if [ "${AUTORUN_NATIVE_RESUME:-0}" = "1" ] && [ "${AUTORUN_UCP_FINETUNE:-0}" = "1" ]; then
+        echo "FATAL [rider conflict]: AUTORUN_NATIVE_RESUME is mutually exclusive with AUTORUN_UCP_FINETUNE — refusing to submit"
+        exit 1
+    fi
+    if [ -n "${AUTORUN_SEQ_LEN:-}" ]; then
+        sed -i "/^eval \"\$CONFIG_VARS\"\$/a SEQ_LEN=${AUTORUN_SEQ_LEN}   # [rider AUTORUN_SEQ_LEN] overrides the registry value" "$f"
+    fi
+    if [ -n "${AUTORUN_PP_SIZE:-}" ]; then
+        sed -i -e "s/^PP_SIZE=1\$/PP_SIZE=${AUTORUN_PP_SIZE}   # [rider AUTORUN_PP_SIZE] overrides the EP-path PP=1 pin/" \
+               -e "s/_pp1_ep/_pp${AUTORUN_PP_SIZE}_ep/g" "$f"
+        if ! grep -q "^PP_SIZE=${AUTORUN_PP_SIZE} " "$f" || ! grep -q "_pp${AUTORUN_PP_SIZE}_ep" "$f"; then
+            echo "FATAL [rider AUTORUN_PP_SIZE]: PP override did not land in $f — refusing to submit (EP-path renders only)"
+            exit 1
+        fi
+    fi
+    if [ "${AUTORUN_NO_CKPT:-0}" = "1" ]; then
+        sed -i -e '/^[[:space:]]*--save ${CHECKPOINT_PATH} \\$/d' \
+               -e '/^[[:space:]]*--load ${LOAD_CHECKPOINT_PATH} \\$/d' "$f"
+    fi
+    if [ "${AUTORUN_CAPACITY_ROUTED:-0}" = "1" ]; then
+        sed -i -e '/^[[:space:]]*--disable-moe-token-dropping \\$/d' \
+               -e 's/ --disable-moe-token-dropping//g' "$f"
+    fi
+    if [ -n "${AUTORUN_SEQ_CHUNKED_CE:-}" ]; then
+        sed -i "/END of Megatron Setup/i megatron_options=\"\${megatron_options} --seq-chunked-ce ${AUTORUN_SEQ_CHUNKED_CE}\"   # [rider AUTORUN_SEQ_CHUNKED_CE]" "$f"
+    fi
+    if [ "${AUTORUN_CKPT_IN_CPU:-0}" = "1" ]; then
+        sed -i "/END of Megatron Setup/i megatron_options=\"\${megatron_options} --checkpoint-in-cpu\"   # [rider AUTORUN_CKPT_IN_CPU]" "$f"
+    fi
+    if [ "${AUTORUN_PARTITION_ACT:-0}" = "1" ]; then
+        sed -i "/END of Megatron Setup/i megatron_options=\"\${megatron_options} --partition-activations\"   # [rider AUTORUN_PARTITION_ACT]" "$f"
+    fi
+    if [ -n "${AUTORUN_DS_SEQUENCE_PARALLEL_SIZE:-}" ]; then
+        sed -i "/END of Megatron Setup/i megatron_options=\"\${megatron_options} --ds-sequence-parallel-size ${AUTORUN_DS_SEQUENCE_PARALLEL_SIZE}\"   # [rider AUTORUN_DS_SEQUENCE_PARALLEL_SIZE]" "$f"
+        if ! grep -q -- "--ds-sequence-parallel-size" "$f"; then echo "FATAL [rider AUTORUN_DS_SEQUENCE_PARALLEL_SIZE]: did not land in $f"; exit 1; fi
+    fi
+    if [ "${AUTORUN_MEGATRON_SP:-0}" = "1" ]; then
+        sed -i "/END of Megatron Setup/i megatron_options=\"\${megatron_options} --sequence-parallel\"   # [rider AUTORUN_MEGATRON_SP]" "$f"
+        sed -i "/^export NCCL_DEBUG=/a export XMOE_MEGATRON_SP=1   # [rider AUTORUN_MEGATRON_SP] REQUIRED with --sequence-parallel (SP_COMPANION_AUDIT.md G2)" "$f"
+        if ! grep -q -- "--sequence-parallel" "$f" || ! grep -q "^export XMOE_MEGATRON_SP=1" "$f"; then
+            echo "FATAL [rider AUTORUN_MEGATRON_SP]: flag+env pair did not both land in $f — refusing to submit (SP_COMPANION_AUDIT.md S9: both are required together)"
+            exit 1
+        fi
+    fi
+    if [ -n "${AUTORUN_LOAD_DIR:-}" ]; then
+        sed -i "s|^LOAD_CHECKPOINT_PATH=checkpoint/deepseek_16b_ds\$|LOAD_CHECKPOINT_PATH=${AUTORUN_LOAD_DIR}   # [rider AUTORUN_LOAD_DIR]|" "$f"
+        if ! grep -q "^LOAD_CHECKPOINT_PATH=${AUTORUN_LOAD_DIR} " "$f"; then
+            echo "FATAL [rider AUTORUN_LOAD_DIR]: load-path override did not land in $f — refusing to submit"
+            exit 1
+        fi
+    fi
+    if [ -n "${AUTORUN_SAVE_DIR:-}" ]; then
+        sed -i "s|^export CHECKPOINT_PATH=checkpoint/\\\$(date .*|export CHECKPOINT_PATH=${AUTORUN_SAVE_DIR}   # [rider AUTORUN_SAVE_DIR]|" "$f"
+        if ! grep -q "^export CHECKPOINT_PATH=${AUTORUN_SAVE_DIR} " "$f"; then
+            echo "FATAL [rider AUTORUN_SAVE_DIR]: save-path override did not land in $f — refusing to submit"
+            exit 1
+        fi
+    fi
+    if [ "${AUTORUN_UCP_FINETUNE:-0}" = "1" ]; then
+        sed -i "/END of Megatron Setup/i megatron_options=\"\${megatron_options} --universal-checkpoint\"   # [rider AUTORUN_UCP_FINETUNE] paired with the base --finetune (turn-1 gotcha)" "$f"
+        if ! grep -q -- "--universal-checkpoint" "$f" || ! grep -q -- "^[[:space:]]*--finetune \\\\\$" "$f"; then
+            echo "FATAL [rider AUTORUN_UCP_FINETUNE]: --universal-checkpoint + --finetune pair not both present in $f — refusing to submit (ANALYSIS_128K.md S3.6 turn-1 gotcha)"
+            exit 1
+        fi
+    fi
+    if [ "${AUTORUN_NO_FP32_RESIDUAL:-0}" = "1" ]; then
+        sed -i -e '/^[[:space:]]*--fp32-residual-connection \\$/d' \
+               -e 's/ --fp32-residual-connection//g' "$f"
+    fi
+    if [ -n "${AUTORUN_NCCL_DEBUG:-}" ]; then
+        sed -i "s/^export NCCL_DEBUG=INFO\$/export NCCL_DEBUG=${AUTORUN_NCCL_DEBUG}/" "$f"
+    fi
+    # Walltime override. The template hard-codes "#SBATCH -t 1:00:00"; a probe wants 20 minutes and a
+    # production turn wants exactly the campaign's 1-hour wall. Rewriting the directive (rather than
+    # passing sbatch -t) keeps the rendered script self-describing: the file you read is the job that
+    # ran. Verify-or-abort, matching every other rider here.
+    # QOS override. The template pins "-q debug", which is MaxSubmitPU=1 -- fine for a probe, fatal
+    # for a chained campaign because turn N+1 cannot be queued while turn N is pending.
+    # Dependency injected INTO the script, not applied afterwards. `sbatch` followed by
+    # `scontrol update Dependency=` is a RACE: job 5380794 was started by the scheduler in the
+    # gap and ran unconstrained -- a second 128-node job resuming the same checkpoint and writing
+    # the same save dir as the turn still running. Putting the directive in the rendered script
+    # makes it atomic with submission.
+    # Bake the data blend INTO the script. LC_DATA_PATH otherwise rides only on --export=ALL, and
+    # if it fails to propagate the template silently falls back to
+    #   DATA_PATH="0.34 ${LC_LONG} 0.66 ${LC_REPLAY}"
+    # i.e. a completely different corpus, with no error. Writing it in makes it auditable with
+    # `scontrol write batch_script` after the fact -- which is the only way to prove which data a
+    # finished run actually trained on.
+    if [ -n "${AUTORUN_DATA_PATH:-}" ]; then
+        # 2026-08-30 POSTMORTEM (job 5381973): the old rider rewrote the top-level
+        # `export DATA_PATH=` line, but the template's LC_MODE block re-exports
+        #   DATA_PATH="${LC_DATA_PATH:-0.34 ${LC_LONG} 0.66 ${LC_REPLAY}}"
+        # LATER in execution, silently replacing the blend with the stale L8+nemotron
+        # default. Turn 3 trained 2.23B tokens on 0% >=128k data while the script TEXT
+        # carried the v2 blend -- the old guard checked the text, not the executed value.
+        # Fix: set LC_DATA_PATH (which that line RESPECTS), and bake a runtime assert
+        # right after the clobber line so the job itself dies loudly on the wrong corpus.
+        # python injection: the blend is full of / and | characters; sed delimiters
+        # cannot carry it safely (first attempt died on "unknown option to s").
+        AUTORUN_DATA_PATH="${AUTORUN_DATA_PATH}" python3 - "$f" <<'PYINJ'
+import os, re, sys
+f = sys.argv[1]; blend = os.environ['AUTORUN_DATA_PATH']
+marker = os.path.basename(blend.split()[1]).split('.')[0]
+s = open(f).read()
+anchor = 'echo "COLLECT_PROFILING_CACHE'
+i = s.index(anchor)
+s = (s[:i] + 'export LC_DATA_PATH="' + blend + '"   # [rider AUTORUN_DATA_PATH]\n' + s[i:])
+clob = re.search(r'^(    export DATA_PATH="\$\{LC_DATA_PATH:-.*)$', s, re.M)
+assert clob, 'clobber line not found'
+check = ('\n    case "${DATA_PATH}" in *"' + marker + '"*) echo "blend RUNTIME-OK: contains ' + marker
+         + '";; *) echo "FATAL: DATA_PATH lacks expected corpus ' + marker
+         + ' -- got: ${DATA_PATH:0:200}"; exit 1;; esac')
+s = s[:clob.end()] + check + s[clob.end():]
+open(f, 'w').write(s)
+PYINJ
+        if ! grep -q "rider AUTORUN_DATA_PATH" "$f" || ! grep -q "blend RUNTIME-OK" "$f"; then
+            echo "FATAL [rider AUTORUN_DATA_PATH]: injection did not land in $f -- refusing to submit"
+            exit 1
+        fi
+    fi
+    if [ -n "${AUTORUN_DEPENDENCY:-}" ]; then
+        sed -i "0,/^#SBATCH -N /s//#SBATCH --dependency=${AUTORUN_DEPENDENCY}\n#SBATCH -N /" "$f"
+        if ! grep -q "^#SBATCH --dependency=${AUTORUN_DEPENDENCY}$" "$f"; then
+            echo "FATAL [rider AUTORUN_DEPENDENCY]: directive did not land in $f -- refusing to submit"
+            exit 1
+        fi
+    fi
+    if [ -n "${AUTORUN_QOS:-}" ]; then
+        sed -i "s|^#SBATCH -q .*$|#SBATCH -q ${AUTORUN_QOS}   # [rider AUTORUN_QOS]|" "$f"
+        if ! grep -q "^#SBATCH -q ${AUTORUN_QOS} " "$f"; then
+            echo "FATAL [rider AUTORUN_QOS]: qos override did not land in $f -- refusing to submit"
+            exit 1
+        fi
+    fi
+    if [ -n "${AUTORUN_WALLTIME:-}" ]; then
+        sed -i "s|^#SBATCH -t .*$|#SBATCH -t ${AUTORUN_WALLTIME}   # [rider AUTORUN_WALLTIME]|" "$f"
+        if ! grep -q "^#SBATCH -t ${AUTORUN_WALLTIME} " "$f"; then
+            echo "FATAL [rider AUTORUN_WALLTIME]: walltime override did not land in $f -- refusing to submit"
+            exit 1
+        fi
+    fi
+    # Launch-geometry guard. The bug that cost this campaign an entire stage at 27% throughput was a
+    # hand-edited script whose TOTAL_GPUS disagreed with -N, so the template's
+    # gpus_per_node=$(( TOTAL_GPUS / NODES )) silently produced 4 GCDs/node. A sweep of the job logs
+    # found 15 runs at the wrong geometry, not 2.
+    # PLACEMENT IS THE POINT: it must fire BEFORE the universal-conversion srun (template ~:730,
+    # measured up to 15 min on 1 node) and before the Triton warm srun -- otherwise a 128-node
+    # allocation burns those minutes doing 1-node work before anything complains. So anchor it to the
+    # first echo of the config block, not to the gpus_per_node line ~180 lines further down.
+    if ! grep -q '^__gpn_guard=' "$f"; then
+        sed -i '/^echo "COLLECT_PROFILING_CACHE: \$COLLECT_PROFILING_CACHE"$/a __gpn_guard=$(( TOTAL_GPUS / NODES )); if [ "${__gpn_guard}" -ne 8 ]; then echo "FATAL launch geometry: gpus_per_node=${__gpn_guard} (TOTAL_GPUS=${TOTAL_GPUS} / NODES=${NODES}); expected 8. Refusing to run at partial node occupancy."; exit 1; fi; if [ -n "${SLURM_NNODES:-}" ] \&\& [ "${SLURM_NNODES}" -ne "${NODES}" ]; then echo "FATAL launch geometry: NODES=${NODES} but SLURM_NNODES=${SLURM_NNODES}."; exit 1; fi; echo "launch geometry OK: ${NODES} nodes x ${__gpn_guard} GCDs = ${TOTAL_GPUS}"' "$f"
+        if ! grep -q '^__gpn_guard=' "$f"; then
+            echo "FATAL [gpus_per_node guard]: guard did not land in $f -- refusing to submit"
+            exit 1
+        fi
+    fi
+    if [ -n "${AUTORUN_SAVE_INTERVAL:-}" ]; then
+        sed -i "s/^SAVE_INTERVAL=10\$/SAVE_INTERVAL=${AUTORUN_SAVE_INTERVAL}   # [rider AUTORUN_SAVE_INTERVAL] overrides the template cadence/" "$f"
+        if ! grep -q "^SAVE_INTERVAL=${AUTORUN_SAVE_INTERVAL} " "$f"; then
+            echo "FATAL [rider AUTORUN_SAVE_INTERVAL]: override did not land in $f — refusing to submit"
+            exit 1
+        fi
+    fi
+    if [ -n "${AUTORUN_EXIT_MINS:-}" ]; then
+        # [2026-09-05, UCP I/O campaign] a chain link must save and exit cleanly N minutes after
+        # launch so the next link can resume; the template pins EXIT_DURATION=30000000 (never).
+        sed -i "s/^EXIT_DURATION=30000000\$/EXIT_DURATION=${AUTORUN_EXIT_MINS}   # [rider AUTORUN_EXIT_MINS] --exit-duration-in-mins/" "$f"
+        if ! grep -q "^EXIT_DURATION=${AUTORUN_EXIT_MINS} " "$f"; then
+            echo "FATAL [rider AUTORUN_EXIT_MINS]: override did not land in $f — refusing to submit"
+            exit 1
+        fi
+    fi
+    if [ -n "${AUTORUN_PRE_CMD:-}" ]; then
+        # [2026-09-05, UCP I/O campaign] a command run inside the allocation BEFORE training (e.g. the
+        # Darshan-profiled conversion of the checkpoint this job resumes from); one job instead of two.
+        python3 - "$f" "${AUTORUN_PRE_CMD}" <<'PY'
+import sys
+f, cmd = sys.argv[1], sys.argv[2]; s = open(f).read()
+a = 'echo "Before launching srun python python ../pretrain_gpt_deepspeed.py"\n'
+assert s.count(a) == 1, 'PRE anchor not unique'
+s = s.replace(a, 'echo "[rider AUTORUN_PRE_CMD] $(date) running: ' + cmd.replace('"', '\\"') + '"\n' + cmd + '   # [rider AUTORUN_PRE_CMD]\n' + a)
+open(f, 'w').write(s)
+PY
+        if ! grep -q "rider AUTORUN_PRE_CMD" "$f"; then echo "FATAL [rider AUTORUN_PRE_CMD]: did not land in $f"; exit 1; fi
+    fi
+    if [ -n "${AUTORUN_POST_CMD:-}" ]; then
+        # [2026-09-05, UCP I/O campaign] a command run inside the allocation AFTER training returns
+        # (e.g. the Darshan-profiled conversion of this job's newest complete save).
+        python3 - "$f" "${AUTORUN_POST_CMD}" <<'PY'
+import sys
+f, cmd = sys.argv[1], sys.argv[2]; s = open(f).read()
+a = 'wait "${TRAIN_PID}"     # SIGUSR1 near walltime interrupts this; normal finish falls through\n'
+assert s.count(a) == 1, 'POST anchor not unique'
+s = s.replace(a, a + 'echo "[rider AUTORUN_POST_CMD] $(date) running: ' + cmd.replace('"', '\\"') + '"\n' + cmd + '   # [rider AUTORUN_POST_CMD]\n')
+open(f, 'w').write(s)
+PY
+        if ! grep -q "rider AUTORUN_POST_CMD" "$f"; then echo "FATAL [rider AUTORUN_POST_CMD]: did not land in $f"; exit 1; fi
+    fi
+    if [ "${AUTORUN_UCP_RESUME:-0}" = "1" ]; then
+        sed -i '/^[[:space:]]*--finetune \\$/d' "$f"
+        sed -i "/END of Megatron Setup/i megatron_options=\"\${megatron_options} --universal-checkpoint\"   # [rider AUTORUN_UCP_RESUME] proper universal resume: optimizer+iteration+consumed-tokens restore; --finetune stripped (UCP_ENABLE=1 semantics on the EP path)" "$f"
+        if ! grep -q -- "--universal-checkpoint" "$f" || grep -q -- "^[[:space:]]*--finetune \\\\\$" "$f"; then
+            echo "FATAL [rider AUTORUN_UCP_RESUME]: expected --universal-checkpoint present AND --finetune absent in $f — refusing to submit"
+            exit 1
+        fi
+    fi
+    if [ "${AUTORUN_NATIVE_RESUME:-0}" = "1" ]; then
+        sed -i '/^[[:space:]]*--finetune \\$/d' "$f"
+        sed -i '/^LOAD_CHECKPOINT_PATH=/a if [ ! -f "${LOAD_CHECKPOINT_PATH}/latest" ]; then echo "FATAL [rider AUTORUN_NATIVE_RESUME]: no latest tag under ${LOAD_CHECKPOINT_PATH} — a chained pass must not fall back to random init"; exit 1; fi   # [rider AUTORUN_NATIVE_RESUME] fail-fast resume guard' "$f"
+        if grep -q -- "^[[:space:]]*--finetune \\\\\$" "$f" || ! grep -q "rider AUTORUN_NATIVE_RESUME" "$f"; then
+            echo "FATAL [rider AUTORUN_NATIVE_RESUME]: expected --finetune absent AND resume guard present in $f — refusing to submit"
+            exit 1
+        fi
+    fi
+}
+# =========================================================================
+
                 CACHE_FILE="./planner_profiling_cache/${CACHE_FILENAME}"
 
                 # C. Check if Cache Exists

@@ -495,7 +495,10 @@ def get_batch(data_iterator):
             '--intra-document-attention expects the flash path, which builds no dense mask'
         attention_mask = build_intra_doc_cu_seqlens(tokens, tokenizer.eod)
 
-    # For DS's sequence parallel
+    # [X-MoE 2026-09-17, the Ulysses blueprint C4] two slices: the DeepSpeed degree P first (contiguous, in rank order, so the
+    # per-token losses gathered over P come back in sequence order), then Megatron's sequence parallelism inside the P shard.
+    # The labels follow the P shard (the head gathers over TP); the loss mask stays FULL-length: the gathered cross entropy
+    # (sequence_parallel/cross_entropy.py) returns [S, B] per-token losses and its backward re-slices this rank's window.
     seq_parallel_world_size = mpu.get_sequence_parallel_world_size()
     seq_parallel_world_rank = mpu.get_sequence_parallel_rank()
 
@@ -603,7 +606,10 @@ def get_batch_pipe(data):
             labels = labels[:, :args.curriculum_seqlen].contiguous()
         loss_mask = loss_mask[:, :args.curriculum_seqlen].contiguous()
 
-    # For DS's sequence parallel
+    # [X-MoE 2026-09-17, the Ulysses blueprint C4] two slices: the DeepSpeed degree P first (contiguous, in rank order, so the
+    # per-token losses gathered over P come back in sequence order), then Megatron's sequence parallelism inside the P shard.
+    # The labels follow the P shard (the head gathers over TP); the loss mask stays FULL-length: the gathered cross entropy
+    # (sequence_parallel/cross_entropy.py) returns [S, B] per-token losses and its backward re-slices this rank's window.
     seq_parallel_world_size = mpu.get_sequence_parallel_world_size()
     seq_parallel_world_rank = mpu.get_sequence_parallel_rank()
 

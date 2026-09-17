@@ -300,7 +300,8 @@ def _initialize_distributed():
         if mpu.model_parallel_is_initialized():
             print('model parallel is already initialized')
         else:
-            if args.ds_sequence_parallel_size > 1 and args.sequence_parallel:
+            if args.ds_sequence_parallel_size > 1 and args.sequence_parallel and getattr(args, 'attention_variant', None) != 'deepseek_v3':
+                # [X-MoE 2026-09-17, C1] the latent attention composes the DeepSpeed degree with Megatron's sequence parallelism
                 raise RuntimeError(
                     f"sequence_parallel_size > 1 enables DeepSpeed's sequence parallel, "
                     f"which is not compatible with Megatron-LM's sequence parallel. "

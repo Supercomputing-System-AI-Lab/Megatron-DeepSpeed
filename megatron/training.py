@@ -743,7 +743,7 @@ def setup_model_and_optimizer(model_provider_func,
 
             assert model.grid.get_pipe_parallel_rank() == mpu.get_pipeline_model_parallel_rank()
             assert model.grid.get_slice_parallel_rank() == mpu.get_tensor_model_parallel_rank()
-            assert model.grid.get_data_parallel_rank() == mpu.get_data_parallel_rank()
+            assert model.grid.get_data_parallel_rank() == mpu.get_sequence_data_parallel_rank()   # [X-MoE 2026-09-17, C3] the grid's data axis is dp x P
         model = [model]
 
     # Compression has its own checkpoint loading path (e.g, loading both teacher and student models). So if compression is enabled, we skip the following checkpoint loading.
