@@ -1404,7 +1404,11 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             global_batch_size = mpu.get_data_parallel_world_size() * \
                                 args.micro_batch_size * \
                                 get_num_microbatches()
-            model[0].set_train_batch_size(global_batch_size)
+            # [X-MoE 2026-09-17, the Ulysses blueprint C3] under a pipeline the engine's data-parallel size is the grid's dp x P: its
+            # train batch is the global batch times P so that every P rank runs all the micro-batches of its loader (see
+            # ulysses_pipe_batch_config); this call re-applies Megatron's global batch every iteration and must carry the same factor
+            _P = args.ds_sequence_parallel_size if (args.ds_sequence_parallel_size > 1 and args.pipeline_model_parallel_size > 1) else 1
+            model[0].set_train_batch_size(global_batch_size * _P)
 
         if args.curriculum_learning_legacy and not args.no_pipeline_parallel:
             curriculum_seqlen = args.curriculum_scheduler.update_difficulty( \
