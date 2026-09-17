@@ -78,11 +78,29 @@ def _create_ds_config_dict():
     if args.universal_checkpoint:
         ds_config_dict["checkpoint"] = {"load_universal": True}
     sequence_parallel_pipe_config(args, ds_config_dict)
+    ulysses_pipe_batch_config(args, ds_config_dict)
 
     # Clear config path
     args.deepspeed_config = None 
 
     return ds_config_dict
+
+
+def ulysses_pipe_batch_config(args, ds_config_dict):
+    """[X-MoE 2026-09-17, the Ulysses blueprint C3] under a pipeline the DeepSpeed engine's data-parallel size is the pipe grid's data
+    axis, which is dp x P (gpt_model.py builds the topology so, for ZeRO and the gradient reduction). DeepSpeed derives the micro-batches
+    per rank as train_batch_size / (micro_batch x that size), so with the global batch as given it would run P times too few: every P
+    rank of one loader must process all of that loader's micro-batches (they hold shards of the same sequences). The engine's
+    train_batch_size is therefore the global batch times P; Megatron's own counters (global_batch_size, consumed samples) are unchanged.
+    Without a pipeline the engine's data-parallel size excludes P and nothing changes."""
+    P = getattr(args, 'ds_sequence_parallel_size', 1) or 1
+    if P > 1 and args.pipeline_model_parallel_size > 1:
+        if 'train_batch_size' in ds_config_dict:
+            ds_config_dict['train_batch_size'] = int(ds_config_dict['train_batch_size']) * P
+        if 'gradient_accumulation_steps' in ds_config_dict:
+            ds_config_dict['gradient_accumulation_steps'] = int(ds_config_dict['gradient_accumulation_steps']) * P
+        print_rank_0(f'[ulysses] DeepSpeed train_batch_size x {P} under the pipeline (the grid data axis is dp x P): '
+                     f'{ds_config_dict.get("train_batch_size")}, gradient_accumulation_steps {ds_config_dict.get("gradient_accumulation_steps")}')
 
 
 def sequence_parallel_pipe_config(args, ds_config_dict):
