@@ -21,6 +21,10 @@ except:
     HAVE_PERSIST_LAYER_NORM = False
 
 from apex.normalization.fused_layer_norm import FusedLayerNormAffineFunction
+try:  # [X-MoE 2026-09-18] the mixed-dtype kernel: an fp32 residual stream normalised with bf16 parameters (apex's own MixedFusedLayerNorm dispatches to it)
+    from apex.normalization.fused_layer_norm import FusedLayerNormAffineMixedDtypesFunction
+except ImportError:  # an apex without it: the same-dtype path below is kept
+    FusedLayerNormAffineMixedDtypesFunction = None
 
 
 global fused_layer_norm_cuda
@@ -85,6 +89,13 @@ class MixedFusedLayerNorm(torch.nn.Module):
               "This warning should only be triggered in the FusedLayerNorm unit tests.")
         return F.layer_norm(input, self.normalized_shape, weight, self.bias, self.eps)
     # print (f'[fused_layer_norm.py] {input.dtype=}, {weight.dtype=}, {self.bias.dtype=}, {self.normalized_shape=}, {self.eps=}')
+    if input.dtype != weight.dtype and FusedLayerNormAffineMixedDtypesFunction is not None:
+        # [X-MoE 2026-09-18] --fp32-residual-connection with bf16 parameters: the residual stream arrives in fp32 and the norm's
+        # weight is bf16; apex's same-dtype kernels (both branches below) raise "expected scalar type Float but found BFloat16"
+        # (jobs 5329736, 5329746, 5503690: every model on the layernorm path since the residual went fp32). The mixed-dtype kernel
+        # normalises in fp32 and returns the output in the weight's dtype, as apex's MixedFusedLayerNorm does. Same-dtype runs
+        # never enter this branch.
+        return FusedLayerNormAffineMixedDtypesFunction.apply(input, weight, self.bias, self.normalized_shape, self.eps, self.mem_efficient_ln)
     if self.no_persist_layer_norm:
         # Apex does not have versions yet (https://github.com/NVIDIA/apex/pull/1648), so we need to inspect 
         # the function manually on whether the extra arg introduced in https://github.com/NVIDIA/apex/pull/1715 exists yet
