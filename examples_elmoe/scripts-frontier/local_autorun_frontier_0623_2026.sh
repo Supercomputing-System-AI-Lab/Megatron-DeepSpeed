@@ -669,11 +669,10 @@ PYINJ
     if [ "${AUTORUN_NO_PROFILING:-0}" = "1" ]; then   # [rider AUTORUN_NO_PROFILING] (X-MoE 2026-09-18)
         sed -i 's|^DARSHAN_PRELOAD=.*$|DARSHAN_PRELOAD=""   # [rider AUTORUN_NO_PROFILING] no Darshan preload|' "$f"
         sed -i '/^ *--log-timers-to-tensorboard \\$/d; /^ *--log-batch-size-to-tensorboard \\$/d; /^ *--log-validation-ppl-to-tensorboard \\$/d; /^ *--tensorboard-queue-size 1 \\$/d; /^ *--tensorboard-dir ${TENSORBOARD_DIR} \\$/d' "$f"
-        sed -i 's|^export WANDB_MODE=.*$|export WANDB_MODE="disabled"; export WANDB_DISABLED=true   # [rider AUTORUN_NO_PROFILING]|' "$f"
-        if ! grep -q '^DARSHAN_PRELOAD=""' "$f" || grep -q -- '--log-timers-to-tensorboard' "$f" || ! grep -q 'WANDB_DISABLED=true' "$f"; then
+        if ! grep -q '^DARSHAN_PRELOAD=""' "$f" || grep -q -- '--log-timers-to-tensorboard' "$f"; then
             echo "FATAL [rider AUTORUN_NO_PROFILING]: not every switch landed in $f -- refusing to submit"; exit 1
         fi
-        echo "[rider AUTORUN_NO_PROFILING] Darshan preload emptied, tensorboard logging flags removed, wandb disabled"
+        echo "[rider AUTORUN_NO_PROFILING] Darshan preload emptied, tensorboard logging flags removed (wandb stays on)"
     fi
     if [ -n "${AUTORUN_PRE_CMD:-}" ]; then
         # [2026-09-05, UCP I/O campaign] a command run inside the allocation BEFORE training (e.g. the
