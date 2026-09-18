@@ -445,6 +445,11 @@ for node_key in "${!PP_STRATEGY_MAP[@]}"; do
 #                                rendered job (checkpoint cadence; a chained
 #   AUTORUN_EXIT_MINS=<n>        replace EXIT_DURATION=30000000 (--exit-duration-in-mins): the job
 #                                saves and exits cleanly N minutes after launch (chain links).
+#   AUTORUN_NO_PROFILING=1       [X-MoE 2026-09-18] a throughput run without instrumentation: empty the Darshan preload
+#                                (DARSHAN_PRELOAD="" so the training srun's LD_PRELOAD carries nothing), drop the
+#                                --log-timers/--log-batch-size/--log-validation-ppl-to-tensorboard flags and the
+#                                tensorboard dir, and export WANDB_DISABLED=true inside the job. The a-monitor stays
+#                                (the run-state instrument, a py-spy sample every 2-4 minutes).
 #   AUTORUN_PRE_CMD=<cmd>        run <cmd> inside the allocation before the training srun (UCP I/O campaign:
 #                                in-job conversion of the resume checkpoint); AUTORUN_POST_CMD=<cmd> after it.
 #                                pass only makes durable progress in
@@ -660,6 +665,15 @@ PYINJ
             echo "FATAL [rider AUTORUN_EXIT_MINS]: override did not land in $f — refusing to submit"
             exit 1
         fi
+    fi
+    if [ "${AUTORUN_NO_PROFILING:-0}" = "1" ]; then   # [rider AUTORUN_NO_PROFILING] (X-MoE 2026-09-18)
+        sed -i 's|^DARSHAN_PRELOAD=.*$|DARSHAN_PRELOAD=""   # [rider AUTORUN_NO_PROFILING] no Darshan preload|' "$f"
+        sed -i '/^ *--log-timers-to-tensorboard \\$/d; /^ *--log-batch-size-to-tensorboard \\$/d; /^ *--log-validation-ppl-to-tensorboard \\$/d; /^ *--tensorboard-queue-size 1 \\$/d; /^ *--tensorboard-dir ${TENSORBOARD_DIR} \\$/d' "$f"
+        sed -i 's|^export WANDB_MODE=.*$|export WANDB_MODE="disabled"; export WANDB_DISABLED=true   # [rider AUTORUN_NO_PROFILING]|' "$f"
+        if ! grep -q '^DARSHAN_PRELOAD=""' "$f" || grep -q -- '--log-timers-to-tensorboard' "$f" || ! grep -q 'WANDB_DISABLED=true' "$f"; then
+            echo "FATAL [rider AUTORUN_NO_PROFILING]: not every switch landed in $f -- refusing to submit"; exit 1
+        fi
+        echo "[rider AUTORUN_NO_PROFILING] Darshan preload emptied, tensorboard logging flags removed, wandb disabled"
     fi
     if [ -n "${AUTORUN_PRE_CMD:-}" ]; then
         # [2026-09-05, UCP I/O campaign] a command run inside the allocation BEFORE training (e.g. the
