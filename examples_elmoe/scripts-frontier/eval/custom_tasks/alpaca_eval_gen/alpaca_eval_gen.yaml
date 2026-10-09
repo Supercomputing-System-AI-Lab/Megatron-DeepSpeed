@@ -1,0 +1,25 @@
+task: alpaca_eval_gen
+dataset_path: json
+dataset_kwargs:
+  data_files:
+    eval: /lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/examples_elmoe/scripts-frontier/eval/cache/hf_datasets_cache/alpaca_eval/alpaca_eval.json
+test_split: eval
+output_type: generate_until
+doc_to_text: !function utils.doc_to_text
+doc_to_target: ""
+process_results: !function utils.process_results
+generation_kwargs:
+  until:
+    - "User:"
+  do_sample: false
+  max_gen_toks: 768
+metric_list:
+  - metric: gen_len
+    aggregation: mean
+    higher_is_better: true
+  - metric: nonempty
+    aggregation: mean
+    higher_is_better: true
+num_fewshot: 0
+metadata:
+  version: 1.0

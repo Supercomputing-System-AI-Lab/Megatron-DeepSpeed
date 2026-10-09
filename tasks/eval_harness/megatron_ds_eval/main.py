@@ -5,6 +5,7 @@ results.json saves, the response-cache path derivation, and registry row writing
 Launched through the tasks/eval_harness/evaluate_v04.py shim.
 """
 import json
+import codecs
 import os
 import sys
 import time
@@ -102,6 +103,17 @@ class _DispatchPeer:
 
     def close(self):
         return None
+
+
+def _dp_gather(payload):
+    """Every rank's (indices, values) of its own group's blocks, gathered over the whole job (the data-parallel prompt split):
+    after the call every rank holds every group's answers, so no position is left a placeholder and no collector is needed.
+    Called by ALL ranks, unconditionally, once per method call."""
+    if not torch.distributed.is_initialized():
+        return [payload]
+    box = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(box, payload)
+    return box
 
 
 def _dispatch_broadcast(obj):
@@ -243,6 +255,11 @@ def tasks_args(parser):
                             'task YAML via simple_evaluate(gen_kwargs=...). The table '
                             'is what check_seqlens.py measures against, so the two must '
                             'agree or prompts get silently truncated (humaneval 2026-08-16).')
+    group.add_argument('--extra-until', dest='extra_until', action='append', default=[],
+                       help='A stop string appended to the `until` list of every generation request (repeatable; '
+                            'python escapes such as \\n are decoded). The task YAML keeps its own stops. For a model '
+                            'that closes a completion with a markdown fence the harness does not stop at: '
+                            "--extra-until '```' (the bigcode harness stops at the fence; lm-eval's humaneval does not).")
     group.add_argument('--include-path', '--include_path', dest='include_path',
                        type=str, default=None,
                        help='Directory of custom lm-eval task YAMLs (TaskManager '
@@ -291,6 +308,13 @@ def tasks_args(parser):
                        help='Number of request-level shards this benchmark is split '
                             'across. 1 or unset = no split, the code path that runs '
                             'today.')
+    group.add_argument('--dp-split', '--dp_split', dest='dp_split', default=False, action='store_true',
+                       help='Split the request list across the DATA-PARALLEL ATTENTION GROUPS of this model copy '
+                            '(the tensor-parallel groups at pp=1): group g takes blocks g, g+G, ... of the list the '
+                            'DispatchLM shard rule already cuts, the groups agree on the number of forwards of every '
+                            'round (an idle group runs an empty forward), and the groups\' answers are all-gathered '
+                            'after each method so the results are complete on every rank. Set by eval_lib from '
+                            'dp_split=1. Ends the 8-fold replication of the 671B evaluation (2026-09-14).')
     group.add_argument('--dispatch-block', '--dispatch_block', dest='dispatch_block',
                        type=int, default=None,
                        help='Requests per dispatch block; shard k takes blocks k, '
@@ -397,7 +421,10 @@ def main():
         print_fn=print_rank_0,
     )
 
-    lm = MegatronDeepSpeedLM(model, tokenizer, response_cache=response_cache)
+    _extra_until = [codecs.decode(u, 'unicode_escape') for u in (getattr(args, 'extra_until', None) or [])]
+    if _extra_until:
+        print_rank_0(f'>>> [gen] extra stop strings appended to every generation request: {_extra_until!r}')
+    lm = MegatronDeepSpeedLM(model, tokenizer, response_cache=response_cache, extra_until=_extra_until)
 
     # deepseek-moe-verify: dump per-layer activations and/or print an inline HF-vs-framework
     # divergence report for a fixed probe input, then exit BEFORE lm-eval. Triggered by either
@@ -487,10 +514,24 @@ def main():
     # whole feature costs no fingerprint and orphans no cached answer.
     _dispatch = None
     _dispatch_client = None
-    if int(getattr(args, 'shard_count', None) or 1) > 1:
+    _dp_groups, _dp_rank = 1, 0
+    if getattr(args, 'dp_split', False):
+        # The data-parallel prompt split (2026-09-14): the request list is cut across the data-parallel attention groups of
+        # this model copy (the tensor-parallel groups at pp=1; 8 nodes of TP 8 = 8 groups for the 671B, 8 ranks of TP 1 = 8
+        # groups for a 16B on one node). The shard rule below is reused with (worker shard, group) as the shard, and the
+        # groups' answers are all-gathered after each method (_dp_gather), so nothing is partial and no collector runs.
+        from megatron.core import mpu as _mpu
+        _dp_groups = int(_mpu.get_data_parallel_world_size())
+        _dp_rank = int(_mpu.get_data_parallel_rank())
+        lm.dp_split = _dp_groups > 1
+        print_rank_0(f'>>> [dp-split] {_dp_groups} data-parallel attention group(s) in this model copy take interleaved '
+                     f'request blocks; the forwards of every round are agreed over the job and an idle group runs an '
+                     f'empty forward (rank {torch.distributed.get_rank() if torch.distributed.is_initialized() else 0} '
+                     f'is in group {_dp_rank})')
+    if int(getattr(args, 'shard_count', None) or 1) > 1 or _dp_groups > 1:
         _block = int(getattr(args, 'dispatch_block', None) or 0) or \
             4 * int(getattr(args, 'micro_batch_size', None) or 8) or DEFAULT_BLOCK
-        _shard_index = int(getattr(args, 'shard_index', None) or 0)
+        _shard_index = int(getattr(args, 'shard_index', None) or 0) * _dp_groups + _dp_rank
         # STAGE 2. Exactly ONE rank of this worker opens the socket -- RANK 0, which
         # cache.writer_rank(8, 1) also makes the answer-file writer, so the rank that
         # receives a block is the rank that persists its answers. The other 7 never touch
@@ -518,14 +559,15 @@ def main():
                 _dispatch_client = _DispatchPeer()
         _dispatch = DispatchLM(lm,
                                shard_index=_shard_index,
-                               shard_count=int(args.shard_count),
+                               shard_count=int(getattr(args, 'shard_count', None) or 1) * _dp_groups,
                                block=_block,
                                print_fn=print_rank_0,
                                client=_dispatch_client,
                                is_leader=_is_leader,
                                broadcast_fn=(_dispatch_broadcast
                                              if getattr(args, 'dispatch_addr', None)
-                                             else None))
+                                             else None),
+                               gather_fn=(_dp_gather if _dp_groups > 1 else None))
         lm = _dispatch
         print_rank_0(f'>>> [dispatch] request-level split ON: shard '
                      f'{_dispatch.shard_index + 1}/{_dispatch.shard_count}, block='
@@ -656,7 +698,9 @@ def main():
             # _meta, writes the full-set row. Additive: every reader uses .get().
             _run_meta['partial'] = 'slice {}/{}'.format(*_slice_kn)
             _run_meta['partial_source'] = 'slice'
-        if _dispatch is not None:
+        if _dispatch is not None and _dp_groups > 1:
+            _run_meta['dp_split'] = _dp_groups
+        if _dispatch is not None and int(getattr(args, 'shard_count', None) or 1) > 1:
             # A dispatched worker holds a SHARD of the request list, so its results.json
             # is built from its own answers plus whatever the shared answer file already
             # held plus placeholders -- a partial result at the full row's identity, the

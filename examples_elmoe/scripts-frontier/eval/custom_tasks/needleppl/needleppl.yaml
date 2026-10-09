@@ -1,0 +1,7 @@
+group: needleppl
+task:
+  - needleppl_4k
+  - needleppl_8k
+  - needleppl_16k
+metadata:
+  version: 1.0

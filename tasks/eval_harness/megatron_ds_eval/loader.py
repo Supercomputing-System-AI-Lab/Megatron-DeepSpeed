@@ -152,8 +152,16 @@ def _tp_slice_spec(full_shape, target_shape, meta, tp_rank, tp_size):
             return ('mismatch', 'vocab atom trailing dims differ from param')
         pad_to = target[0] * tp_size
         if full[0] > pad_to:
-            return ('mismatch',
-                    f'vocab atom rows {full[0]} exceed padded target {pad_to}')
+            # [2026-10-07] a save written under a LARGER padded vocabulary (the 671B 128k chain trained with
+            # XMOE_NULL_TOKENIZER=1: 129,280 rows, the HF vocab_size, against the eval's 128,815 real tokens
+            # padded to 129,024 at TP 8) is loaded from its first pad_to rows: the rows beyond the tokenizer's
+            # vocabulary are padding in both layouts, and the adapter slices logits to [:vocab_size] before
+            # scoring, so they never enter a score (the base's atoms were trimmed to 128,815 rows by hand on
+            # 2026-09-13 for the same reason: fp32.pt.full beside fp32.pt). Refused beyond 4,096 extra rows,
+            # which no padding rule produces.
+            if full[0] - pad_to > 4096:
+                return ('mismatch',
+                        f'vocab atom rows {full[0]} exceed padded target {pad_to} by more than 4,096')
         return ('vocab_pad_slice', pad_to, tp_rank * target[0],
                 (tp_rank + 1) * target[0])
     if meta.get('sub_param_shape') is not None:
@@ -615,6 +623,11 @@ def load_ds_checkpoint_and_setup_megatron(extra_args_provider):
         _cfg = dict(args.deepspeed_config_dict)
         for _k in ('optimizer', 'zero_optimization', 'scheduler', 'bf16', 'fp16'):
             _cfg.pop(_k, None)
+        # 2026-10-09 (job 5641368, 16 nodes EP128 TP8: data-parallel 16): the json's fixed train_batch_size (8) no longer divides,
+        # DeepSpeed asserts 'Gradient accumulation steps: 0'. The batch is the CLI's: global = micro x data-parallel, accumulation 1.
+        _cfg['train_micro_batch_size_per_gpu'] = int(args.micro_batch_size)
+        _cfg['train_batch_size'] = int(args.global_batch_size)
+        _cfg.pop('gradient_accumulation_steps', None)
         model = _get_model(model_provider, ModelType.encoder_or_decoder)
         if args.bf16:
             model[0].bfloat16()

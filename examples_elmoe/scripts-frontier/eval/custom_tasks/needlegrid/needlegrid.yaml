@@ -1,0 +1,55 @@
+tag:
+  - needlegrid
+task: needlegrid
+dataset_path: ""
+dataset_name: ""
+output_type: generate_until
+test_split: test
+custom_dataset: !function utils.load
+doc_to_text: "{{input}}"
+doc_to_target: "{{answer}}"
+target_delimiter: " "
+process_results: !function utils.process_results
+metric_list:
+  - metric: exact
+    aggregation: mean
+    higher_is_better: true
+  - metric: exact_d0.05
+    aggregation: !function utils.aggregate_depth
+    higher_is_better: true
+  - metric: exact_d0.15
+    aggregation: !function utils.aggregate_depth
+    higher_is_better: true
+  - metric: exact_d0.25
+    aggregation: !function utils.aggregate_depth
+    higher_is_better: true
+  - metric: exact_d0.35
+    aggregation: !function utils.aggregate_depth
+    higher_is_better: true
+  - metric: exact_d0.45
+    aggregation: !function utils.aggregate_depth
+    higher_is_better: true
+  - metric: exact_d0.55
+    aggregation: !function utils.aggregate_depth
+    higher_is_better: true
+  - metric: exact_d0.65
+    aggregation: !function utils.aggregate_depth
+    higher_is_better: true
+  - metric: exact_d0.75
+    aggregation: !function utils.aggregate_depth
+    higher_is_better: true
+  - metric: exact_d0.85
+    aggregation: !function utils.aggregate_depth
+    higher_is_better: true
+  - metric: exact_d0.95
+    aggregation: !function utils.aggregate_depth
+    higher_is_better: true
+generation_kwargs:
+  do_sample: false
+  temperature: 0.0
+  max_gen_toks: 16
+  until:
+    - "\n"
+repeats: 1
+metadata:
+  version: 1.0

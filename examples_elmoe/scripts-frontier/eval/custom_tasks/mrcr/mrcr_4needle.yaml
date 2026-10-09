@@ -1,0 +1,48 @@
+tag:
+  - mrcr
+task: mrcr_4needle
+dataset_path: ""
+dataset_name: ""
+output_type: generate_until
+test_split: test
+custom_dataset: !function utils.load_4needle
+doc_to_text: "{{input}}"
+doc_to_target: "{{answer}}"
+target_delimiter: " "
+process_results: !function utils.process_results
+metric_list:
+  - metric: ratio
+    aggregation: mean
+    higher_is_better: true
+  - metric: ratio_4k-8k
+    aggregation: !function utils.aggregate_bin
+    higher_is_better: true
+  - metric: ratio_8k-16k
+    aggregation: !function utils.aggregate_bin
+    higher_is_better: true
+  - metric: ratio_16k-32k
+    aggregation: !function utils.aggregate_bin
+    higher_is_better: true
+  - metric: ratio_32k-64k
+    aggregation: !function utils.aggregate_bin
+    higher_is_better: true
+  - metric: ratio_64k-128k
+    aggregation: !function utils.aggregate_bin
+    higher_is_better: true
+  - metric: ratio_128k-256k
+    aggregation: !function utils.aggregate_bin
+    higher_is_better: true
+  - metric: ratio_256k-512k
+    aggregation: !function utils.aggregate_bin
+    higher_is_better: true
+  - metric: ratio_512k-1m
+    aggregation: !function utils.aggregate_bin
+    higher_is_better: true
+generation_kwargs:
+  do_sample: false
+  temperature: 0.0
+  max_gen_toks: 1200
+  until: []
+repeats: 1
+metadata:
+  version: 1.0

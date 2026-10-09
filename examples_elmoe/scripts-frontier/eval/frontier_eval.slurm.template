@@ -1,0 +1,698 @@
+#!/bin/bash
+#SBATCH -A gen150
+#SBATCH -J {{JOB_NAME}}
+#SBATCH -o {{EVAL_DIR}}/logs/job_%j_step{{STEP}}_{{MOE_TYPE}}_{{MODEL_SIZE}}_pad{{PADDING_SIDE}}/slurm.out
+#SBATCH -e {{EVAL_DIR}}/logs/job_%j_step{{STEP}}_{{MOE_TYPE}}_{{MODEL_SIZE}}_pad{{PADDING_SIDE}}/slurm.err
+#SBATCH -t {{TIME}}
+#SBATCH -p batch
+#a SBATCH -p extended
+#SBATCH -N {{NODES}}
+#a SBATCH -d singleton
+#a SBATCH -q debug
+#
+# ============================================================================
+# frontier_eval.slurm.template
+#
+# Single-checkpoint eval template. Mirrors the structure of
+# ../frontier_elmoe.slurm.template (training-side) so anyone familiar with
+# the training pipeline can read this without re-learning conventions.
+#
+# Toolchain pin (2026-08-23): a stray torch JIT rebuild on a node whose shell
+# lost the inherited $CXX picked the pre-GCC-9 system compiler and failed with
+# "too old version of GCC" (job 5331713). Any rebuild must use the Cray GCC.
+export CXX=${CXX:-/opt/cray/pe/gcc-native/13/bin/g++}
+export CC=${CC:-/opt/cray/pe/gcc-native/13/bin/gcc}
+# Required by megatron/arguments.py:390 whenever sequence_parallel is active. UCP override_args
+# copies sequence_parallel=True from any TP>1-trained checkpoint's stored args, so every eval of
+# such a checkpoint hits that assertion. Baked here (not ridden in via --export=ALL) so it is
+# verifiable in the rendered script of every job -- 9 jobs died for lack of this line.
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+
+# Do NOT submit this file directly. Generated per-checkpoint by
+# eval/autorun_eval.sh, which sed-substitutes {{PLACEHOLDER}} tokens.
+#
+# Does NOT modify training files, checkpoints, datasets, or tokenizers.
+# All eval-side scratch under eval/{logs,runs,cache,temp_slurm}/
+# ============================================================================
+
+set -uo pipefail
+
+# ============================================================================
+# Template placeholders (filled by sed in eval/autorun_eval.sh)
+# ============================================================================
+JOB_NAME="{{JOB_NAME}}"
+STEP={{STEP}}
+NODES={{NODES}}
+TOTAL_GPUS={{TOTAL_GPUS}}
+MODEL_SIZE="{{MODEL_SIZE}}"
+MOE_TYPE="{{MOE_TYPE}}"
+TASK_LIST="{{TASK_LIST}}"
+MICRO_BATCH_SIZE={{MICRO_BATCH_SIZE}}
+EP_PARALLEL_SIZE={{EP_PARALLEL_SIZE}}
+LIMIT_FLAG="{{LIMIT_FLAG}}"
+CKPT_STEP_DIR="{{CKPT_STEP_DIR}}"
+CONSOLIDATED_LOAD="{{CONSOLIDATED_LOAD}}"
+# ---------------------------------------------------------------------------
+# Weight source. UCP is the default.
+#
+# WHY UCP AND NOT THE RAW DS CHECKPOINT
+#   A DeepSpeed checkpoint stores experts in FILES named by process-group coordinates, and the
+#   reader reconstructs a global expert id as `rank_fn() * num_local_experts + local_id`. That
+#   arithmetic only reproduces the training assignment when the eval runs at the same layout, so
+#   a DP9/EP8 checkpoint cannot be read by a 1-node DP1/EP8 job. UCP instead stores one directory
+#   per PARAMETER NAME under <tag>_universal/zero/, and the loader resolves each parameter by
+#   name through engine.param_names -- no rank arithmetic, hence no layout constraint.
+#
+# PATH CONVENTION (must match DeepSpeed's, not invented here)
+#   engine.load_checkpoint() is called by megatron/checkpointing.py:551 with NO tag, so DeepSpeed
+#   resolves the tag from a `latest_universal` file in the directory given to --load. Therefore
+#   --load takes the PARENT directory, never the step directory.
+#
+#   ds_to_universal.py:712 writes `latest_universal` into the parent of its --output_folder. That
+#   file is global to the parent, so converting step 200 would silently repoint a concurrent
+#   step-340 eval. Each job therefore gets a PRIVATE parent under .eval_ucp/<tag>/ holding just a
+#   symlink to the shared converted directory plus its own latest_universal. The conversion is
+#   still shared and done once; only the 2-entry selector directory is per-step.
+#
+# Set USE_UCP=0 to fall back to the --consolidated_load path.
+# ---------------------------------------------------------------------------
+USE_UCP="${USE_UCP:-1}"
+CKPT_PARENT="$(dirname "${CKPT_STEP_DIR}")"
+CKPT_TAG="$(basename "${CKPT_STEP_DIR}")"
+UCP_STEP_DIR="${CKPT_PARENT}/${CKPT_TAG}_universal"
+# PER-JOB, not per-step: `make_ucp_load_root` rewrites this directory from scratch on
+# every job, so two jobs evaluating the same step (a suite submits one job per seqlen
+# group) would rm -rf it under each other -- observed 2026-08-15 as
+# `FileNotFoundError: --load .../.eval_ucp/<tag>` in 8 concurrent jobs whose selector
+# dir was deleted mid-run by a sibling. A lock cannot fix it (the directory must
+# survive the whole job, not just its creation), so give each job its own; it holds
+# one symlink plus a 24-byte file, and is removed when the job exits.
+UCP_LOAD_ROOT="${CKPT_PARENT}/.eval_ucp/${CKPT_TAG}.${SLURM_JOB_ID:-manual}"
+PADDING_SIDE="{{PADDING_SIDE}}"
+LEFT_PAD_FLAG="{{LEFT_PAD_FLAG}}"
+SEQ_LEN_OVERRIDE="{{SEQ_LEN_OVERRIDE}}"
+# Optional 9th EVAL_MAP field. Empty => 0-shot (lm-eval default). The DeepSeekMoE paper reports
+# few-shot numbers, so set this for like-for-like comparison (keep SEQ_LEN=4096 when you do).
+NUM_FEWSHOT="{{NUM_FEWSHOT}}"
+# Filled by submit_eval.py: verbatim extra harness flags (e.g. ruler's --task-metadata-json)
+# and the suite name for provenance. The deprecated autorun_eval.sh does not substitute
+# these, so guard against the raw placeholder surviving.
+EXTRA_EVAL_FLAGS="{{EXTRA_EVAL_FLAGS}}"
+EVAL_SUITE="{{SUITE}}"
+[[ "${EXTRA_EVAL_FLAGS}" == *"{{"* ]] && EXTRA_EVAL_FLAGS=""
+[[ "${EVAL_SUITE}" == *"{{"* ]] && EVAL_SUITE="adhoc"
+export EVAL_SUITE
+
+# Exported (not just assigned) so the eval PROCESS can read them and stamp each result row in
+# eval/results/registry.jsonl. srun uses --export=ALL, which propagates the environment but NOT
+# plain shell variables, so these must be exported explicitly.
+export MODEL_SIZE MOE_TYPE STEP
+
+# ============================================================================
+# Static configuration (does not vary per checkpoint)
+# ============================================================================
+REPO_ROOT=${REPO_ROOT:-/lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE}   # an exported REPO_ROOT (a code snapshot) wins; 2026-09-17
+# 2026-09-17: init.sh prepends the live fork root to PYTHONPATH; a job running from a code snapshot needs the snapshot's fork root
+# (deepspeed, op_builder, accelerator) ahead of it. Exported EVAL_PYTHONPATH_PREFIX (the snapshot root) goes first; unset = unchanged.
+export PYTHONPATH=${EVAL_PYTHONPATH_PREFIX:+${EVAL_PYTHONPATH_PREFIX}:}${PYTHONPATH:-}
+EVAL_DIR=${REPO_ROOT}/examples_elmoe/scripts-frontier/eval
+# Env-overridable (default FORGE). For DeepSeek export before autorun:
+#   export VOCAB_FILE=${REPO_ROOT}/examples_elmoe/data/deepseek_tokenizer/tokenizer.json
+# VOCAB_FILE="${VOCAB_FILE:-${REPO_ROOT}/examples_elmoe/data/FORGE/all_vocab.json}"
+VOCAB_FILE=/lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/examples_elmoe/data/deepseek_tokenizer/tokenizer.json
+DS_CONFIG=${EVAL_DIR}/mvp_ds_config.json
+# Absolute python path — submission shell may or may not have the conda env
+# activated. Hardcoding avoids the `import torch` failure that happens when
+# sbatch is fired from a shell without the env activated.
+# PYTHON_BIN=/lustre/orion/world-shared/gen150/zixianw4/envs/TORCH-ROCM6.4.1_env_v6/bin/python
+PYTHON_BIN=/lustre/orion/world-shared/gen150/zixianw4/envs/TORCH-ROCM6.4.1_env_groupgemm_v5/bin/python   # 2026-10-06: v4 was purged on 2026-10-05, v5 is its rebuild
+# TP shards the DENSE layers only; EP shards the MoE layers; PP shards both across
+# stages. 4 nodes = 32 GCDs = PP4 stages x 8 GCDs, EP8 and TP4 inside a stage.
+# Filled by autorun_eval.sh; EVAL_MP_SIZE stays honoured for the legacy env override.
+MP_SIZE=${EVAL_MP_SIZE:-{{TP_SIZE}}}
+PP_SIZE={{PP_SIZE}}
+# --no-pipeline-parallel selects the non-PipelineModule forward. It must be dropped
+# when PP>1, and dropping it has two consequences the caller must have accepted:
+#   * lm_eval_adapter._use_kv_decode() is gated on this flag, so generation falls back
+#     to the legacy full-reforward loop.
+#   * the response cache's writer is world rank 0 while put_batch() is called only on
+#     the LAST pipeline stage, so with PP>1 nothing is appended to the answer file.
+# Both are tracked in rebuild/template_parallelism.patch's header.
+if [[ ${PP_SIZE} -gt 1 ]]; then NO_PP_FLAG=""; else NO_PP_FLAG="--no-pipeline-parallel"; fi
+GPUS_PER_NODE=$(( TOTAL_GPUS / NODES ))
+
+JOB_DIR=${EVAL_DIR}/logs/job_${SLURM_JOB_ID}_step${STEP}_${MOE_TYPE}_${MODEL_SIZE}_pad${PADDING_SIDE}
+# Centralized: per-job artifacts (slurm.out/err, rank_<N>.log, results.json)
+# all live under ${JOB_DIR}. One job = one directory.
+RESULTS_JSON=${JOB_DIR}/results.json
+mkdir -p "${JOB_DIR}"
+
+# ============================================================================
+# Model architecture — pulled from training's model_registry (single source
+# of truth). Sets HIDDEN_SIZE, FFN_HIDDEN_SIZE, NUM_LAYERS, NUM_ATTN_HEADS,
+# EP_SIZE, topk, SEQ_LEN, KV_HEADS via shell eval.
+# ============================================================================
+CONFIG_VARS=$(python3 ${REPO_ROOT}/examples_elmoe/utils/model_registry.py get_vars --model_size "${MODEL_SIZE}")
+eval "${CONFIG_VARS}"
+
+# Per-entry SEQ_LEN override (optional). If the EVAL_MAP entry supplied a
+# non-empty 8th field, it overrides model_registry's training-time SEQ_LEN
+# (= 4096 for FORGE_10B) for this single eval job only. The override is
+# safe for short-content tasks (piqa/sciq/arc/lambada) — see
+# `_t_padding_length_invariance` probe at eval/tests/test_runtime.py which
+# verifies content scoring doesn't depend on positions >= S/2. Wikitext
+# rolling-windows ARE the seq_length, so changing SEQ_LEN for wikitext
+# changes the eval semantically (different window size = different PPL);
+# keep wikitext at the training-time 4096 unless you know what you're
+# comparing against.
+# Rotary base is REQUIRED (2026-08-29). Previously the template passed no base at
+# all, so megatron's 10,000 default (arguments.py:689) applied unless loader.py's
+# override_args() happened to copy the checkpoint's own value onto the runtime args.
+# That inheritance failed intermittently -- 70 jobs on 2026-08-28 scored lc16k-idoc
+# and sft-16k15b at 10,000 against checkpoints trained at 100,000, interleaved with
+# correct-base jobs the same day. A wrong base does not crash; it silently scores
+# lower. So refuse to start rather than produce a plausible wrong number.
+ROTARY_BASE="{{ROTARY_BASE}}"
+if [[ -z "${ROTARY_BASE}" || ! "${ROTARY_BASE}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "FATAL: ROTARY_BASE is unset or not a number ('${ROTARY_BASE}')."
+    echo "       It must match the value the checkpoint was TRAINED at:"
+    echo "         torch.load('<ckpt>/mp_rank_00_model_states.pt')['args'].rotary_base"
+    echo "       Declare rotary_base=<value> on the run line, or add the run to"
+    echo "       ROTARY_BASE_BY_RUN in eval_lib.py. Never let it default."
+    exit 1
+fi
+echo "  Rotary base       : ${ROTARY_BASE}  (explicit; never megatron's 10000 default)"
+
+if [[ -n "${SEQ_LEN_OVERRIDE}" && "${SEQ_LEN_OVERRIDE}" != "default" ]]; then
+    if [[ "${SEQ_LEN_OVERRIDE}" =~ ^[0-9]+$ ]]; then
+        echo "  [seq-len-override] SEQ_LEN ${SEQ_LEN} -> ${SEQ_LEN_OVERRIDE} (per EVAL_MAP entry)"
+        SEQ_LEN=${SEQ_LEN_OVERRIDE}
+    else
+        echo "FATAL: SEQ_LEN_OVERRIDE='${SEQ_LEN_OVERRIDE}' is not a positive integer"
+        exit 1
+    fi
+fi
+
+echo "============================================================"
+echo "  Eval job"
+echo "  Job ID            : ${SLURM_JOB_ID}"
+echo "  Job log dir       : ${JOB_DIR}"
+echo "  Results JSON      : ${RESULTS_JSON}"
+echo "  Checkpoint dir    : ${CKPT_STEP_DIR}"
+echo "  Consolidated .pt  : ${CONSOLIDATED_LOAD:-<none — using DeepSpeed engine load>}"
+echo "  Step              : ${STEP}"
+echo "  Model size        : ${MODEL_SIZE}    (layers=${NUM_LAYERS}, h=${HIDDEN_SIZE}, ffn=${FFN_HIDDEN_SIZE}, heads=${NUM_ATTN_HEADS}, experts=${EP_SIZE}, topk=${topk}, seq=${SEQ_LEN})"
+echo "  MoE type          : ${MOE_TYPE}"
+echo "  Parallelism       : EP=${EP_PARALLEL_SIZE}, TP=${MP_SIZE}, PP=${PP_SIZE}, DP=$(( TOTAL_GPUS / EP_PARALLEL_SIZE / MP_SIZE / PP_SIZE ))"
+echo "  Task list         : ${TASK_LIST}"
+echo "  Limit flag        : ${LIMIT_FLAG:-<none>}"
+echo "  Micro batch size  : ${MICRO_BATCH_SIZE}"
+echo "  Total GPUs        : ${TOTAL_GPUS} (${NODES} node x ${GPUS_PER_NODE} GCDs)"
+echo "  Node list         : ${SLURM_NODELIST}"
+echo "  Started           : $(date '+%F %T')"
+echo "============================================================"
+
+# ============================================================================
+# Cache exports — all under eval/cache/ to keep training caches untouched
+# ============================================================================
+export HF_HOME=${EVAL_DIR}/cache/hf_home
+export HF_DATASETS_CACHE=${EVAL_DIR}/cache/hf_datasets_cache
+# RULER's SQuAD/Hotpot corpora (disk-cached by our lm-eval patch in ruler/qa_utils.py;
+# warmed from a login node so compute nodes never fetch from the flaky academic hosts)
+export LM_EVAL_RULER_CACHE=${EVAL_DIR}/cache/ruler
+# Job-local extensions dir seeded from a known-good snapshot: the shared
+# lustre dir serialized every eval job through one file_baton build lock,
+# and jobs submitted without the CXX pin kept rewriting build.ninja with the
+# too-old system g++ (2026-08-23 stall). With the seed + pinned CXX, ninja
+# sees up-to-date outputs and no-ops.
+export TORCH_EXTENSIONS_DIR=/tmp/${SLURM_JOB_ID}/torch_extensions
+# Private fused-kernels build dir (same rationale): each job compiles its own
+# ~10-min set instead of queueing on the in-tree shared lock.
+export MEGATRON_FUSED_KERNELS_BUILD_DIR=/tmp/${SLURM_JOB_ID}/fused_kernels_build
+mkdir -p "${MEGATRON_FUSED_KERNELS_BUILD_DIR}"
+mkdir -p "${TORCH_EXTENSIONS_DIR}"
+cp -a ${EVAL_DIR}/cache/torch_extensions_good/. "${TORCH_EXTENSIONS_DIR}/" 2>/dev/null || true
+export TRITON_CACHE_DIR=${EVAL_DIR}/cache/triton_cache
+mkdir -p "${HF_HOME}" "${HF_DATASETS_CACHE}" "${TORCH_EXTENSIONS_DIR}" "${TRITON_CACHE_DIR}"
+# /tmp is NODE-LOCAL: on multi-node (TP>1) jobs the batch-shell mkdir above
+# only exists on node 0; ranks elsewhere crash touching the build lock
+# (job 5336680). Create the private dirs + seed on EVERY node.
+if [ "${NODES}" -gt 1 ]; then
+  srun --ntasks=${NODES} --ntasks-per-node=1 bash -c \
+    "mkdir -p '${TORCH_EXTENSIONS_DIR}' '${MEGATRON_FUSED_KERNELS_BUILD_DIR}' && cp -a ${EVAL_DIR}/cache/torch_extensions_good/. '${TORCH_EXTENSIONS_DIR}/' 2>/dev/null || true"
+fi
+
+# ============================================================================
+# OLCF outbound proxy so HF can reach datasets-server.huggingface.co
+# (commented offline flags become useful once datasets are cached)
+# ============================================================================
+export http_proxy=http://proxy.ccs.ornl.gov:3128
+export https_proxy=http://proxy.ccs.ornl.gov:3128
+export no_proxy=localhost,127.0.0.1,.ccs.ornl.gov,.olcf.ornl.gov
+# export HF_DATASETS_OFFLINE=1
+# export TRANSFORMERS_OFFLINE=1
+
+# ============================================================================
+# Frontier networking / NCCL / FI — values matched verbatim to training side
+# ============================================================================
+export HIGH_SPEED_INTERFACE=hsn0
+export NCCL_SOCKET_IFNAME=hsn0
+export FI_MR_CACHE_MONITOR=userfaultfd
+export FI_CXI_DEFAULT_CQ_SIZE=131072
+export FI_CXI_RX_MATCH_MODE=hybrid
+export OMP_NUM_THREADS=1
+export TRITON_PTXAS_NUM_WORKERS=1
+export NCCL_TIMEOUT=1200
+export NCCL_TIMEOUT_MS=1200000
+export TORCH_NCCL_BLOCKING_WAIT=1
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_ASYNC_ERROR_HANDLING=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# PyTorch 2.x renamed this; the CUDA_ name now only prints a deprecation
+# warning and is IGNORED, which is why 32k jobs still showed ~11.5 GiB
+# reserved-but-unallocated fragmentation and OOMd needing 6.11 GiB with
+# 5.29 GiB free (job 5345910, 2026-08-26). Set the current name too.
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+export NCCL_DEBUG=WARN
+
+# ============================================================================
+# MoE-type branch — matches the case block in ../frontier_elmoe.slurm.template
+# Produces ${moe_options}, exported env vars, and any backend-specific flags
+# ============================================================================
+moe_options=""
+case "${MOE_TYPE}" in
+    X-MOE|ELMOE-3D)
+        moe_options="--use-uneven-all-to-all --use-pft"
+        ;;
+    ELMOE-GroupedGEMM-triton)
+        moe_options="--use-uneven-all-to-all --use-pft --use-groupedGEMM --use-triton"
+        export USE_TRITON_GROUPGEMM=True
+        ;;
+    ELMOE-GroupedGEMM-primus)
+        moe_options="--use-uneven-all-to-all --use-pft --use-groupedGEMM --no-bias-gelu-fusion --disable-bias-linear"
+        export USE_AITER_GROUPGEMM=True
+        ;;
+    *)
+        echo "FATAL: unsupported MOE_TYPE='${MOE_TYPE}' for eval template"
+        exit 1
+        ;;
+esac
+
+# ============================================================================
+# Robust MASTER_ADDR discovery — identical pattern to training template
+# ============================================================================
+readarray -t arr < <(scontrol show hostnames "${SLURM_NODELIST}")
+master_node=${arr[0]}
+export MASTER_ADDR=$(ssh "${master_node}" "ip -4 addr show ${HIGH_SPEED_INTERFACE} | grep 'inet' | awk '{print \$2}' | cut -d/ -f1 | head -n1")
+if [[ -z "${MASTER_ADDR}" ]]; then
+    echo "FATAL: Could not determine MASTER_ADDR on ${master_node} for ${HIGH_SPEED_INTERFACE}"
+    exit 1
+fi
+export MASTER_PORT=29500
+echo "  MASTER_NODE       : ${master_node}"
+echo "  MASTER_ADDR       : ${MASTER_ADDR}"
+echo "  MASTER_PORT       : ${MASTER_PORT}"
+
+# ============================================================================
+# Pre-flight checks — fail fast with clear messages
+# ============================================================================
+# 2026-10-07: a step whose ZeRO save was deleted after its universal conversion (the 128k chain's retention rule) is loaded from
+# the complete universal directory alone; the step directory is then not required (eval_lib.weights_dir validated the same way).
+if [[ "${USE_UCP}" == "1" && ! -d "${CKPT_STEP_DIR}" && -f "${UCP_STEP_DIR}/zero/optimizer_state.pt" ]]; then
+    echo "  Checkpoint dir    : ${CKPT_STEP_DIR} absent; its universal copy ${UCP_STEP_DIR} is complete and is the weight source"
+else
+[[ -d "${CKPT_STEP_DIR}" ]] || { echo "FATAL: checkpoint missing: ${CKPT_STEP_DIR}"; exit 1; }
+[[ -f "${CKPT_STEP_DIR}/mp_rank_00_model_states.pt" ]] || { echo "FATAL: mp_rank_00_model_states.pt not found in ${CKPT_STEP_DIR}"; exit 1; }
+fi
+# USE_UCP=0 means exactly one thing: load the consolidated flat .pt. There is no third
+# "raw DeepSpeed step directory" path -- engine.load_checkpoint() resolves its tag from a
+# latest* file, which a bare global_step<N>/ directory does not have, and the old tag='.'
+# workaround only ever worked because the layouts happened to match. Reject the ambiguous
+# combination here rather than fail later inside the harness.
+if [[ "${USE_UCP}" != "1" ]]; then
+    if [[ -z "${CONSOLIDATED_LOAD}" ]]; then
+        echo "FATAL: USE_UCP=0 requires CONSOLIDATED_LOAD to be set (it is empty)."
+        echo "       Either leave USE_UCP unset to use the universal-checkpoint path, or supply a"
+        echo "       consolidated .pt via the EVAL_MAP entry."
+        exit 1
+    fi
+    [[ -f "${CONSOLIDATED_LOAD}" ]] || { echo "FATAL: consolidated .pt missing: ${CONSOLIDATED_LOAD}"; echo "       Generate with: python eval/xmoe_consolidate.py --input_folder ${CKPT_STEP_DIR} --output_path ${CONSOLIDATED_LOAD}"; exit 1; }
+fi
+[[ -f "${VOCAB_FILE}" ]] || { echo "FATAL: vocab file missing: ${VOCAB_FILE}"; exit 1; }
+[[ -f "${REPO_ROOT}/tasks/eval_harness/evaluate_v04.py" ]] || { echo "FATAL: evaluate_v04.py missing"; exit 1; }
+[[ -f "${DS_CONFIG}" ]] || { echo "FATAL: DS config missing: ${DS_CONFIG}"; exit 1; }
+echo "  Pre-flight        : OK"
+echo "============================================================"
+
+# ============================================================================
+# Universal-checkpoint conversion (idempotent)
+#
+# Adapted from convert_to_universal() in frontier_elmoe.slurm_0623_2026.template:554.
+# That one resolves its tag from <parent>/latest; the eval targets an explicit step, so this
+# takes the step directory directly. Same checks, same ds_to_universal invocation.
+#
+# Runs once per checkpoint: a completed conversion is detected and reused, so repeat evals of
+# the same step pay nothing.
+# ============================================================================
+ensure_universal() {
+    # Serialize across JOBS. Several eval jobs of the same step start together (a suite
+    # is submitted as one job per seqlen group); without a lock each one sees "no
+    # universal dir", each rm -rf's and converts into the SAME out_dir, and the
+    # interleaved merges produce empty atom slices -- observed 2026-08-15 as
+    # `IndexError: list index out of range` at ds_to_universal.py:387 (merge_tp_slices)
+    # in three concurrent jobs. The first holder converts; the rest block, then take the
+    # reuse path below. flock releases automatically if the holder dies, so a killed
+    # conversion cannot wedge the queue.
+    local out_dir="$2"
+    local lock="${out_dir}.convert.lock"
+    mkdir -p "$(dirname "${lock}")"
+    exec {ucp_lock_fd}>"${lock}"
+    flock "${ucp_lock_fd}"
+    _ensure_universal_locked "$@"
+    local lrc=$?
+    flock -u "${ucp_lock_fd}"; exec {ucp_lock_fd}>&-
+    return ${lrc}
+}
+
+_ensure_universal_locked() {
+    local step_dir="$1" out_dir="$2"
+    local workers_extract="${UCP_WORKERS_EXTRACT:-8}"
+    local workers_merge="${UCP_WORKERS_MERGE:-8}"
+    local n_atoms rc n_existing=0
+
+    # Reuse only if all three hold, matching the training template's test:
+    #   1. zero/optimizer_state.pt exists  -- the merge phase ran to completion
+    #   2. no tmp/ left behind             -- extraction was not interrupted
+    #   3. at least one atom directory     -- guards an empty zero/ from a killed job
+    [[ -d "${out_dir}/zero" ]] && \
+        n_existing=$(find "${out_dir}/zero" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+    if [[ -f "${out_dir}/zero/optimizer_state.pt" && ! -d "${out_dir}/tmp" && ${n_existing} -gt 0 ]]; then
+        if [[ -n "${UCP_FORCE:-}" ]]; then
+            echo "  UCP               : ${out_dir} exists (${n_existing} atoms) but UCP_FORCE=1 -- reconverting"
+        else
+            echo "  UCP               : reusing ${out_dir} (${n_existing} atoms)"
+            return 0
+        fi
+    fi
+    if [[ -d "${out_dir}" ]]; then
+        # A surviving tmp/ or a missing optimizer_state.pt means the merge phase never finished.
+        # Resuming from a partially populated zero/ dies on the first missing atom, so redo it.
+        echo "  UCP               : found INCOMPLETE ${out_dir} -- reconverting"
+        rm -rf "${out_dir}"
+    fi
+
+    echo "================ Universal Checkpoint conversion ================"
+    echo "  input   : ${step_dir}"
+    echo "  output  : ${out_dir}"
+    echo "  workers : extract=${workers_extract} merge=${workers_merge}"
+    echo "  started : $(date '+%F %T')"
+    mkdir -p "${out_dir}"
+    # Atom files are large and written sequentially: stripe so the merge is not served by one OST.
+    lfs setstripe -c 8 -S 4M "${out_dir}" 2>/dev/null || echo "  (lfs setstripe unavailable; continuing)"
+
+    srun -N1 -n1 -c 32 ${PYTHON_BIN} -m deepspeed.checkpoint.ds_to_universal \
+        --input_folder  "${step_dir}" \
+        --output_folder "${out_dir}" \
+        --num_extract_workers "${workers_extract}" \
+        --num_merge_workers   "${workers_merge}"
+    rc=$?
+    [[ ${rc} -eq 0 ]] || { echo "FATAL: ds_to_universal exited ${rc}."; return ${rc}; }
+
+    if [[ ! -f "${out_dir}/zero/optimizer_state.pt" || -d "${out_dir}/tmp" ]]; then
+        echo "FATAL: conversion did not complete cleanly (tmp/ present or optimizer_state.pt missing)."
+        return 1
+    fi
+    n_atoms=$(find "${out_dir}/zero" -mindepth 1 -maxdepth 1 -type d | wc -l)
+    echo "  finished: $(date '+%F %T')   atoms: ${n_atoms}"
+    echo "================================================================"
+    return 0
+}
+
+# Build the private selector directory this job passes to --load. Two entries:
+#   <root>/<tag>_universal   symlink -> the shared converted directory
+#   <root>/latest_universal  the tag DeepSpeed should resolve
+# Written fresh every job so a stale symlink from a moved checkpoint can never be followed.
+make_ucp_load_root() {
+    local root="$1" out_dir="$2" tag="$3"
+    rm -rf "${root}"
+    mkdir -p "${root}"
+    ln -s "${out_dir}" "${root}/${tag}_universal" || return 1
+    printf '%s\n' "${tag}_universal" > "${root}/latest_universal" || return 1
+    echo "  UCP load root     : ${root}  (latest_universal -> ${tag}_universal)"
+    return 0
+}
+
+# A weights-only checkpoint (e.g. the HF-imported base model) has no ZeRO optimizer
+# files, and ds_to_universal refuses it by design. Fall back to the direct DeepSpeed
+# load, which needs only mp_rank_* / expert model_states at the checkpoint's own EP.
+if [[ "${USE_UCP}" == "1" && -d "${CKPT_STEP_DIR}" ]] && ! compgen -G "${CKPT_STEP_DIR}/*zero_pp_rank_*" >/dev/null; then   # 2026-10-07: an absent step dir with a complete universal copy is the UCP path, not weights-only
+    echo "  UCP               : ${CKPT_STEP_DIR} is weights-only (no ZeRO files) -- direct DeepSpeed load"
+    USE_UCP=0
+fi
+
+if [[ "${USE_UCP}" == "1" ]]; then
+    ensure_universal    "${CKPT_STEP_DIR}" "${UCP_STEP_DIR}"            || exit 1
+    make_ucp_load_root  "${UCP_LOAD_ROOT}" "${UCP_STEP_DIR}" "${CKPT_TAG}" || exit 1
+    # NO exit-trap cleanup here: bash subshells inherit EXIT traps, so the monitor
+    # subshell's exit would delete this directory while the eval is still loading from
+    # it (observed 2026-08-15: 6 jobs died with "has no latest_universal" on their OWN
+    # per-job selector). The directory holds a symlink plus a 24-byte file; stale ones
+    # are pruned below on the next job for the same step.
+    find "${CKPT_PARENT}/.eval_ucp" -maxdepth 1 -name "${CKPT_TAG}.*" -type d -mmin +720 \
+        -exec rm -rf {} + 2>/dev/null || true
+fi
+
+# ============================================================================
+# Megatron / data option groups (mirroring training template style)
+# ============================================================================
+# Weight source. UCP addresses parameters by NAME (one folder per parameter), so the eval may run
+# at any DP/TP/PP/EP. The consolidated .pt remains as an explicit fallback (USE_UCP=0).
+consolidated_flag=""
+if [[ "${USE_UCP}" == "1" ]]; then
+    LOAD_DIR="${UCP_LOAD_ROOT}"
+    UCP_FLAG="--universal-checkpoint"
+else
+    UCP_FLAG=""
+    if [[ -n "${CONSOLIDATED_LOAD}" ]]; then
+        LOAD_DIR="${CKPT_STEP_DIR}"
+        consolidated_flag="--consolidated_load ${CONSOLIDATED_LOAD}"
+    else
+        # Plain DeepSpeed engine load: --load takes the PARENT dir and the engine reads
+        # its `latest` tag file, so that tag must name the step this job was asked for.
+        LOAD_DIR="${CKPT_PARENT}"
+        [[ "$(cat "${CKPT_PARENT}/latest" 2>/dev/null)" == "${CKPT_TAG}" ]] || {
+            echo "FATAL: plain DeepSpeed load needs ${CKPT_PARENT}/latest to name ${CKPT_TAG}"; exit 1; }
+    fi
+fi
+echo "  Weight source     : $([ "${USE_UCP}" == "1" ] && echo "UCP ${UCP_STEP_DIR}" || echo "consolidated ${CONSOLIDATED_LOAD}")"
+echo "  --load            : ${LOAD_DIR}"
+
+megatron_options=" \
+        --tensor-model-parallel-size ${MP_SIZE} \
+        --pipeline-model-parallel-size ${PP_SIZE} \
+        ${NO_PP_FLAG} \
+        --moe-expert-parallel-size ${EP_PARALLEL_SIZE} \
+        --num-experts ${EP_SIZE} \
+        --topk ${topk} \
+        --moe-eval-capacity-factor ${MOE_EVAL_CAP:-1.5} \
+        ${MOE_DROP_FLAG:---disable-moe-token-dropping} \
+        --create-moe-param-group \
+        --use-rotary-position-embeddings \
+        --rotary-base ${ROTARY_BASE} \
+        ${ATTN_FLAGS:---use-flash-attn-v2} \
+        --micro-batch-size ${MICRO_BATCH_SIZE} \
+        --seq-length ${SEQ_LEN} \
+        --max-position-embeddings ${SEQ_LEN} \
+        --hidden-size ${HIDDEN_SIZE} \
+        --ffn-hidden-size ${FFN_HIDDEN_SIZE} \
+        --num-layers ${NUM_LAYERS} \
+        --num-attention-heads ${NUM_ATTN_HEADS} \
+        --bf16 \
+        --train-iters 1 --lr 0.0 \
+        --no-load-optim --no-load-rng \
+        --finetune \
+        --load ${LOAD_DIR} \
+        ${UCP_FLAG} \
+        --no-bias-gelu-fusion \
+        ${ARCH_FLAGS:-} \
+        ${LEFT_PAD_FLAG} \
+        ${moe_options}"
+# ${ARCH_FLAGS}: model_registry get_vars (eval'd above) emits the architecture
+# flags a model needs -- rmsnorm, --disable-bias-linear, --swiglu, --untie...,
+# --num-shared-experts, --first-k-dense-replace, --dense-ffn-hidden-size,
+# --softmax-before-topk, --layernorm-epsilon, --eod-token. Empty for FORGE_10B
+# (no arch fields) so existing evals are byte-identical; populated for DeepSeek_16B
+# so the eval model matches the converted checkpoint (else load fails with missing keys).
+# --no-bias-gelu-fusion: disables the torch.jit.script fused-bias-gelu kernel
+# which on PyTorch+ROCm tries to emit CUDA-style `__nv_bfloat16` source that
+# HIP's `comgr` compiler rejects. Math is identical, ~10-20% slower per layer.
+# Training works without this flag only because it warms the kernel via a
+# cached compile path that we can't easily replicate at eval startup.
+# --use-left-pad-eval (set by autorun via LEFT_PAD_FLAG): opt-in left-pad
+# path. When the flag is present the rotary uses position_ids and the Flash
+# attention path strips padding via varlen API. When absent (default), the
+# codebase behaves bitwise as the pre-patch fork — training and right-pad
+# eval are unchanged.
+
+data_options=" \
+        --tokenizer-type HFTokenizer \
+        --vocab-file ${VOCAB_FILE}"
+
+deepspeed_options=" \
+        --deepspeed --deepspeed_config ${DS_CONFIG}"
+
+
+# Runtime-suite gate, decided from SEQ_LEN (baked, no env ride-along). Several tests do
+# full-pad_to forwards; each TP logits all-gather is seq x vocab x 2B PER TEST and they
+# accumulate: at seq 65536 that is 12.25 GiB/gather on top of ~43 GiB already held, which
+# OOM'd every 64k job at mappings.py:82 (5382561/5382562) AFTER the softmax fix. The suite
+# still runs on every row below 64k, so per-checkpoint coverage is retained by the short
+# rows of the same job family.
+if [ "${SEQ_LEN}" -ge 65536 ]; then
+    CORRECTNESS_TESTS_FLAG=""
+    echo "correctness tests: SKIPPED (SEQ_LEN=${SEQ_LEN} >= 65536; gather accumulation OOM)"
+else
+    CORRECTNESS_TESTS_FLAG="--correctness_tests"
+fi
+# Fragmentation relief for the remaining single big gather in the scoring/gen path.
+# Both names: ROCm torch honors the CUDA_ name (its own OOM message asks for it);
+# the HIP_ alias is kept for builds that prefer it.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
+
+eval_options=" \
+        ${consolidated_flag} \
+        --task_list ${TASK_LIST} \
+        --results_path ${RESULTS_JSON} \
+        --ckpt-step-dir ${CKPT_STEP_DIR} \
+        --padding-side ${PADDING_SIDE} \
+        ${CORRECTNESS_TESTS_FLAG} \
+        --lm-eval-response-cache \
+        ${LIMIT_FLAG} \
+        ${EXTRA_EVAL_FLAGS}"
+
+# Few-shot (optional). --num_fewshot already exists in evaluate_v04.py and is passed straight to
+# lm-eval's simple_evaluate; this just makes it reachable from the EVAL_MAP entry.
+if [[ -n "${NUM_FEWSHOT}" ]]; then
+    eval_options="${eval_options} --num_fewshot ${NUM_FEWSHOT}"
+    echo "  [few-shot] num_fewshot=${NUM_FEWSHOT}"
+fi
+
+# deepseek-moe-verify debug hooks. Any of these makes the job forward a fixed probe input and
+# EXIT before lm-eval (reuses the full, working eval load path). Set via `export` before autorun:
+#   DUMP_COMPARE_REF=/path/hf_acts.pt  -> forward the SAME ids stored in that HF reference (from
+#       hf_dump.py) through our framework and print a per-layer HF-vs-framework divergence report
+#       INLINE in rank_0.log (no copy-paste ids, no separate compare.py). This is the one-shot
+#       "what goes sideways" debug path.
+#   DUMP_ACTIVATIONS=/path/fw_acts.pt  -> also SAVE the framework per-layer tensors to this .pt
+#       (for offline compare.py / re-inspection). Optional; the inline report needs only the ref.
+#   DUMP_IDS=100000,549,...            -> force explicit ids (else taken from DUMP_COMPARE_REF).
+# Each flag is appended only when its var is set, so an unset DUMP_IDS never leaves a dangling
+# `--dump-ids` with no value.
+# NO_KV_DECODE=1 -> force the legacy full-reforward generation loop (the KV-decode
+# equivalence oracle). Env-gated like the DUMP_* hooks; unset = KV decode (default).
+if [ -n "${NO_KV_DECODE:-}" ]; then
+    eval_options="${eval_options} --no-kv-decode"
+fi
+if [ -n "${DUMP_COMPARE_REF:-}" ]; then
+    eval_options="${eval_options} --dump-compare-ref ${DUMP_COMPARE_REF}"
+fi
+if [ -n "${DUMP_ACTIVATIONS:-}" ]; then
+    eval_options="${eval_options} --dump-activations ${DUMP_ACTIVATIONS}"
+fi
+if [ -n "${DUMP_IDS:-}" ]; then
+    eval_options="${eval_options} --dump-ids ${DUMP_IDS}"
+fi
+#   DUMP_PAD=4096 -> forward the ref ids RIGHT-PADDED to 4096, compare only content positions.
+#       Reproduces the real eval's padded regime so a padding/varlen-only bug (causal_mask_sanity)
+#       is isolated. Only meaningful together with DUMP_COMPARE_REF.
+if [ -n "${DUMP_PAD:-}" ]; then
+    eval_options="${eval_options} --dump-pad ${DUMP_PAD}"
+fi
+#   DUMP_SUBLAYERS="0,1" [+ DUMP_SUBLAYERS_OUT=/path.pt] -> capture OP-LEVEL tensors (ln1/qkv/
+#       rope/ctx/attn_out/ln2/mlp/router) for those layers and exit, for op-by-op HF-vs-framework
+#       localization (pair with sublayer_hf.py + sublayer_compare.py). Uses DUMP_IDS for the input.
+if [ -n "${DUMP_SUBLAYERS:-}" ]; then
+    eval_options="${eval_options} --dump-sublayers ${DUMP_SUBLAYERS}"
+fi
+if [ -n "${DUMP_SUBLAYERS_OUT:-}" ]; then
+    eval_options="${eval_options} --dump-sublayers-out ${DUMP_SUBLAYERS_OUT}"
+fi
+# --lm-eval-response-cache: the adapter's resumable per-request cache
+# (tasks/eval_harness/megatron_ds_eval/cache.py). Append-only JSONL at
+# eval/cache/responses/<run>__<step>_m<mtime>_code<fp>_<src>_pad<side>_seq<S>_fs<N>.jsonl,
+# flushed after EVERY computed batch: a walltime kill loses at most one batch, and the
+# next job over the same checkpoint+config resumes exactly where this one stopped (this is
+# what makes 2h-chained jobs lossless). Identity comes from --ckpt-step-dir + the weights
+# file's mtime + code_fp, so it survives re-runs and auto-invalidates on a re-converted
+# checkpoint or a forward-relevant code change. Safe to delete a .jsonl to force re-eval.
+# (The old sqlite files in eval/cache/lm_eval_responses/ are dead -- deletable.)
+# --correctness_tests: runs the runtime probe suite at eval/tests/test_runtime.py
+# immediately after model load (~30s). Catches NaN/Inf, causal-mask leaks,
+# position-id drift, degenerate softmax — anything that would silently corrupt
+# scoring. The probes run BEFORE lm_eval.simple_evaluate so a broken pipeline
+# fails fast instead of after a 3-hour eval.
+# --adaptive_seq_len was REMOVED:
+#   With adaptive seq len, lm-eval bucket-packs each window to its natural
+#   length. The rotary apply at megatron/model/rotary_pos_embedding.py:55
+#   multiplies query/key (seq_len = natural) with a freqs table sized for
+#   args.max_position_embeddings (= 4096). When the two don't match we get
+#   `RuntimeError: tensor a (1382) must match tensor b (4096) at dim 0`.
+#   Without --adaptive_seq_len, every input is padded to args.seq_length
+#   (4096) and the forward operates in the same regime training did.
+#   Slower per-batch but correct. (Re-enable later only after auditing the
+#   rotary code path for input-length-slicing support.)
+
+# ============================================================================
+# Launch — single srun, no deepspeed CLI. Mirrors training srun pattern.
+# ============================================================================
+echo "--- Python interpreter: ${PYTHON_BIN}"
+${PYTHON_BIN} -c "import sys, torch; print(f'  python {sys.version.split()[0]}, torch {torch.__version__}')" || { echo "FATAL: ${PYTHON_BIN} cannot import torch"; exit 1; }
+echo "--- Launching srun ${PYTHON_BIN} tasks/eval_harness/evaluate_v04.py ---"
+echo "--- Started at: $(date '+%F %T') ---"
+
+# ============================================================================
+# Async GPU/stall monitor — same body as ../frontier_elmoe.slurm.template
+# (monitor_run.sh, one dir up). Backgrounded so it never blocks the eval srun.
+# MON_PROC_MATCH points it at the eval process (evaluate_v04.py) instead of the
+# training launcher. Writes ${JOB_DIR}/a-monitor.txt (per-interval state histogram
+# across all ranks + WATTS/HBM%/RAM + frozen/odd counts + culprit stack) and
+# ${JOB_DIR}/monitor/ (per-node tables + monitor.tsv). Needs ~/.local/bin/py-spy.
+# Cadence: every MON_FAST s for the first MON_WINDOW s, then every MON_SLOW s.
+# ============================================================================
+MONITOR_SCRIPT="$(dirname "${EVAL_DIR}")/monitor_run.sh"
+MON_FAST=120; MON_SLOW=240; MON_WINDOW=600; MON_TRACE_FRAMES=20
+export MON_PROC_MATCH=evaluate_v04.py
+if [[ -f "${MONITOR_SCRIPT}" ]]; then
+    bash "${MONITOR_SCRIPT}" "${JOB_DIR}" "${MON_FAST}" "${MON_SLOW}" "${MON_WINDOW}" "${MON_TRACE_FRAMES}" &
+    MONITOR_PID=$!
+    trap 'kill ${MONITOR_PID} 2>/dev/null' EXIT
+    echo "[monitor] pid ${MONITOR_PID} -> ${JOB_DIR}/ (a-monitor.txt summary + monitor/; sampling ${MON_PROC_MATCH}; ${MON_FAST}s for first ${MON_WINDOW}s, then ${MON_SLOW}s)"
+else
+    echo "[monitor] SKIPPED — ${MONITOR_SCRIPT} not found"
+fi
+
+{{LAUNCH}}
+
+RC=$?
+echo "--- Finished at: $(date '+%F %T') ---"
+echo "  srun exit code    : ${RC}"
+echo "  Result file       : ${RESULTS_JSON}"
+echo "============================================================"
+
+# ============================================================================
+# Result summary (always run, even on failure, so slurm.out tells the story)
+# ============================================================================
+if [[ -f "${RESULTS_JSON}" ]]; then
+    echo
+    echo "===== results JSON ====="
+    cat "${RESULTS_JSON}"
+else
+    echo "results.json NOT produced — inspect ${JOB_DIR}/rank_0.log for traceback"
+fi
+
+# Regenerate the human-readable result tables (eval/results/tables/<run>.md|.csv) from the
+# registry. Stdlib-only, seconds, and never allowed to fail the job.
+${PYTHON_BIN} ${EVAL_DIR}/render_results.py --quiet || true
+
+exit ${RC}

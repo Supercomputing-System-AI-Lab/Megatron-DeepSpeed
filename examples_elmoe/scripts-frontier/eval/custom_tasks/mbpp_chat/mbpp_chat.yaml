@@ -1,0 +1,23 @@
+task: mbpp_chat
+dataset_path: google-research-datasets/mbpp
+dataset_name: full
+test_split: test
+output_type: generate_until
+doc_to_text: !function utils.doc_to_text
+doc_to_target: ""
+process_results: !function utils.process_results
+generation_kwargs:
+  until:
+    - "User:"
+  do_sample: false
+  max_gen_toks: 512
+metric_list:
+  - metric: pass_at_1
+    aggregation: mean
+    higher_is_better: true
+  - metric: nonempty
+    aggregation: mean
+    higher_is_better: true
+num_fewshot: 0
+metadata:
+  version: 1.0
