@@ -169,13 +169,24 @@ def check_adlr_autoresume_termination(iteration, model,
         sys.exit(0)
 
 
+_LTOR_MASK_CACHE = {}   # (seq_length, device) -> the plain causal [1, 1, s, s] bool mask, built once per process (see below)
+
+
 def get_ltor_masks_and_position_ids(data,
                                     eod_token,
                                     reset_position_ids,
                                     reset_attention_mask,
                                     eod_mask_loss,
                                     skip_mask=False):
-    """Build masks and position id for left to right model."""
+    """Build masks and position id for left to right model.
+
+    The attention mask (2026-09-19): without --reset-attention-mask the causal mask does not depend on the data, so it is
+    built ONCE per (seq_length, device) and reused (upstream Megatron-LM caches it per dataset object the same way,
+    gpt_dataset.py masks_and_position_ids_are_cacheable). It is built directly as bool (s^2 bytes) instead of an fp32
+    ones tensor (s^2 x 4 bytes: 4.3 GB and 5.6 s per call at 32k on one host core, the PL4 profile). With
+    --reset-attention-mask the mask is per sample (document blocks) and is built as before. The cached tensor is shared:
+    callers must not modify it in place (none does; the pipe engine clones its inputs).
+    """
 
     # Extract batch size and sequence length.
     micro_batch_size, seq_length = data.size()
@@ -187,9 +198,18 @@ def get_ltor_masks_and_position_ids(data,
         att_mask_batch = 1
 
     attention_mask = None
-    if not skip_mask:
+    if not skip_mask and reset_attention_mask:
         attention_mask = torch.tril(torch.ones(
             (att_mask_batch, seq_length, seq_length))).view(att_mask_batch, 1, seq_length, seq_length)
+    elif not skip_mask:
+        key = (seq_length, str(data.device))
+        attention_mask = _LTOR_MASK_CACHE.get(key)
+        if attention_mask is None:
+            # True above the diagonal (= the old tril(ones) < 0.5), as bool from the start
+            attention_mask = torch.triu(torch.ones((seq_length, seq_length), dtype=torch.bool), diagonal=1)
+            attention_mask = attention_mask.view(1, 1, seq_length, seq_length).to(data.device)
+            _LTOR_MASK_CACHE.clear()                 # one length at a time: never two s^2 masks in memory
+            _LTOR_MASK_CACHE[key] = attention_mask
 
     # Loss mask.
     loss_mask = torch.ones(data.size(), dtype=torch.float, device=data.device)
@@ -226,8 +246,8 @@ def get_ltor_masks_and_position_ids(data,
                     position_ids[b, (i + 1):] -= (i + 1 - prev_index)
                     prev_index = i + 1
 
-    # Convert attention mask to binary:
-    if not skip_mask:
+    # Convert attention mask to binary (the per-sample path; the cached path is already bool on the device):
+    if not skip_mask and reset_attention_mask:
         attention_mask = (attention_mask < 0.5)
         attention_mask = attention_mask.to(data.device)
 

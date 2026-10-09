@@ -224,6 +224,12 @@ def model_provider(pre_process=True, post_process=True):
             # args.attn_mask routes EmbeddingPipe to forward the activation.
             if args.intra_document_attention:
                 attention_mask = None
+            elif args.use_flash_attn:
+                # [2026-09-19] flash attention takes the causal flag and never reads a mask tensor (deepseek_v3/attention.py
+                # _flash_attention, transformer.py FlashSelfAttention); the layers still expect a tensor in the slot, so the
+                # constant is the one-element bool placeholder the layers already accept (ParallelTransformerLayerPipe.forward)
+                # instead of the [1, 1, s, s] bool constant of s^2 bytes per rank (1 GiB at 32k, 64 GiB at 256k).
+                attention_mask = torch.zeros(1, dtype=torch.bool, device=get_accelerator().current_device_name())
             else:
                 attention_mask = torch.tril(torch.ones(
                     (1, args.seq_length, args.seq_length), device=get_accelerator().current_device_name())).view(
@@ -468,7 +474,8 @@ def get_batch(data_iterator):
 
     #ADDED
     # Get the masks and postition ids.
-    skip_mask = args.use_flash_attn or args.use_flash_attn_triton
+    # no dense mask under flash, or when --no-create-attention-mask-in-dataloader is on (arguments.py turns it off wherever the mask is unread)
+    skip_mask = args.use_flash_attn or args.use_flash_attn_triton or not args.create_attention_mask_in_dataloader
     attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
         tokens,
         tokenizer.eod,
@@ -501,27 +508,27 @@ def get_batch(data_iterator):
     # (sequence_parallel/cross_entropy.py) returns [S, B] per-token losses and its backward re-slices this rank's window.
     seq_parallel_world_size = mpu.get_sequence_parallel_world_size()
     seq_parallel_world_rank = mpu.get_sequence_parallel_rank()
-
-    # For Megatron's sequence parallel
-    if args.sequence_parallel:
-        seq_parallel_world_size = mpu.get_tensor_model_parallel_world_size()
-        seq_parallel_world_rank = mpu.get_tensor_model_parallel_rank()
     seq_length = tokens.size(1)
-
-    assert seq_length % seq_parallel_world_size == 0
-    sub_seq_length = seq_length // seq_parallel_world_size
-    sub_seq_start = seq_parallel_world_rank * sub_seq_length
-    sub_seq_end = (seq_parallel_world_rank + 1) * sub_seq_length
-
-    tokens = tokens[:, sub_seq_start:sub_seq_end]
-    position_ids = position_ids[:, sub_seq_start:sub_seq_end]
-    # For DS's sequence parallel
-    if mpu.get_sequence_parallel_world_size() > 1:
+    if seq_parallel_world_size > 1:
+        assert seq_length % seq_parallel_world_size == 0
+        sub_seq_length = seq_length // seq_parallel_world_size
+        sub_seq_start = seq_parallel_world_rank * sub_seq_length
+        sub_seq_end = (seq_parallel_world_rank + 1) * sub_seq_length
+        tokens = tokens[:, sub_seq_start:sub_seq_end]
+        position_ids = position_ids[:, sub_seq_start:sub_seq_end]
         labels = labels[:, sub_seq_start:sub_seq_end]
-        # loss_mask stays FULL-length: vocab_sequence_parallel_cross_entropy
-        # all-gathers the per-shard losses back to [S, B] (cross_entropy.py:28)
-        # and its backward re-slices to this rank's window, so loss_func sees
-        # full-sequence losses and needs the full-sequence mask.
+        seq_length = tokens.size(1)
+
+    # For Megatron's sequence parallel (the companion of TP): the TP shard of what this rank holds
+    if args.sequence_parallel:
+        tp_world_size = mpu.get_tensor_model_parallel_world_size()
+        tp_rank = mpu.get_tensor_model_parallel_rank()
+        assert seq_length % tp_world_size == 0
+        sub_seq_length = seq_length // tp_world_size
+        sub_seq_start = tp_rank * sub_seq_length
+        sub_seq_end = (tp_rank + 1) * sub_seq_length
+        tokens = tokens[:, sub_seq_start:sub_seq_end]
+        position_ids = position_ids[:, sub_seq_start:sub_seq_end]
 
     return tokens, labels, loss_mask, attention_mask, position_ids
 
@@ -586,7 +593,23 @@ def get_batch_pipe(data):
         position_ids = torch.arange(tokens.shape[1], dtype=torch.long,
                                     device=tokens.device)
         position_ids = position_ids.unsqueeze(0).expand_as(tokens).contiguous()
+    elif not args.create_attention_mask_in_dataloader:
+        # [2026-09-19] The pipeline path never reads a per-micro-batch mask: EmbeddingPipe drops it (language_model.py) and
+        # every layer takes the constant args.attn_mask, so the dense [1, 1, s, s] build (s^2 x 4 bytes on the host, 4.3 GB and
+        # 5.6 s per micro-batch at 32k: the PL4 profile) is skipped. arguments.py turns the flag off on this path. A one-element
+        # bool placeholder keeps the pipe's 3-tuple contract (every slot must be a tensor; the layers already accept it, see
+        # ParallelTransformerLayerPipe.forward). The loss mask and the position ids come from the same builder as before.
+        attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
+            tokens,
+            tokenizer.eod,
+            args.reset_position_ids,
+            args.reset_attention_mask,
+            args.eod_mask_loss,
+            skip_mask=True)
+        attention_mask = torch.zeros(1, dtype=torch.bool, device=tokens.device)
     else:
+        # the dense mask (the non-flash core attention on a non-pipeline run, or the flag forced on): built once per process and
+        # reused (megatron/utils.py _LTOR_MASK_CACHE), no longer per micro-batch
         attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
             tokens,
             tokenizer.eod,
@@ -612,27 +635,27 @@ def get_batch_pipe(data):
     # (sequence_parallel/cross_entropy.py) returns [S, B] per-token losses and its backward re-slices this rank's window.
     seq_parallel_world_size = mpu.get_sequence_parallel_world_size()
     seq_parallel_world_rank = mpu.get_sequence_parallel_rank()
-
-    # For Megatron's sequence parallel
-    if args.sequence_parallel:
-        seq_parallel_world_size = mpu.get_tensor_model_parallel_world_size()
-        seq_parallel_world_rank = mpu.get_tensor_model_parallel_rank()
     seq_length = tokens.size(1)
-
-    assert seq_length % seq_parallel_world_size == 0
-    sub_seq_length = seq_length // seq_parallel_world_size
-    sub_seq_start = seq_parallel_world_rank * sub_seq_length
-    sub_seq_end = (seq_parallel_world_rank + 1) * sub_seq_length
-
-    tokens = tokens[:, sub_seq_start:sub_seq_end]
-    position_ids = position_ids[:, sub_seq_start:sub_seq_end]
-    # For DS's sequence parallel
-    if mpu.get_sequence_parallel_world_size() > 1:
+    if seq_parallel_world_size > 1:
+        assert seq_length % seq_parallel_world_size == 0
+        sub_seq_length = seq_length // seq_parallel_world_size
+        sub_seq_start = seq_parallel_world_rank * sub_seq_length
+        sub_seq_end = (seq_parallel_world_rank + 1) * sub_seq_length
+        tokens = tokens[:, sub_seq_start:sub_seq_end]
+        position_ids = position_ids[:, sub_seq_start:sub_seq_end]
         labels = labels[:, sub_seq_start:sub_seq_end]
-        # loss_mask stays FULL-length: vocab_sequence_parallel_cross_entropy
-        # all-gathers the per-shard losses back to [S, B] (cross_entropy.py:28)
-        # and its backward re-slices to this rank's window, so loss_func sees
-        # full-sequence losses and needs the full-sequence mask.
+        seq_length = tokens.size(1)
+
+    # For Megatron's sequence parallel (the companion of TP): the TP shard of what this rank holds
+    if args.sequence_parallel:
+        tp_world_size = mpu.get_tensor_model_parallel_world_size()
+        tp_rank = mpu.get_tensor_model_parallel_rank()
+        assert seq_length % tp_world_size == 0
+        sub_seq_length = seq_length // tp_world_size
+        sub_seq_start = tp_rank * sub_seq_length
+        sub_seq_end = (tp_rank + 1) * sub_seq_length
+        tokens = tokens[:, sub_seq_start:sub_seq_end]
+        position_ids = position_ids[:, sub_seq_start:sub_seq_end]
 
     return (tokens, position_ids, attention_mask), (labels, loss_mask)
 

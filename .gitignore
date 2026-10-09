@@ -62,3 +62,27 @@ examples_elmoe/scripts-frontier/checkpoint
 examples_elmoe/scripts-frontier/output
 examples_elmoe/scripts-frontier/temp_slurm
 examples_elmoe/scripts-frontier/temp_ds_json
+
+# examples_elmoe run output, data and junk (merged 2026-09-11 from a nested examples_elmoe/.gitignore, which is deleted)
+examples_elmoe/scripts-frontier/output/
+examples_elmoe/scripts-frontier/logs
+examples_elmoe/scripts-frontier/checkpoint
+examples_elmoe/scripts-frontier/temp_slurm/
+examples_elmoe/scripts-frontier/temp_ds_json/
+examples_elmoe/scripts-frontier/eval/cache
+examples_elmoe/scripts-frontier/eval/archived
+examples_elmoe/scripts-frontier/eval/logs
+examples_elmoe/scripts-frontier/eval/results/
+examples_elmoe/scripts-frontier/wandb/
+examples_elmoe/data/*
+!examples_elmoe/data/README.md
+!examples_elmoe/data/*.slurm
+!examples_elmoe/data/mix16k/
+examples_elmoe/data/mix16k/*
+!examples_elmoe/data/mix16k/*.py
+!examples_elmoe/data/mix16k/*.txt
+examples_elmoe/__pycache__/
+examples_elmoe/*.pyc
+examples_elmoe/*.bak*
+examples_elmoe/core
+examples_elmoe/scripts-frontier/deepspeed/

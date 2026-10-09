@@ -149,23 +149,17 @@ def initialize_model_parallel(
     # expert groups stay inside the node), the sequence group at stride TP (one rank of each of P nodes at TP 8), the data-parallel
     # group at stride TP x P, the pipeline at stride TP x P x dp (the existing loop). With P = 1 every group is what it was.
     enable_ds_sequence_parallel = sequence_parallel_size > 1
-    if enable_ds_sequence_parallel:
-        assert tensor_model_parallel_size == 1 and pipeline_model_parallel_size == 1, \
-        'DeepSpeed\'s sequence parallel does not work with tensor parallel or pipeline parallel'
-
-        if world_size % sequence_parallel_size != 0:
-            raise RuntimeError(
-                f"world_size ({world_size}) is not divisible by sequence_parallel_size {sequence_parallel_size})"
-            )
+    if world_size % (tensor_model_parallel_size * sequence_parallel_size * pipeline_model_parallel_size) != 0:
+        raise RuntimeError(
+            f"world_size ({world_size}) is not divisible by tensor_model_parallel_size ({tensor_model_parallel_size}) x "
+            f"sequence_parallel_size ({sequence_parallel_size}) x pipeline_model_parallel_size ({pipeline_model_parallel_size})"
+        )
 
     data_parallel_size: int = world_size // (tensor_model_parallel_size * pipeline_model_parallel_size * sequence_parallel_size)
     sequence_data_parallel_size: int = sequence_parallel_size * data_parallel_size
 
     num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size
     num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
-    num_data_parallel_groups: int = world_size // data_parallel_size
-    num_sequence_parallel_groups: int = world_size // sequence_parallel_size
-    num_sequence_data_parallel_groups: int = world_size // sequence_parallel_size // data_parallel_size
 
     if virtual_pipeline_model_parallel_size is not None:
         if not pipeline_model_parallel_size > 2:
@@ -180,50 +174,25 @@ def initialize_model_parallel(
         _PIPELINE_MODEL_PARALLEL_SPLIT_RANK = pipeline_model_parallel_split_rank
 
     rank = torch.distributed.get_rank()
+    tp_, cp_, dp_, pp_ = tensor_model_parallel_size, sequence_parallel_size, data_parallel_size, pipeline_model_parallel_size
 
-    # Build the data-parallel groups.
+    def rank_of(p, d, c, t):
+        return ((p * dp_ + d) * cp_ + c) * tp_ + t
+
+    # Build the data-parallel groups (without the sequence dimension: the loader's sampler and Megatron's batch arithmetic),
+    # the sequence-parallel groups and the sequence-data-parallel groups (ZeRO and the gradient reduction: dp x P).
     global _DATA_PARALLEL_GROUP
     global _DATA_PARALLEL_GROUP_GLOO
     global _DATA_PARALLEL_GLOBAL_RANKS
     assert _DATA_PARALLEL_GROUP is None, 'data parallel group is already initialized'
-    all_data_parallel_group_ranks = []
-    for i in range(pipeline_model_parallel_size):
-        start_rank = i * num_pipeline_model_parallel_groups
-        end_rank = (i + 1) * num_pipeline_model_parallel_groups
-
-        if sequence_parallel_size > 1:
-            tp_or_sp_size = sequence_parallel_size
-        else:
-            tp_or_sp_size = tensor_model_parallel_size
-
-        for j in range(tp_or_sp_size):
-            ranks = range(start_rank + j, end_rank, tp_or_sp_size)
-            all_data_parallel_group_ranks.append(list(ranks))
-            group = torch.distributed.new_group(ranks)
-            if use_distributed_optimizer:
-                group_gloo = torch.distributed.new_group(ranks, backend="gloo")
-            else:
-                group_gloo = None
-            if rank in ranks:
-                _DATA_PARALLEL_GROUP = group
-                _DATA_PARALLEL_GROUP_GLOO = group_gloo
-                _DATA_PARALLEL_GLOBAL_RANKS = ranks
-
-    # Build the sequence parallel groups.
     global _SEQUENCE_PARALLEL_GROUP
+    global _SEQUENCE_PARALLEL_GLOBAL_RANKS
     assert _SEQUENCE_PARALLEL_GROUP is None, \
         'sequence parallel group is already initialized'
-    for i in range(num_sequence_parallel_groups):
-        ranks = range(i * sequence_parallel_size,
-                      (i + 1) * sequence_parallel_size)
-        group = torch.distributed.new_group(ranks)
-        if rank in ranks:
-            _SEQUENCE_PARALLEL_GROUP = group
-
-    # Build the sequence data parallel groups.
     global _SEQUENCE_DATA_PARALLEL_GROUP
     assert _SEQUENCE_DATA_PARALLEL_GROUP is None, \
         'sequence data parallel group is already initialized'
+    all_data_parallel_group_ranks = []
     all_data_sequence_parallel_group_ranks = []
     for p in range(pp_):
         for t in range(tp_):
@@ -261,13 +230,11 @@ def initialize_model_parallel(
         for d in range(dp_):
             ranks = [rank_of(p, d, c, t) for c in range(cp_) for t in range(tp_)]
             group = torch.distributed.new_group(ranks)
-            all_data_sequence_parallel_group_ranks.append(list(ranks))
             if rank in ranks:
-                _SEQUENCE_DATA_PARALLEL_GROUP = group
-    else:
-        _SEQUENCE_DATA_PARALLEL_GROUP = _DATA_PARALLEL_GROUP
+                _DATA_BROADCAST_GROUP = group
+                _DATA_BROADCAST_GLOBAL_RANKS = ranks
 
-    # Build the model-parallel groups.
+    # Build the model-parallel groups: one member of every sequence-data group (or data group) -> the TP x PP ranks of one (d, c).
     global _MODEL_PARALLEL_GROUP
     assert _MODEL_PARALLEL_GROUP is None, 'model parallel group is already initialized'
     num_model_parallel_groups = sequence_data_parallel_size if enable_ds_sequence_parallel else data_parallel_size
@@ -435,23 +402,6 @@ def sequence_parallel_is_initialized():
     if _SEQUENCE_PARALLEL_GROUP is None or \
         _DATA_PARALLEL_GROUP is None:
         return False
-def get_data_broadcast_group():
-    """[X-MoE 2026-09-17] the TP x P ranks that share one sample (the group of the batch broadcast)."""
-    assert _DATA_BROADCAST_GROUP is not None, 'data broadcast group is not initialized'
-    return _DATA_BROADCAST_GROUP
-
-
-def get_data_broadcast_src_rank():
-    """the first rank of this rank's data-broadcast group: TP rank 0 and sequence rank 0, the one that owns the loader"""
-    assert _DATA_BROADCAST_GLOBAL_RANKS is not None, 'data broadcast group is not initialized'
-    return _DATA_BROADCAST_GLOBAL_RANKS[0]
-
-
-def get_data_broadcast_rank():
-    assert _DATA_BROADCAST_GLOBAL_RANKS is not None, 'data broadcast group is not initialized'
-    return _DATA_BROADCAST_GLOBAL_RANKS.index(torch.distributed.get_rank())
-
-
     return True
 
 def sequence_data_parallel_is_initialized():
@@ -483,6 +433,23 @@ def get_sequence_parallel_group():
     assert _SEQUENCE_PARALLEL_GROUP is not None, \
         'sequence parallel group is not initialized'
     return _SEQUENCE_PARALLEL_GROUP
+
+
+def get_data_broadcast_group():
+    """[X-MoE 2026-09-17] the TP x P ranks that share one sample (the group of the batch broadcast)."""
+    assert _DATA_BROADCAST_GROUP is not None, 'data broadcast group is not initialized'
+    return _DATA_BROADCAST_GROUP
+
+
+def get_data_broadcast_src_rank():
+    """the first rank of this rank's data-broadcast group: TP rank 0 and sequence rank 0, the one that owns the loader"""
+    assert _DATA_BROADCAST_GLOBAL_RANKS is not None, 'data broadcast group is not initialized'
+    return _DATA_BROADCAST_GLOBAL_RANKS[0]
+
+
+def get_data_broadcast_rank():
+    assert _DATA_BROADCAST_GLOBAL_RANKS is not None, 'data broadcast group is not initialized'
+    return _DATA_BROADCAST_GLOBAL_RANKS.index(torch.distributed.get_rank())
 
 
 def get_sequence_data_parallel_group():
@@ -829,10 +796,6 @@ def get_data_parallel_world_size():
 def get_data_parallel_rank():
     """Return my rank for the data parallel group."""
     return torch.distributed.get_rank(group=get_data_parallel_group())
-    global _SEQUENCE_PARALLEL_GLOBAL_RANKS
-    _SEQUENCE_PARALLEL_GLOBAL_RANKS = None   # [X-MoE 2026-09-17]
-    global _DATA_BROADCAST_GROUP, _DATA_BROADCAST_GLOBAL_RANKS
-    _DATA_BROADCAST_GROUP = None; _DATA_BROADCAST_GLOBAL_RANKS = None   # [X-MoE 2026-09-17]
 
 
 def _set_global_memory_buffer():
@@ -866,6 +829,10 @@ def destroy_model_parallel():
     _DATA_PARALLEL_GROUP = None
     global _SEQUENCE_PARALLEL_GROUP
     _SEQUENCE_PARALLEL_GROUP = None
+    global _SEQUENCE_PARALLEL_GLOBAL_RANKS
+    _SEQUENCE_PARALLEL_GLOBAL_RANKS = None   # [X-MoE 2026-09-17]
+    global _DATA_BROADCAST_GROUP, _DATA_BROADCAST_GLOBAL_RANKS
+    _DATA_BROADCAST_GROUP = None; _DATA_BROADCAST_GLOBAL_RANKS = None   # [X-MoE 2026-09-17]
     global _SEQUENCE_DATA_PARALLEL_GROUP
     _SEQUENCE_DATA_PARALLEL_GROUP = None
     global _EMBEDDING_GROUP

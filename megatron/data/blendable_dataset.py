@@ -101,13 +101,16 @@ class BlendableDataset(torch.utils.data.Dataset):
             self.dataset_index, self.dataset_sample_index = _build_indices()
 
 
-        # Check size
-        _ = self.__getitem__(self.size - 1)
-        try:
-            _ = self.__getitem__(self.size)
-            raise RuntimeError('BlendedDataset size is improperly bounded')
-        except IndexError:
-            pass
+        # Check size. Skip for an empty dataset (e.g. the valid split with
+        # eval_iters=0): __getitem__(-1) on an empty index is an IndexError,
+        # and an empty loader is never iterated anyway.
+        if self.size > 0:
+            _ = self.__getitem__(self.size - 1)
+            try:
+                _ = self.__getitem__(self.size)
+                raise RuntimeError('BlendedDataset size is improperly bounded')
+            except IndexError:
+                pass
         print_rank_0('> size of blendable dataset: '
                      '{} samples'.format(self.size))
 

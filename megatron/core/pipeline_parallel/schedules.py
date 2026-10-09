@@ -264,6 +264,11 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     # Backward pass.
     if args.deepspeed:
         model.backward(output_tensor[0])
+        # the micro-batch profiler window without a pipeline (megatron/training.py train(), PROFILE_MICROBATCHES=1): one
+        # profiler step per micro-batch, after its backward, as the pipe engine does after BackwardPass
+        _micro_step = getattr(model, '_xmoe_micro_step', None)
+        if _micro_step is not None:
+            _micro_step()
     else:
         if output_tensor_grad[0] is None and config.grad_scale_func is not None:
             output_tensor[0] = config.grad_scale_func(output_tensor[0])

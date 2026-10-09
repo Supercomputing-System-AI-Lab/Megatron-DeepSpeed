@@ -313,7 +313,7 @@ class _HFTokenizer(AbstractTokenizer):
         # Probe known EOD token names across tokenizer families:
         #   GPT-2 / GPT-NeoX: <|endoftext|>
         #   Llama 3 / 3.1:    <|end_of_text|>
-        candidates = [eod_token] if eod_token else ['<|endoftext|>', '<|end_of_text|>']
+        candidates = [eod_token] if eod_token else ['<|endoftext|>', '<|end_of_text|>', '<｜end▁of▁sentence｜>', '<|end▁of▁sentence|>']   # + DeepSeek (V3 / MoE-16B) EOD, 2026-10-06
         self.eod_id = next((self.tokenizer.token_to_id(t) for t in candidates
                             if self.tokenizer.token_to_id(t) is not None), None)
         assert self.eod_id is not None, \

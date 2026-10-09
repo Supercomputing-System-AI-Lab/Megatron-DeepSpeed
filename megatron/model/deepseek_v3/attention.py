@@ -19,7 +19,17 @@ carry partial gradients per rank and are marked sequence_parallel so the engine'
 
 Parameter names are the released model's (self_attn.X -> self_attention.X), so a checkpoint importer maps them by prefix.
 The inference cache follows ParallelAttention's contract (inference_params.key_value_memory_dict, sequence_len_offset,
-batch_size_offset; the batched ragged decode with row_lengths and kv_extent): keys are cached rotated, values at their own width.
+batch_size_offset; the batched ragged decode with row_lengths and kv_extent). Two forms, chosen by XMOE_V3_KV_LATENT (2026-09-14):
+  1 (the default): the latent form. One buffer [max_seq, max_batch, kv_lora_rank + rope] per layer holds, per token, the normalized
+    latent and the rotated rope key: 576 numbers for the released model, the same on every tensor-parallel rank (the latent has no
+    head dimension). A prefill writes its tokens and up-projects the cached prefix through kv_b_proj for the attention kernel (the
+    same numbers the direct path computes, so a prefill is unchanged bit for bit); a decode step never expands: the query is
+    carried into the latent space (q_nope . W_UK), scored against the latent plus the rope part, and the weighted latent is
+    brought back through W_UV (the released model's "absorbed" decode, as vLLM, SGLang and Megatron-LM run it). Per token per
+    layer the cache is (kv_lora_rank + rope) x 2 bytes instead of heads_per_rank x (nope + rope + v_head_dim) x 2: 1,152 against
+    10,240 bytes for the 671B at TP 8, which is what lets a 256k prompt fit on a 64 GB GCD (18 GB of cache against 164).
+  0: the expanded form of 2026-09-11: keys [max_seq, max_batch, heads, nope + rope] cached rotated and values at their own width;
+    the decode is an fp32 einsum over the expanded cache.
 Not built here (open items of the blueprint): the V3.2 indexer.
 """
 import os
@@ -159,6 +169,7 @@ class DeepSeekV3Attention(MegatronModule):
                               and get_accelerator().device_name() == 'cuda')
         self.attn_backend = os.getenv('XMOE_V3_ATTN_BACKEND', 'sdpa')      # see _flash_attention
         assert self.attn_backend in ('sdpa', 'ck256', 'ck'), self.attn_backend
+        self.kv_latent = os.getenv('XMOE_V3_KV_LATENT', '1') == '1'         # the inference cache's form; see the module docstring
         if self.use_flash:
             from megatron.model.transformer import FlashSelfAttention
             self.core_attention_flash = FlashSelfAttention(causal=True, softmax_scale=self.softmax_scale,
@@ -168,7 +179,7 @@ class DeepSeekV3Attention(MegatronModule):
             print(f'[deepseek_v3] MLA attention: heads {H} (per TP rank {self.heads_per_partition}), q_lora_rank {self.q_lora_rank}, '
                   f'kv_lora_rank {self.kv_lora_rank}, head dims nope/rope/v {self.qk_nope_head_dim}/{self.qk_rope_head_dim}/{self.v_head_dim}, '
                   f'softmax scale {self.softmax_scale:.6f}, yarn {self.rotary.yarn}, flash {self.use_flash} ({self.attn_backend}), '
-                  f'sequence_parallel {self.sequence_parallel}', flush=True)
+                  f'sequence_parallel {self.sequence_parallel}, inference cache {"latent" if self.kv_latent else "expanded"}', flush=True)
 
     # ------------------------------------------------------------------ helpers
     def _mark_replicated(self):
@@ -198,6 +209,11 @@ class DeepSeekV3Attention(MegatronModule):
             starts = torch.repeat_interleave(cu[:-1], lengths)
             flat = torch.arange(n, device=device) - starts.to(device)
             return flat if b == 1 else flat.view(b, s).transpose(0, 1).contiguous()
+        P = parallel_state.get_sequence_parallel_world_size()
+        if P > 1:
+            # [X-MoE 2026-09-17, the Ulysses blueprint C5] the gathered shard is this rank's contiguous window of the full sequence
+            r = parallel_state.get_sequence_parallel_rank()
+            return torch.arange(r * s, (r + 1) * s, device=device)
         return torch.arange(s, device=device)
 
     def _eager_attention(self, query, key, value, query_start=0, keep_heads=False):   # keep_heads: [X-MoE 2026-09-17] the exchange wants [s, b, h, d]
@@ -209,11 +225,6 @@ class DeepSeekV3Attention(MegatronModule):
         k = key.permute(1, 2, 0, 3)
         v = value.permute(1, 2, 0, 3)
         scores = torch.matmul(q, k.transpose(-1, -2)).to(torch.float32) * self.softmax_scale
-        P = parallel_state.get_sequence_parallel_world_size()
-        if P > 1:
-            # [X-MoE 2026-09-17, the Ulysses blueprint C5] the gathered shard is this rank's contiguous window of the full sequence
-            r = parallel_state.get_sequence_parallel_rank()
-            return torch.arange(r * s, (r + 1) * s, device=device)
         q_pos = torch.arange(s, device=scores.device) + query_start
         causal = torch.arange(s_k, device=scores.device)[None, :] <= q_pos[:, None]
         scores = scores.masked_fill(~causal, torch.finfo(torch.float32).min)
@@ -263,12 +274,67 @@ class DeepSeekV3Attention(MegatronModule):
     # ------------------------------------------------------------------ forward
     # ------------------------------------------------------------------ the inference cache (the same contract as ParallelAttention)
     def _allocate_cache(self, inference_params, like):
-        """k [max_s, max_b, heads, nope + rope] (rotated) and v [max_s, max_b, heads, v_head_dim] in the activation's dtype."""
+        """The latent form: one zero-filled buffer [max_s, max_b, kv_lora_rank + rope] in the activation's dtype (zeros, not empty:
+        the decode reads [:kv_extent], the batch's extent, and a short row's never-written slots enter its softmax with a finite
+        score before the mask; garbage bits could carry NaN). The expanded form: k [max_s, max_b, heads, nope + rope] (rotated) and
+        v [max_s, max_b, heads, v_head_dim]."""
         hp = self.heads_per_partition
         n, bmax = inference_params.max_sequence_len, inference_params.max_batch_size
+        if self.kv_latent:
+            return torch.zeros(n, bmax, self.kv_lora_rank + self.qk_rope_head_dim, dtype=like.dtype, device=like.device)
         k = torch.empty(n, bmax, hp, self.qk_head_dim, dtype=like.dtype, device=like.device)
         v = torch.empty(n, bmax, hp, self.v_head_dim, dtype=like.dtype, device=like.device)
         return k, v
+
+    def _up_project(self, lat):
+        """The cached latent [n, b, kv_lora_rank + rope] -> key [n, b, heads, nope + rope], value [n, b, heads, v_head_dim]: the
+        numbers kv_b_proj gives the direct path (the stored latent is the normalized one, the stored rope key is rotated), so a
+        prefill through the latent cache equals a prefill through the expanded cache bit for bit."""
+        n, b, _ = lat.shape
+        hp = self.heads_per_partition
+        c, kpe = torch.split(lat, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv, _ = self.kv_b_proj(c)
+        kv = kv.view(n, b, hp, self.qk_nope_head_dim + self.v_head_dim)
+        k_nope, value = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        key = torch.cat((k_nope, kpe[:, :, None, :].expand(n, b, hp, self.qk_rope_head_dim)), dim=-1)
+        return key, value
+
+    def _latent_prefill(self, latent, k_pe, mem, s, b, query_start, inference_params):
+        """Write this forward's tokens (the normalized latent and the rotated rope key) at their positions, then hand the whole
+        prefix [0, query_start + s) back expanded, for the attention kernel: a chunked prefill attends to every earlier chunk."""
+        b0 = inference_params.batch_size_offset
+        b1 = b0 + b
+        seq_end = query_start + s
+        assert seq_end <= mem.shape[0] and b1 <= mem.shape[1], 'the inference cache is smaller than the sequence or the batch'
+        mem[query_start:seq_end, b0:b1] = torch.cat((latent, k_pe[:, :, 0]), dim=-1).to(mem.dtype)
+        return self._up_project(mem[:seq_end, b0:b1])
+
+    def _absorbed_decode(self, q_nope, q_pe, latent, k_pe, mem, pos, inference_params):
+        """One decode step of one token per row over the latent cache, without expanding it. Row b's token lands at slot pos[b]
+        (its true position: the ragged contract, or query_start for every row on the uniform path) and attends to slots
+        0 .. pos[b]. The algebra: q . (W_UK c) = (q . W_UK) . c, so the query is carried into the latent space once (a [heads,
+        nope, rank] product per token) and scored against the cached latent; softmax . (W_UV c) = W_UV . (softmax . c), so the
+        weighted latent is brought back through W_UV after the softmax. fp32 eager math, like the expanded decode."""
+        b = q_nope.shape[1]
+        hp = self.heads_per_partition
+        b_idx = torch.arange(b, device=q_nope.device)
+        mem[pos, b_idx] = torch.cat((latent[0], k_pe[0, :, 0]), dim=-1).to(mem.dtype)
+        kv_hi = getattr(inference_params, 'kv_extent', None)
+        if kv_hi is None:
+            kv_hi = int(pos.max().item()) + 1
+        lat = mem[:kv_hi, :b].float()                                                   # [kv, b, rank + rope]
+        c, kpe = torch.split(lat, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        w = self.kv_b_proj.weight.view(hp, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank).float()
+        w_uk, w_uv = w[:, : self.qk_nope_head_dim], w[:, self.qk_nope_head_dim:]     # [heads, nope, rank], [heads, v, rank]
+        q_abs = torch.einsum('bhd,hdr->bhr', q_nope[0].float(), w_uk)                  # the query in the latent space
+        scores = torch.einsum('bhr,sbr->bhs', q_abs, c) + torch.einsum('bhp,sbp->bhs', q_pe[0].float(), kpe)
+        scores = scores * self.softmax_scale
+        dead = torch.arange(kv_hi, device=q_nope.device)[None, :] > pos[:, None]
+        scores = scores.masked_fill(dead[:, None, :], float('-inf'))
+        probs = torch.softmax(scores, dim=-1)
+        u = torch.einsum('bhs,sbr->bhr', probs, c)                                      # the weighted latent
+        context = torch.einsum('bhr,hdr->bhd', u, w_uv)                                 # back to the value space
+        return context.reshape(1, b, -1).to(q_nope.dtype)
 
     def _ragged_decode(self, query, key_new, value_new, k_mem, v_mem, row_lengths, inference_params):
         """One batched decode step over rows at different positions (the contract of ParallelAttention._ragged_decode_step, the
@@ -362,8 +428,39 @@ class DeepSeekV3Attention(MegatronModule):
             k_pe = copy_to_tensor_model_parallel_region(k_pe)
 
         query = torch.cat((q_nope, q_pe), dim=-1)
-        key = torch.cat((k_nope, k_pe.expand(s, b, hp, self.qk_rope_head_dim)), dim=-1)
-        if cache is not None:
+        if ulysses:
+            from megatron.core.sequence_parallel.mappings import gather_from_sequence_group, seq_all_to_all
+            P = parallel_state.get_sequence_parallel_world_size()
+            r = parallel_state.get_sequence_parallel_rank()
+            query = seq_all_to_all(query, 2, 0)                                         # [s/P, b, hp, d_qk] -> [s, b, hp/P, d_qk]
+            lat = gather_from_sequence_group(torch.cat((latent, k_pe[:, :, 0, :]), dim=-1))   # [s, b, kv_lora + rope]
+            s_full = lat.shape[0]
+            c, kpe = torch.split(lat, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+            hq = hp // P
+            width = self.qk_nope_head_dim + self.v_head_dim
+            kv = F.linear(c, self.kv_b_proj.weight[r * hq * width:(r + 1) * hq * width])    # this rank's heads only: [s, b, hq x width]
+            kv = kv.view(s_full, b, hq, width)
+            k_nope, value = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+            key = torch.cat((k_nope, kpe[:, :, None, :].expand(s_full, b, hq, self.qk_rope_head_dim)), dim=-1)
+            if self.use_flash:
+                ctx4 = self._flash_attention(query, key, value, attention_mask, keep_heads=True)   # [s, b, hq, d_v]
+            else:
+                ctx4 = self._eager_attention(query, key, value, keep_heads=True)
+            context = seq_all_to_all(ctx4, 0, 2)                                        # [s, b, hq, d_v] -> [s/P, b, hp, d_v]
+            context = context.reshape(s, b, hp * self.v_head_dim)
+            output, bias = self.o_proj(context)
+            return output, bias
+        if cache is not None and self.kv_latent:
+            if s == 1 and (row_lengths is not None or query_start > 0):
+                # a decode step: one token per row at its own position (the ragged contract) or at query_start (the uniform path)
+                pos = row_lengths.to(x.device) if row_lengths is not None else torch.full((b,), query_start, dtype=torch.long, device=x.device)
+                context = self._absorbed_decode(q_nope, q_pe, latent, k_pe, cache, pos, inference_params)
+                output, bias = self.o_proj(context)
+                return output, bias
+            key, value = self._latent_prefill(latent, k_pe, cache, s, b, query_start, inference_params)
+        else:
+            key = torch.cat((k_nope, k_pe.expand(s, b, hp, self.qk_rope_head_dim)), dim=-1)
+        if cache is not None and not self.kv_latent:
             k_mem, v_mem = cache
             if row_lengths is not None:
                 context = self._ragged_decode(query, key, value, k_mem, v_mem, row_lengths, inference_params)

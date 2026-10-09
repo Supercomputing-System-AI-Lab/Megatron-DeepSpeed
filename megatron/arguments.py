@@ -424,6 +424,26 @@ def validate_args(args):
     # FlashAttention
     args.use_flash_attn = args.use_flash_attn_v1 or args.use_flash_attn_triton or args.use_flash_attn_v2
 
+    # The dense [1, 1, s, s] attention mask of the data path (upstream Megatron-LM's create_attention_mask_in_dataloader,
+    # 2026-09-19). Nobody reads it on the pipeline path (EmbeddingPipe drops it, the layers take args.attn_mask), under
+    # --intra-document-attention (the slot carries cu_seqlens) or under flash attention (the kernel takes the causal flag),
+    # and building it costs seq^2 x 4 bytes on the host per micro-batch (4.3 GB and 5.6 s at 32k: the PL4 profile), so the
+    # flag is turned off wherever the mask is unread. The non-flash core attention still gets its mask: on the pipeline path
+    # from the constant args.attn_mask (built once, pretrain_gpt_deepspeed.py model_provider), elsewhere from get_batch.
+    if args.create_attention_mask_in_dataloader:
+        reasons = []
+        if getattr(args, 'deepspeed', False) and not args.no_pipeline_parallel:
+            reasons.append('the pipeline path never reads the per-micro-batch mask')
+        if args.intra_document_attention:
+            reasons.append('--intra-document-attention carries cu_seqlens in its place')
+        if args.use_flash_attn:
+            reasons.append('flash attention takes the causal flag')
+        if reasons:
+            args.create_attention_mask_in_dataloader = False
+            if args.rank == 0:
+                print('[arguments] create_attention_mask_in_dataloader set to False: ' + '; '.join(reasons)
+                      + ' (pass nothing to keep it off; the non-flash core attention on the non-pipeline path still builds it).', flush=True)
+
     # Intra-document attention. Implemented as document-boundary cu_seqlens on
     # the flash-attn varlen call, so every constraint below is about keeping the
     # boundaries and the token stream in agreement.
@@ -1500,6 +1520,18 @@ def _add_data_args(parser):
     group.add_argument('--reset-attention-mask', action='store_true',
                        help='Reset self attention maske after '
                        'end-of-document token.')
+    group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',
+                       help='If set, do not create attention_masks in dataloader. '
+                       'The upstream Megatron-LM flag, same name and default (the mask is '
+                       'created unless this is passed). On this fork it is switched off '
+                       'automatically wherever the mask is never read: the DeepSpeed '
+                       'pipeline path (EmbeddingPipe drops the per-micro-batch mask and '
+                       'the layers take args.attn_mask), --intra-document-attention '
+                       '(document boundaries ride the slot as cu_seqlens) and flash '
+                       'attention (the kernel takes the causal flag). Building the mask '
+                       'costs seq^2 x 4 bytes on the host per micro-batch (4.3 GB, 5.6 s '
+                       'at 32k). Only the non-flash core attention reads it.',
+                       dest='create_attention_mask_in_dataloader')
     group.add_argument('--intra-document-attention', action='store_true',
                        help='Prevent tokens from attending across document '
                        'boundaries within a packed training sequence. Unlike '

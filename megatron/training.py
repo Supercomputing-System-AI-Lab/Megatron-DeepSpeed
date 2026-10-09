@@ -321,6 +321,10 @@ def pretrain(train_valid_test_dataset_provider,
                             process_non_loss_data_func)
 
         print_datetime('after training is done')
+        # 2026-09-18: the micro-batch profiler window keeps its per-rank traces unmerged inside the iteration; merge one rank per
+        # pipeline stage into a Perfetto-ready .json.gz now that every rank has finished (profiler_manager.merge_after_training).
+        from megatron.profiler_manager import merge_after_training
+        merge_after_training()
         # Clean the model
         if args.compression_training:
             print (f"[training.py] {rank=} before cleaning the model", flush=True )
@@ -1320,7 +1324,7 @@ if examples_dir not in sys.path:
     sys.path.append(examples_dir)
 
 # 5. Now you can safely import!
-from megatron.profiler_manager import _get_profiler, finalize_profiler
+from megatron.profiler_manager import _get_profiler, finalize_profiler, rank_selected
 
 def train(forward_step_func, model, optimizer, opt_param_scheduler,
           train_data_iterator, valid_data_iterator,
@@ -1334,12 +1338,22 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     # Zixian: 04/15/2025: Enabled a central file to control profiler args in X-MoE/Megatron-DeepSpeed-X-MoE/profiler_manager.py
     
     to_profile=os.getenv ("to_profile")
+    # the routing record (2026-10-06): deepspeed/moe/route_log.py, on under XMOE_ROUTE_LOG=1, flushed once per step after the optimizer step
+    try:
+        from deepspeed.moe import route_log as _route_log
+        _route_on = _route_log.enabled()
+    except Exception:
+        _route_log, _route_on = None, False
+    if to_profile == 'True' and not rank_selected():
+        to_profile = 'False'   # PROFILE_RANKS (2026-10-06): this rank is not in the traced set
     if mpu.get_data_parallel_rank() == 0:
         print (f'[training.py] {to_profile=}')
     if to_profile=='True': 
-        wait=1
-        warmup=2
-        active=2
+        # the schedule in iterations; PROFILE_WAIT / PROFILE_WARMUP / PROFILE_ACTIVE override it (2026-09-13: one active iteration
+        # at GBS 2,048, where an iteration holds hundreds of micro-batches); the defaults are the previous constants
+        wait=int(os.getenv('PROFILE_WAIT', '1'))
+        warmup=int(os.getenv('PROFILE_WARMUP', '2'))
+        active=int(os.getenv('PROFILE_ACTIVE', '2'))
         repeat=1
         max_prof_steps = (wait + warmup + active) * repeat 
         current_prof_step = 0
@@ -1348,6 +1362,23 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         # from ../examples_xmoe import 
         # profiler_manager import _get_profiler, finalize_profiler
         prof = _get_profiler(wait=wait, warmup=warmup, active=active, repeat=repeat)
+        if os.getenv('PROFILE_MICROBATCHES') == '1' and (hasattr(model[0], '_exec_schedule') or (args.deepspeed and not args.ds_pipeline_enabled)):
+            # 2026-09-13: the schedule counts micro-batches instead of iterations (an iteration of GBS 2,048 at micro-batch 1
+            # holds 256 micro-batches per rank, about 12 GB of trace per rank): the pipeline engine calls this after every
+            # backward pass (deepspeed/runtime/pipe/engine.py _exec_schedule), and without a pipeline (--no-pipeline-parallel,
+            # 2026-09-14: run Y1 traced nothing because only the pipe engine was hooked) backward_step in
+            # megatron/core/pipeline_parallel/schedules.py calls it after model.backward, so PROFILE_WAIT / WARMUP / ACTIVE count
+            # micro-batches; the per-iteration step below is switched off, and the per-rank traces are not merged (rank 0
+            # would read the other ranks' files while they are still being written)
+            _engine, _micro = model[0], {'n': 0}
+            def _xmoe_micro_step():
+                prof.step()
+                _micro['n'] += 1
+                if _micro['n'] >= max_prof_steps:
+                    _engine._xmoe_micro_step = None
+                    finalize_profiler(merge=False)
+            _engine._xmoe_micro_step = _xmoe_micro_step
+            to_profile = 'False'
 
     # Standalone CUDA-allocator memory snapshot (.pickle for https://pytorch.org/memory_viz).
     # Independent of the torch profiler (`to_profile`): runs whenever profile_memory=True, so
@@ -1399,6 +1430,17 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     while iteration < args.train_iters and (args.train_tokens is None or \
         args.consumed_train_tokens < args.train_tokens):
         update_num_microbatches(args.consumed_train_samples)
+        # [X-MoE 2026-10-08] fault injection for the hang-detection test: XMOE_HANG_INJECT="<rank>:<iteration>" makes that one rank
+        # sleep forever at the start of that iteration (a fail-silent stop of a single rank); every other rank then blocks in its next
+        # collective. It measures what NCCL_TIMEOUT, the process-group timeout and the watchers actually do: in V3X0 (job 5638129) a
+        # wedged node stopped 8 ranks and 2,040 waited 86 min without one error line. Off unless the variable is set.
+        _hang = os.environ.get('XMOE_HANG_INJECT')
+        if _hang:
+            _hr, _hit = (int(x) for x in _hang.split(':'))
+            if torch.distributed.get_rank() == _hr and iteration == _hit:
+                print(f'[hang-inject] rank {_hr} sleeps forever at iteration {_hit} ({time.strftime("%Y-%m-%d %H:%M:%S")})', flush=True)
+                while True:
+                    time.sleep(60)
         if args.deepspeed:
             # inform deepspeed of any batch size changes
             global_batch_size = mpu.get_data_parallel_world_size() * \
@@ -1449,8 +1491,13 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             
             # ---> THE FIX <---
             if current_prof_step >= max_prof_steps:
-                print(f"[training.py] Profiling schedule complete! Closing handler early to save memory.")
-                finalize_profiler()   # 1. Close the background trace threads safely
+                if os.getenv('PROFILE_EXPORT_AT_END') == '1':
+                    # 2026-10-06: the export (a file write of seconds) and the close happen after the training loop
+                    # (profiler_manager.finalize_if_pending, called from merge_after_training), so no iteration after the traced one pays for it
+                    print(f"[training.py] Profiling schedule complete! Export deferred to the end of training (PROFILE_EXPORT_AT_END=1).")
+                else:
+                    print(f"[training.py] Profiling schedule complete! Closing handler early to save memory.")
+                    finalize_profiler()   # 1. Close the background trace threads safely
                 to_profile = 'False'  # 2. Dynamically turn off profiling for remaining steps!
             
                 
@@ -1467,6 +1514,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                         config)
         iteration += 1
         args.iteration = iteration
+        if _route_on:
+            _route_log.flush(iteration)   # the routing record: one host copy + one append per step
 
         # One-shot allocator snapshot after a few warm steps (standalone; no kineto needed).
         if profile_memory and not _mem_snapshot_done and iteration >= mem_snapshot_after_steps:
@@ -1555,7 +1604,10 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 done_cuda, op=torch.distributed.ReduceOp.MAX)
             done = done_cuda.item()
             if done:
-                if not saved_checkpoint:
+                # [2026-09-20] the same guard the exit-interval branch below carries: with --exit-duration-in-mins
+                # reached and no --save (a probe that keeps no checkpoint), get_checkpoint_name(None) raised
+                # TypeError on all ranks at exit (P3p 5517094)
+                if args.save and not saved_checkpoint:
                     save_checkpoint_and_time(iteration, model, optimizer,
                                              opt_param_scheduler)
                 print_datetime('exiting program after {} minutes'.format(train_time))
@@ -1571,6 +1623,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             sys.exit()
 
 
+    if _route_on:
+        _route_log.close()   # the routing record: flush + fsync + close the per-rank file
     return iteration
 
 

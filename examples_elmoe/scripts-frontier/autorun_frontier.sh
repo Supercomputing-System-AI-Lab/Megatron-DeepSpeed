@@ -47,20 +47,20 @@ declare -A PP_BATCH_MAP
 # ================================== 63B ELMoE ==================================
 # ==================== 24 GPUs ===================
 # PP4-EP8-DP1
-PP_STRATEGY_MAP["3:24"]="3:8" # **
+# PP_STRATEGY_MAP["3:24"]="3:8" # **
 # ELMoE configurations: 
-PP_BATCH_MAP["3:24"]=" 1:64:15:ELMOE-3D:56B:dynamic-ckpt:1:uneven:yes-planner "
+# PP_BATCH_MAP["3:24"]=" 1:64:15:ELMOE-3D:56B:dynamic-ckpt:1:uneven:yes-planner "
 # PP_BATCH_MAP["3:24"]=" 1:64:15:ELMOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner "
 # PP_BATCH_MAP["4:32"]=" 1:64:15:ELMOE-3D:63B:no-ckpt:0:even:no-planner "
 # PP_BATCH_MAP["3:24"]=" 1:64:15:ELMOE-3D:56B:ckpt:1:even:no-planner "
 
 # ==================== 32 GPUs ===================
 # PP4-EP8-DP1
-# PP_STRATEGY_MAP["4:32"]="4:8" # **
+PP_STRATEGY_MAP["4:32"]="4:8" # **
 # ELMoE configurations: 
 # PP_BATCH_MAP["4:32"]=" 1:64:15:ELMOE-3D:63B:dynamic-ckpt:1:uneven:yes-planner "
 # PP_BATCH_MAP["4:32"]=" 1:64:15:ELMOE-3D:63B:no-ckpt:0:even:no-planner "
-# PP_BATCH_MAP["4:32"]=" 2:32:15:ELMOE-3D:63B:ckpt:1:even:no-planner "
+PP_BATCH_MAP["4:32"]=" 1:64:10:ELMOE-3D:63B:ckpt:1:even:no-planner "
 
 
 # ==================== 64 GPUs ===================

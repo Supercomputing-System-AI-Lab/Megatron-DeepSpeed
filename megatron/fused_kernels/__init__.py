@@ -40,7 +40,12 @@ def load(args):
 
     # Build path
     srcpath = pathlib.Path(__file__).parent.absolute()
-    buildpath = srcpath / 'build'
+    # A shared build dir serializes every concurrent job through one
+    # file_baton lock; env-divergent jobs flip ninja's command hash and force
+    # full rebuilds each handoff (2026-08-23 fleet stall). Jobs may opt into a
+    # private dir; default (unset) keeps the in-tree path for training.
+    _override = os.environ.get('MEGATRON_FUSED_KERNELS_BUILD_DIR')
+    buildpath = pathlib.Path(_override) if _override else srcpath / 'build'
     _create_build_dir(buildpath)
 
     # Helper function to build the kernels.

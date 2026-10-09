@@ -14,3 +14,15 @@ $ python ../../tools/preprocess_data.py \
     --merge-file gpt2-merges.txt \
     --workers 8
 ```
+
+For deepseek-moe-16B: 
+```
+python ../../tools/preprocess_data.py \
+    --input oscar-1GB.jsonl \
+    --output-prefix oscar-deepseek \
+    --tokenizer-type HFTokenizer \
+    --vocab-file deepseek_tokenizer/tokenizer.json \
+    --eod-token '<｜end▁of▁sentence｜>' \
+    --dataset-impl mmap \
+    --workers 8
+```

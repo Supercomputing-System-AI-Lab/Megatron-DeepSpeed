@@ -8,7 +8,7 @@
 #SBATCH -t 1:00:00
 #SBATCH -p {{PARTITION}}
 #SBATCH -N {{NODES}}
-#SBATCH -d singleton
+#a SBATCH -d singleton
 # [TIMEOUT-SAFE ANALYSIS] SLURM sends SIGUSR1 to this batch shell (B:) 180s before the
 # walltime so run_analysis() runs before the job is killed. Requires the backgrounded
 # srun + `wait "${TRAIN_PID}"` in the Launch section and `trap on_timeout USR1` below.
@@ -22,6 +22,7 @@
 ##SBATCH -e logs/xmoe-{{RUN_TYPE}}-%j.e
 
 # 01141-01142,02548,02551,02556,02676-02679
+
 
 # --- 2. Templatized Variable Definitions ---
 BATCH_SIZE={{BATCH_SIZE}}
@@ -42,6 +43,9 @@ DYNAMIC_CHECKPOINT="{{DYNAMIC_CHECKPOINT}}"
 UNEVEN_PP="{{UNEVEN_PP}}"
 RUN_PLANNER="{{RUN_PLANNER}}"
 COLLECT_PROFILING_CACHE="{{COLLECT_PROFILING_CACHE}}"
+UCP_ENABLE="{{UCP_ENABLE}}"   # rendered per launcher loop: PP-loop jobs get the
+                             # submit shell's UCP_ENABLE, all other loops pin 0 --
+                             # the knob can never leak into non-PP jobs via env
 ZERO_STAGE={{ZERO}}
 
 
@@ -100,24 +104,29 @@ export DYNAMIC_CHECKPOINT=$DYNAMIC_CHECKPOINT
 export UNEVEN_PP=$UNEVEN_PP
 
 # ================================================== Darshan Profiling Variables =============================================================
-# MVP per the OLCF tutorial: preload the proper 3.4.7-mpi build, set env + config, and let
-# Darshan write to its DEFAULT central dir: /lustre/orion/darshan/frontier/<Y>/<M>/<D>/ .
-# Find this run's log there by job id:  *_python_id${SLURM_JOB_ID}-*.darshan
+# Darshan 3.4.7 (Lustre-enabled gcc-14.2 build; the help-desk's cce-20.0.0 path does not exist on
+# the system) in NONMPI mode, because the training ranks are plain Python processes.
 #
-# DO NOT set DARSHAN_LOGFILE: with NONMPI every process writes a log, and a fixed filename
-# makes them clobber each other (that is why a prior run showed exe=mkdir). Default auto-naming
-# gives one uniquely-named log per process, so the training rank is distinct and not overwritten.
+# SCOPE (2026-09-05): the preload is applied PER PROCESS, on the python command inside the srun
+# below and on the converter's python, never exported job-wide. Job-wide export instrumented every
+# bash/mkdir/as/ls of the job and wrote up to ~1M two-KB logs per day into the central directory
+# (974,551 on 2026-08-30). Darshan's APP_INCLUDE directive and the DARSHAN_APP_INCLUDE variable
+# were both tested on the login node and are NOT honoured by this build, so scoping by where the
+# preload is set is the only mechanism that works.
 #
-# Build choice: the help-desk's cce-20.0.0 path (wvhy7) is a BROKEN variant -> dead Crusher log
-# path + --disable-lustre. We use the Lustre-enabled, correct-path 3.4.7 build instead (this is
-# what `module load darshan-runtime/3.4.7-mpi` resolves to under the gcc/cray-mpich-9.1.0 PrgEnv).
+# LOGS (2026-09-05): DARSHAN_LOGPATH is honoured once <path>/<Y>/<M>/<D> exists (verified on the
+# login node), so every run keeps its own logs under ${JOB_DIR}/darshan/ instead of the central
+# /lustre/orion/darshan/frontier tree; today's and tomorrow's date directories are created so a job
+# that crosses midnight still lands. No DARSHAN_LOGFILE: with NONMPI every process writes a log and
+# a fixed name would clobber (the auto name is unique per process).
 source /usr/share/lmod/lmod/init/bash 2>/dev/null || true
 module unload darshan-runtime 2>/dev/null || true
-export LD_PRELOAD="/opt/cray/libfabric/2.3.1/lib64/libfabric.so /sw/frontier/spack-envs/cpe26.03-cpu/opt/__spack_path_placeholder__/__spack_path_placeholder__/__spack_path_placeholder__/__spac/gcc-14.2/darshan-runtime-3.4.7-i6lglufb3nzhpr6gneuq2bjdaonwtv66/lib/libdarshan.so"
+DARSHAN_PRELOAD="/opt/cray/libfabric/2.3.1/lib64/libfabric.so /sw/frontier/spack-envs/cpe26.03-cpu/opt/__spack_path_placeholder__/__spack_path_placeholder__/__spack_path_placeholder__/__spac/gcc-14.2/darshan-runtime-3.4.7-i6lglufb3nzhpr6gneuq2bjdaonwtv66/lib/libdarshan.so"
 export DARSHAN_ENABLE_NONMPI=1          # REQUIRED for Python (no MPI-link interposition)
 export DARSHAN_MOD_ENABLE="POSIX,STDIO,MPI-IO,LUSTRE,DXT_POSIX"  # LUSTRE now produces data (enable-lustre build)
 export DARSHAN_CONFIG_PATH="${PWD}/darshan.conf"   # absolute: ./ is unreliable on compute-node CWD
-# NOTE: no DARSHAN_LOGFILE on purpose -> auto-named logs in the central Darshan dir.
+export DARSHAN_LOGPATH="${PWD}/${JOB_DIR}/darshan"
+mkdir -p "${DARSHAN_LOGPATH}/$(date +%Y/%-m/%-d)" "${DARSHAN_LOGPATH}/$(date -d tomorrow +%Y/%-m/%-d)"
 
 # ================================================== Model & Data Setup =============================================================
 # export LD_PRELOAD="/usr/lib64/libcrypto.so /usr/lib64/libssh.so.4 /usr/lib64/libssl.so.1.1"
@@ -137,7 +146,27 @@ export CHECKPOINT_PATH=checkpoint/$(date +%Y-%m-%d)_${SLURM_JOB_ID}
 
 # export CHECKPOINT_PATH=checkpoint/shared_exp_swiglu_0701_2026_v2
 # export LOAD_CHECKPOINT_PATH=${CHECKPOINT_PATH}     # 1800
+
+# Env-overridable so a resume chain can point one job at another run's checkpoints
+# without editing the template (default unchanged).
+# LOAD_CHECKPOINT_PATH=checkpoint/2026-08-14_5266788 # fullloss-turn-2
 LOAD_CHECKPOINT_PATH=checkpoint/deepseek_16b_ds
+# LOAD_CHECKPOINT_PATH=checkpoint/2026-08-08_5209412 # gptmodel-pipe
+# LOAD_CHECKPOINT_PATH=checkpoint/2026-08-06_5182118 # step-60
+# LOAD_CHECKPOINT_PATH=checkpoint/2026-08-06_5182163 # step-90
+
+# LOAD_CHECKPOINT_PATH=checkpoint/2026-08-09_5213097 # nemotron-turn-1
+# LOAD_CHECKPOINT_PATH=checkpoint/2026-08-09_5213105  # nemotron-turn-2
+# LOAD_CHECKPOINT_PATH=checkpoint/2026-08-09_5213106 # nemotron-turn-3
+# LOAD_CHECKPOINT_PATH=checkpoint/2026-08-09_5213107 # nemotron-turn-4
+
+# LOAD_CHECKPOINT_PATH=checkpoint/2026-08-14_5261740 # dolci-sft-turn-1
+# LOAD_CHECKPOINT_PATH=checkpoint/2026-08-14_5261771 # dolci-sft-turn-2
+
+# LOAD_CHECKPOINT_PATH=checkpoint/2026-08-14_5264971 # dolci-full-turn-1
+# LOAD_CHECKPOINT_PATH=checkpoint/2026-08-14_5261771 # dolci-full-turn-2
+
+# LOAD_CHECKPOINT_PATH=checkpoint/2026-08-14_5182544 # step-90 TP4 
 
 # --- Continue training from a previous checkpoint ---------------------------
 # Point at the PARENT dir containing latest_checkpointed_iteration.txt
@@ -158,8 +187,13 @@ LOAD_CHECKPOINT_PATH=checkpoint/deepseek_16b_ds
 
 # DeepSeek-MoE-16B:
 export VOCAB_FILE=/lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/examples_elmoe/data/deepseek_tokenizer/tokenizer.json
-export DATA_PATH=/lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/examples_elmoe/data/oscar-deepseek_text_document
-
+# export DATA_PATH=/lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/examples_elmoe/data/oscar-deepseek_text_document
+# nemotron-instruction-tune
+# export DATA_PATH=/lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/examples_elmoe/data/nemotron/nemotron-deepseek_text_document
+# export DATA_PATH=/lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/examples_elmoe/data/dolci/dolci-sft-deepseek_answer_mask_document
+# export DATA_PATH=/lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/examples_elmoe/data/dolci/dolci-sft-deepseek_text_document
+# Env-overridable (weighted "W1 prefix1 W2 prefix2" mixes allowed, megatron-style)
+export DATA_PATH=${DATA_PATH:-/lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/examples_elmoe/data/longctx/L8-dolma3-deepseek_text_document}
 
 # Llama tokenizer/data
 # export VOCAB_FILE=/lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/examples_elmoe/data/llama31_tokenizer/tokenizer.json
@@ -194,8 +228,42 @@ echo "  KV_HEADS: $KV_HEADS"
 
 
 # ================================================== Megatron Setup =============================================================
-GLOBAL_BATCH_SIZE=$(( NUM_BATCHES * BATCH_SIZE * (TOTAL_GPUS / PP_SIZE / MP_SIZE) ))
+# [2026-09-20 11:40, the user] the Ulysses degree divides the batch: the P ranks of a sequence-parallel group form ONE data-parallel
+# replica (Megatron: data_parallel_size = world / (PP x TP x P), as upstream's world / (TP x PP x CP)), so NUM_BATCHES means micro-batches
+# per replica per step. DS_SEQ_PAR_SIZE is 1 unless the AUTORUN_DS_SEQUENCE_PARALLEL_SIZE rider sets it, which keeps every run without
+# Ulysses byte-identical in arithmetic; the runs of 2026-09-17..20 with Ulysses P trained P x NUM_BATCHES x DP_NON_MOE sequences per step.
+DS_SEQ_PAR_SIZE=${DS_SEQ_PAR_SIZE:-1}
+GLOBAL_BATCH_SIZE=$(( NUM_BATCHES * BATCH_SIZE * (TOTAL_GPUS / PP_SIZE / MP_SIZE / DS_SEQ_PAR_SIZE) ))
 echo "GLOBAL_BATCH_SIZE=$GLOBAL_BATCH_SIZE"
+
+# --- Resolved parallel layout (informational) --------------------------------
+# A MoE model has TWO INDEPENDENT data-parallel widths:
+#     DP_NON_MOE = TOTAL_GPUS / PP / TP     non-expert grads all-reduce over this
+#     DP_MOE     = TOTAL_GPUS / PP / EP     expert grads all-reduce over this
+# TP does NOT divide DP_MOE: with enable_expert_tensor_parallelism=False (X-MoE's default)
+# deepspeed/moe/layer.py takes the _create_expert_and_data_parallel branch, which carves expert
+# groups from the GLOBAL rank space and only asserts _ensure_divisibility(TOTAL_GPUS/PP, EP).
+# EP*TP is therefore allowed to exceed TOTAL_GPUS (e.g. 8 GPUs with EP8+TP4 -> DP_moe=1,
+# DP_non_moe=2). GLOBAL_BATCH_SIZE above depends on DP_NON_MOE only, so EP never changes the
+# batch math. NOTE: EP_SIZE here is the model's NUMBER OF EXPERTS from model_registry.py,
+# not a parallel degree; TED-MOE (--enable-expert-tensor-parallelism) uses a different branch
+# where EP must instead divide DP_NON_MOE.
+PP_STRIDE=$(( TOTAL_GPUS / PP_SIZE ))
+DP_NON_MOE=$(( PP_STRIDE / MP_SIZE / DS_SEQ_PAR_SIZE ))   # [2026-09-20] the Ulysses group is one replica
+if (( EP_PARALLEL_SIZE >= 1 && PP_STRIDE % EP_PARALLEL_SIZE == 0 )); then
+    DP_MOE=$(( PP_STRIDE / EP_PARALLEL_SIZE ))
+else
+    DP_MOE="INVALID"
+    echo "WARNING: EP=${EP_PARALLEL_SIZE} does not divide TOTAL_GPUS/PP=${PP_STRIDE}; DeepSpeed's"
+    echo "         _ensure_divisibility(pp_stride, ep_size) will abort this run."
+fi
+echo "DP_NON_MOE (attention/dense DP width) : $DP_NON_MOE   (= ${TOTAL_GPUS} / PP ${PP_SIZE} / TP ${MP_SIZE} / Ulysses ${DS_SEQ_PAR_SIZE})"
+echo "DP_MOE     (replicas per expert shard): $DP_MOE   (= ${TOTAL_GPUS} / PP ${PP_SIZE} / EP ${EP_PARALLEL_SIZE})"
+if (( EP_PARALLEL_SIZE >= 1 && EP_SIZE % EP_PARALLEL_SIZE == 0 )); then
+    echo "LOCAL_EXPERTS (experts per rank): $(( EP_SIZE / EP_PARALLEL_SIZE ))  (num_experts=${EP_SIZE} / EP=${EP_PARALLEL_SIZE})"
+else
+    echo "WARNING: num_experts=${EP_SIZE} is not divisible by EP=${EP_PARALLEL_SIZE}; deepspeed/moe/layer.py will assert."
+fi
 
 # --- Static Training Parameters ---
 # 200M tokens for LR tuning 
@@ -215,15 +283,77 @@ echo "GLOBAL_BATCH_SIZE=$GLOBAL_BATCH_SIZE"
 # LR_DECAY_TOKENS=9800000000      # 9.8B = TRAIN_TOKENS - WARMUP_TOKENS
 # # -----------------------------------------------------------
 
+# # -----------------------------------------------------------
+# # 10B tokens 
+# # DeepSeek-v2-16B 
+# LR=4.2e-4
+# MIN_LR=4.2e-5
+# TRAIN_TOKENS=10000000000 
+# WARMUP_TOKENS=1000000000         # 200M tokens 
+# LR_DECAY_TOKENS=9000000000      # 9.8B = TRAIN_TOKENS - WARMUP_TOKENS
+# # -----------------------------------------------------------
+
 # -----------------------------------------------------------
 # 10B tokens 
-# DeepSeek-v2-16B 
-LR=4.2e-4
-MIN_LR=4.2e-5
-TRAIN_TOKENS=10000000000 
-WARMUP_TOKENS=1000000000         # 200M tokens 
-LR_DECAY_TOKENS=9000000000      # 9.8B = TRAIN_TOKENS - WARMUP_TOKENS
+# DeepSeek-MoE-16B 80% data on ward lr
+LR=1.33e-4
+MIN_LR=1.33e-5
+TRAIN_TOKENS=11070000000
+WARMUP_TOKENS=100000000         # 200M tokens
+LR_DECAY_TOKENS=10970000000      # 9.8B = TRAIN_TOKENS - WARMUP_TOKENS
 # -----------------------------------------------------------
+
+# ----- SFT (answer-only loss). Launch: -----------------------------------
+#   SFT_MODE=1 SFT_DATA_PATH=<prefix>_text_document ./local_autorun_...
+# with LOAD_CHECKPOINT_PATH pointed at the STEP-0 IMPORTED BASE above and
+# the dispatcher iters set to ~2 epochs (docs_kept x 4096 x 2 / GBS/seq).
+# Nothing here runs unless SFT_MODE=1 -- the mid-training path is untouched.
+if [ "${SFT_MODE:-0}" == "1" ] || [ "${SFT_MODE:-0}" == "full" ]; then
+    LR=1e-5                       # DeepSeekMoE-Chat's own SFT recipe;
+    MIN_LR=1e-6                   # the pretraining LR above would wreck the base
+    if [ "${SFT_MODE}" == "1" ]; then
+        # Masked SFT on the PADDED two-stream corpus (dolci-sft-deepseek).
+        # docs_kept=1,909,572 (manifest 2026-08-13); 2 epochs ~852 iters at GBS 4480.
+        TRAIN_TOKENS=15643213824      # 1,909,572 x 4096 x 2
+        WARMUP_TOKENS=1835008000      # ~100 steps x 4480 x 4096
+        LR_DECAY_TOKENS=13808205824   # TRAIN - WARMUP
+    else
+        # SFT_MODE=full: full-loss ablation on the UNPADDED corpus
+        # (dolci-fullloss-deepseek, built with --no-pad). Same rows, same LR,
+        # no mask -- 2 epochs = 2 x 1,198,536,345 real tokens, ~131 iters.
+        TRAIN_TOKENS=2397072690
+        WARMUP_TOKENS=256901120       # ~14 steps
+        LR_DECAY_TOKENS=2140171570
+    fi
+    # optional override for short/1-node diagnostic runs (e.g. the overfit
+    # gate): the token-based warmup is sized for GBS 4480 and would pin LR
+    # at ~0 for thousands of iters at a small GBS.
+    WARMUP_TOKENS="${SFT_WARMUP_TOKENS:-$WARMUP_TOKENS}"
+    export DATA_PATH="${SFT_DATA_PATH:?SFT_MODE needs SFT_DATA_PATH (a _text_document prefix)}"
+fi
+# --------------------------------------------------------------------------
+
+# ----- Long-context extension (LC_MODE=1): 4096 -> 8192 raw-text CPT -------
+# Launch: LC_MODE=1 ./local_autorun_...  with the dispatcher NBS HALVED
+# (70 -> 35) so token-GBS stays 18.35M/step at the doubled seq length.
+# Turn 1 loads the mid-training checkpoint with the manual --finetune toggle
+# ON (fresh schedule + skips the seq-length checkpoint-args check);
+# continuation turns: toggle OFF, as always. Full loss, no mask.
+if [ "${LC_MODE:-0}" == "1" ]; then
+    # SEQ_LEN="${LC_SEQ_LEN:-8192}"
+    LR=${LC_LR:-4.2e-5}              # late-pretraining-scale LR for the extension; LC_LR overrides (2026-10-06: the DeepSeek-V3 paper's 7.3e-6 for the 671B), default unchanged
+    MIN_LR=${LC_MIN_LR:-${LC_LR:-4.2e-5}}
+    TRAIN_TOKENS="${LC_TRAIN_TOKENS:-11000000000}"    # 34% long + 66% short replay
+    WARMUP_TOKENS=0
+    LR_DECAY_TOKENS="${LC_DECAY_TOKENS:-4450000000}"
+    LC_LONG="${LC_LONG_PREFIX:-/lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/examples_elmoe/data/longctx/L8-dolma3-deepseek_text_document}"
+    LC_REPLAY="${LC_REPLAY_PREFIX:-/lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/examples_elmoe/data/nemotron/nemotron-deepseek_text_document}"
+    # LC_DATA_PATH overrides the whole blend (e.g. the 9-stream mix16k list);
+    # default = the original 34/66 two-stream blend, unchanged.
+    export DATA_PATH="${LC_DATA_PATH:-0.34 ${LC_LONG} 0.66 ${LC_REPLAY}}"
+fi
+# --------------------------------------------------------------------------
+
 
 EXIT_DURATION=30000000
 # WARMUP_TOKENS=375000000
@@ -242,9 +372,9 @@ CL_TOKENS=60
 CL_TOKENS=$((CL_TOKENS * 1000000000))
 CL_STEP=$(( CL_TOKENS / (GLOBAL_BATCH_SIZE * CL_AVG_SEQLEN) ))
 LOG_INTERVAL=1
-EVAL_ITERS=0
+EVAL_ITERS=10
 EVAL_INTERVAL=300
-SAVE_INTERVAL=60
+SAVE_INTERVAL=100
 INIT_STD=0.014
 
 # --- Output and Data Configs ---
@@ -347,7 +477,7 @@ megatron_options=" \
         --train-iters ${TRAIN_ITERS} \
         --lr ${LR} \
         --min-lr ${MIN_LR} \
-        --lr-decay-style cosine \
+        --lr-decay-style constant \
         --split 98,2,0 \
         --log-interval ${LOG_INTERVAL} \
         --eval-interval ${EVAL_INTERVAL} \
@@ -357,6 +487,9 @@ megatron_options=" \
         --clip-grad 1.0 \
         --hysteresis 2 \
         --num-workers 0 \
+        --attention-dropout 0 \
+        --hidden-dropout 0 \
+        --fp32-residual-connection \
         --bf16 \
         --tensorboard-queue-size 1 \
         --log-timers-to-tensorboard \
@@ -374,11 +507,21 @@ megatron_options=" \
         --save-interval ${SAVE_INTERVAL} \
         --finetune \
 	--use-rotary-position-embeddings"
+        # --finetune \        <- manual toggle, pairs with --universal-checkpoint
+        #                        above (converted ckpt: --finetune, no UCP flag;
+        #                        UCP resume: UCP flag, no --finetune)
     # --using-torchrun \
         # --inference \
-                # --finetune \
 
-        
+                # --finetune \
+                # --universal-checkpoint \
+
+# export DUMP_BATCH_TOKENS=1
+# export DUMP_BATCH_TOKENS_ITERS="all"      # or "all"; default 0,1,2
+# export DUMP_BATCH_TOKENS_FULL=1   
+# export DEBUG_WEIGHT_DUMP=1
+export DEBUG_ACTIVATION_OUTPUT=0
+# export MOE_DROP_TOKEN=false   # 2026-09-18 (the user): token dropping ON for all runs; the default above is true, so this override is off
         
 # --- Conditional Logic ---
 # Set DeepSpeed flags and other settings based on whether this is a PP run.
@@ -437,6 +580,36 @@ elif [[ "${MOE_TYPE}" == "TUTEL-MOE" ]]; then
 elif [[ "${MOE_TYPE}" == "DENSE" ]]; then
     megatron_options="${megatron_options} --num-key-value-heads ${KV_HEADS} --swiglu  --normalization rmsnorm --disable-bias-linear --no-bias-gelu-fusion  --untie-embeddings-and-output-weights"
 fi
+
+# SFT (see the SFT block by the LR section): --answer-loss-only reads the
+# _answer_mask_document sibling stream; --finetune resets the token-driven LR
+# schedule (without it a loaded checkpoint's consumed_train_tokens starts the
+# run at the tail of the cosine -- looks alive, learns nothing).
+if [ "${SFT_MODE:-0}" == "1" ]; then
+    megatron_options="${megatron_options} --answer-loss-only"
+fi
+if [ "${LC_MODE:-0}" == "1" ]; then
+    # raised rope theta for the context extension; ablatable via env
+    megatron_options="${megatron_options} --rotary-base ${LC_ROTARY_BASE:-100000}"
+fi
+# Intra-document attention (env-gated, default off): tokens never attend across
+# document boundaries in a packed sequence. Implemented as document-boundary
+# cu_seqlens on the flash-attn varlen call -- see docs/PLAN_INTRA_DOC_ATTENTION.md.
+if [ "${INTRA_DOC:-0}" == "1" ]; then
+    megatron_options="${megatron_options} --intra-document-attention"
+fi
+# Pipe MoE auxiliary-loss rider (env-gated, default off): only meaningful for
+# pipeline-class runs; adds moe_loss_coeff * (summed aux losses) to the loss.
+if [ "${PIPE_MOE_AUX:-0}" == "1" ]; then
+    megatron_options="${megatron_options} --pipe-moe-aux-loss"
+fi
+# NOTE: --finetune / --universal-checkpoint stay MANUAL toggles in the main
+# options block above, exactly as for the pretraining runs. For SFT:
+#   * turn 1 from the step-0 base: --finetune optional (the base ckpt is at
+#     iteration 0, so the LR schedule starts fresh either way); REQUIRED only
+#     if starting SFT from a mid-training ckpt (nonzero consumed tokens would
+#     put LR at the cosine tail).
+#   * continuation turns: --finetune must be OFF or every turn restarts.
 # Turn off to 0, on to 1
 export LAYER_TIMING=0
 export LAYER_TIMING_TARGETS=0
@@ -460,7 +633,153 @@ if [ -n "${ARCH_FLAGS}" ]; then
     megatron_options="${megatron_options} ${ARCH_FLAGS}"
     echo "  ARCH_FLAGS: ${ARCH_FLAGS}"
 fi
+
+# UCP_ENABLE=1 -> resume from a universal checkpoint AND convert the final save
+# (the conversion block below keys on --universal-checkpoint being present).
+# Replaces the manual comment-toggling of --universal-checkpoint / --finetune:
+# --finetune discards optimizer state and the iteration counter, which silently
+# defeats a universal RESUME, so it is stripped here (review finding 2026-08-15).
+if [ "${UCP_ENABLE}" = "1" ]; then
+    megatron_options="${megatron_options//--finetune/} --universal-checkpoint"
+    echo "  UCP_ENABLE=1: --universal-checkpoint appended, --finetune stripped"
+fi
 # ================================================== END of Megatron Setup =============================================================
+
+
+# ================================================== Universal Checkpoint Conversion =============================================================
+# Converts the DeepSpeed checkpoint under $LOAD_CHECKPOINT_PATH into Universal Checkpoint format so
+# training can resume under a different TP/PP/DP/EP. Runs automatically when BOTH hold:
+#   * megatron_options contains --universal-checkpoint
+#   * LOAD_CHECKPOINT_PATH points at a directory containing a DeepSpeed `latest` tag file
+#
+# IDEMPOTENT: if <parent>/<tag>_universal already looks complete it is reused, so re-submitting the
+# same job does not reconvert ~183 GiB. Export UCP_FORCE=1 to reconvert anyway.
+#
+# WALLTIME: conversion reads ~183 GiB and writes ~183 GiB of fragments, then merges those into
+# ~183 GiB of atoms. Budget 20-40 min ON TOP of training time, or convert once with
+# convert_to_universal.slurm and let subsequent jobs hit the "reusing existing" path.
+#
+# Tunables (export before sbatch):
+#   UCP_WORKERS_EXTRACT   default 4. Each worker holds ONE whole ZeRO shard (~23 GiB for DeepSeek_16B),
+#                         so this is the knob that controls peak RAM. There are only DP shards to do,
+#                         and ds_to_universal clamps the count for you.
+#   UCP_WORKERS_MERGE     default 4. Each worker holds whole parameters; the largest is the embedding.
+#   UCP_FORCE=1           reconvert even if the output already exists.
+#
+# NOTE: deliberately no `set -euo pipefail` here -- it would change the behaviour of the whole
+# template. Every step below is checked explicitly instead.
+convert_to_universal() {
+    local parent="$1"
+    local workers_extract="${UCP_WORKERS_EXTRACT:-4}"
+    local workers_merge="${UCP_WORKERS_MERGE:-4}"
+    local tag step_dir out_dir rc n_atoms n_expert
+
+    echo "================ Universal Checkpoint conversion ================"
+
+    if [[ -z "${parent}" || ! -d "${parent}" ]]; then
+        echo "FATAL: --universal-checkpoint is set but LOAD_CHECKPOINT_PATH='${parent}' is not a directory (cwd=$(pwd))"
+        return 1
+    fi
+
+    # DeepSpeed records the newest tag in <parent>/latest, e.g. "global_step60".
+    tag=$(cat "${parent}/latest" 2>/dev/null)
+    if [[ -z "${tag}" ]]; then
+        echo "FATAL: '${parent}/latest' is missing or empty -- not a DeepSpeed checkpoint directory."
+        echo "       (A weights-only import such as deepseek_16b_ds has no optimizer state and cannot"
+        echo "        be converted; load it with --finetune and WITHOUT --universal-checkpoint.)"
+        return 1
+    fi
+
+    step_dir="${parent}/${tag}"
+    out_dir="${parent}/${tag}_universal"
+
+    echo "  latest DeepSpeed step : ${tag}"
+
+    # Is the LATEST step already converted? Three conditions, all required:
+    #   1. zero/optimizer_state.pt exists      -- the merge phase ran to completion
+    #   2. no tmp/ left behind                 -- extraction was not interrupted
+    #   3. at least one atom directory         -- guards against an empty zero/ from a killed job
+    # Anything less and we reconvert rather than resume from a partially populated zero/.
+    local n_existing=0
+    if [[ -d "${out_dir}/zero" ]]; then
+        n_existing=$(find "${out_dir}/zero" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+    fi
+    if [[ -f "${out_dir}/zero/optimizer_state.pt" && ! -d "${out_dir}/tmp" && ${n_existing} -gt 0 ]]; then
+        if [[ -n "${UCP_FORCE:-}" ]]; then
+            echo "  universal checkpoint for ${tag} exists (${n_existing} atoms) but UCP_FORCE=1 -- reconverting"
+        else
+            echo "  ALREADY CONVERTED: ${out_dir}  (${n_existing} atoms) -- skipping conversion"
+            echo "  (export UCP_FORCE=1 to reconvert)"
+            printf '%s\n' "${tag}_universal" > "${parent}/latest_universal"
+            echo "  latest_universal -> ${tag}_universal"
+            echo "================================================================"
+            return 0
+        fi
+    elif [[ -d "${out_dir}" ]]; then
+        echo "  found an INCOMPLETE ${out_dir} (atoms=${n_existing},"
+        echo "        optimizer_state.pt=$([ -f "${out_dir}/zero/optimizer_state.pt" ] && echo yes || echo no),"
+        echo "        tmp/=$([ -d "${out_dir}/tmp" ] && echo present || echo absent)) -- reconverting"
+    else
+        echo "  no universal checkpoint for ${tag} yet -- converting"
+    fi
+
+    echo "  input   : ${step_dir}"
+    echo "  output  : ${out_dir}"
+    echo "  workers : extract=${workers_extract} merge=${workers_merge}"
+    echo "  started : $(date '+%F %T')"
+    if [[ ! -d "${step_dir}" ]]; then
+        echo "FATAL: ${step_dir} does not exist (referenced by ${parent}/latest)"
+        return 1
+    fi
+    df -h . | tail -1
+
+    mkdir -p "${out_dir}"
+    # Atom files are large and written sequentially: stripe so the merge phase is not served by one OST.
+    lfs setstripe -c 8 -S 4M "${out_dir}" 2>/dev/null || echo "  (lfs setstripe unavailable; continuing)"
+
+    srun -N1 -n1 -c 32 env LD_PRELOAD="${DARSHAN_PRELOAD}" python -m deepspeed.checkpoint.ds_to_universal \
+        --input_folder  "${step_dir}" \
+        --output_folder "${out_dir}" \
+        --num_extract_workers "${workers_extract}" \
+        --num_merge_workers   "${workers_merge}"
+    rc=$?
+    if [[ ${rc} -ne 0 ]]; then
+        echo "FATAL: ds_to_universal exited ${rc}."
+        return ${rc}
+    fi
+
+    n_atoms=$(find "${out_dir}/zero" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+    n_expert=$(find "${out_dir}/zero" -mindepth 1 -maxdepth 1 -type d -name '*deepspeed_experts*' 2>/dev/null | wc -l)
+    echo "  finished: $(date '+%F %T')"
+    echo "  atoms total       : ${n_atoms}"
+    echo "  expert atoms      : ${n_expert}  (expect num_moe_layers * num_experts * 2)"
+    echo "  optimizer_state.pt: $([ -f "${out_dir}/zero/optimizer_state.pt" ] && echo present || echo MISSING)"
+    echo "  latest_universal  -> $(cat "${parent}/latest_universal" 2>/dev/null || echo MISSING)"
+
+    # A surviving tmp/ means the merge phase did not run to completion; resuming from a partially
+    # populated zero/ would die on the first missing atom, so stop here instead.
+    if [[ ! -f "${out_dir}/zero/optimizer_state.pt" || -d "${out_dir}/tmp" ]]; then
+        echo "FATAL: conversion did not complete cleanly (tmp/ still present or optimizer_state.pt missing)."
+        return 1
+    fi
+    echo "================================================================"
+    return 0
+}
+
+if [[ "${megatron_options}" == *"--universal-checkpoint"* && "${UCP_SKIP_CONVERT:-0}" != "1" ]]; then
+    # UCP_SKIP_CONVERT=1 -> trust the existing universal dir as-is. Needed when the
+    # atoms were prepared externally (e.g. migrate_ucp_namespace.py renamed a legacy
+    # GPTModel-namespace conversion for a pipe-class resume) -- this block would
+    # otherwise regenerate/restore the original namespace over the migration.
+    if ! convert_to_universal "${LOAD_CHECKPOINT_PATH:-}"; then
+        echo "Aborting job: universal checkpoint conversion failed. Training would resume from an"
+        echo "incomplete checkpoint, so nothing is launched."
+        exit 1
+    fi
+else
+    echo "[universal-checkpoint] --universal-checkpoint not set; skipping conversion."
+fi
+# ================================================== END of Universal Checkpoint Conversion =============================================================
 
 
 # ================================================== DeepSpeed Setup =============================================================
@@ -575,11 +894,20 @@ export TRITON_PTXAS_NUM_WORKERS=1
 export OMP_NUM_THREADS=1
 export NCCL_TIMEOUT=1200
 export NCCL_TIMEOUT_MS=1200000
-export TORCH_NCCL_BLOCKING_WAIT=1
-
-# help exit the program if nccl hang 
+# [2026-10-08, measured by fault injection, jobs 5639309 and 5639642] TORCH_NCCL_BLOCKING_WAIT=1 together with
+# TORCH_NCCL_ASYNC_ERROR_HANDLING=1 leaves ONLY the blocking wait in force (PyTorch keeps one of the two), and the blocking wait
+# does not cover a stream sync after a collective: with one rank stopped, the other 15 waited 31 min in .tolist() after the expert
+# all-to-all with no error (5639309); the 256-node link 5638129 waited 86 min the same way. With the blocking wait OFF the watchdog
+# thread fires at the group timeout (10 min on the expert group), names the collective and tears the processes down (5639642:
+# "Watchdog caught collective operation timeout: WorkNCCL(SeqNum=2497, OpType=ALLTOALL_BASE ...)"). The flight recorder writes the
+# last collectives of every rank into the job folder on that timeout, so the rank that never entered the collective is readable.
+export TORCH_NCCL_BLOCKING_WAIT=0
+export NCCL_BLOCKING_WAIT=0
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_NCCL_DUMP_ON_TIMEOUT=1
+export TORCH_NCCL_TRACE_BUFFER_SIZE=2000
+export TORCH_NCCL_DEBUG_INFO_TEMP_FILE="${JOB_DIR}/nccl_trace_rank_"
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
@@ -647,7 +975,7 @@ echo "--- Cache warm done at: $(date '+%F %T') ---"
 #   monitor.tsv     — one row per (interval,rank) for grep/plot.
 # Needs ~/.local/bin/py-spy on $HOME (shared across nodes).
 # Adaptive cadence: every 1 min for the first 5 min (catch first-iteration hangs), then every 3 min.
-MON_FAST=120; MON_SLOW=240; MON_WINDOW=600; MON_TRACE_FRAMES=20
+MON_FAST=120; MON_SLOW=240; MON_WINDOW=1200; MON_TRACE_FRAMES=20
 bash "${DIR:-.}/monitor_run.sh" "${JOB_DIR}" "${MON_FAST}" "${MON_SLOW}" "${MON_WINDOW}" "${MON_TRACE_FRAMES}" &
 MONITOR_PID=$!
 trap 'kill ${MONITOR_PID} 2>/dev/null' EXIT
@@ -778,7 +1106,7 @@ export mem_snapshot_ranks="all"          # which ranks dump a memory .pickle: "a
 
 export profile_dir="${JOB_DIR}/torch_profile"
 
-# Darshan per-rank logs land here (DARSHAN_LOGFILE set per-rank in the srun below).
+# Darshan logs of this run land under ${JOB_DIR}/darshan/<Y>/<M>/<D>/ (DARSHAN_LOGPATH, set in the Darshan block).
 mkdir -p "${JOB_DIR}/darshan"
 
 planner_mode="{{RUN_PLANNER}}"
@@ -798,7 +1126,7 @@ srun -N ${NODES} -n ${TOTAL_GPUS} -c6 \
      --kill-on-bad-exit=1 \
      --export=ALL,FI_MR_CACHE_MONITOR,FI_CXI_DEFAULT_CQ_SIZE,FI_CXI_RX_MATCH_MODE,NCCL_DEBUG,UNEVEN_PP,TRITON_CACHE_DIR,TRITON_DISABLE_CACHE \
      bash -c "
-     python ../ELMoE_launch.py \
+     LD_PRELOAD=\"${DARSHAN_PRELOAD}\" python ../ELMoE_launch.py \
         --run-planner ${planner_mode} \
         --planner-profile-dir ./planner_profiling_cache \
         ${megatron_options} \

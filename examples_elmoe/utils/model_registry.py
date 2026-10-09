@@ -23,12 +23,43 @@ import sys
 # Entries without these fields emit an empty ARCH_FLAGS, so existing runs and their
 # checkpoints are unaffected.
 MODEL_SPECS = {
-    "10B":    {"h": 2048, "ffn": 1408, "heads": 16, "ep": 64,  "k": 6, "s": 2048, "layers": 24},
+    # eod_token: consumed only by the HF tokenizer path (tokenizer.py:37); the GPT2BPE
+    # benchmark path ignores it. Needed when 10B runs on DeepSeek-tokenized corpora
+    # with --intra-document-attention (PP rider equivalence runs, 2026-08-23).
+    "10B":    {"h": 2048, "ffn": 1408, "heads": 16, "ep": 64,  "k": 6, "s": 2048, "layers": 24,
+               "eod_token": "<｜end▁of▁sentence｜>"},
     "10B_k7":    {"h": 2048, "ffn": 1408, "heads": 16, "ep": 64,  "k": 7, "s": 2048, "layers": 24},
     "10B_k8":    {"h": 2048, "ffn": 1408, "heads": 16, "ep": 64,  "k": 8, "s": 2048, "layers": 24},
     "50B":    {"h": 5120, "ffn": 1536, "heads": 40, "ep": 128, "k": 6, "s": 4096, "layers": 24},
     "56B":    {"h": 5120, "ffn": 1536, "heads": 40, "ep": 128, "k": 6, "s": 4096, "layers": 27},
-    "63B":    {"h": 5120, "ffn": 1536, "heads": 40, "ep": 128, "k": 6, "s": 4096, "layers": 32},
+    "63B":    {"h": 5120, "ffn": 1536, "heads": 40, "ep": 128, "k": 6, "s": 4096, "layers": 32,
+               "eod_token": "<｜end▁of▁sentence｜>"},   # 2026-09-05: DeepSeek-tokenized corpora are the default DATA_PATH; without it the HFTokenizer EOD lookup fails (job 5425223)
+    # SwiGLU equal-weight variants of 10B / 63B (UCP I/O round 2, E5; delivered 2026-09-05 15:54 EDT).
+    # gelu expert = 2 matrices h x ffn; swiglu expert = 3 matrices h x ffn' (fused [gate;up]
+    # of shape [2*ffn', h] plus down [h, ffn']). Equal expert weights:
+    #   3*h*ffn' = 2*h*ffn  ->  ffn' = 2/3 * ffn
+    #   63B: 2/3 * 1536 = 1024, exact (3*1024 = 3072 = 2*1536).
+    #   10B: 2/3 * 1408 = 938.67, no integer solution; 936 (nearest multiple of 8) gives
+    #        3*2048*936 = 5,750,784 expert weights vs 5,767,168 (-0.28%), total params
+    #        9,450,418,176 vs 9,474,871,296 (-0.26%).
+    # The template always passes --ffn-hidden-size, so arguments.py's 2/3 auto-scale never
+    # runs: the ffn here IS the per-matrix width. SwiGLU keeps the tensor count per expert
+    # (4 with biases, 2 without), so the expected universal-checkpoint atom files
+    # (3 per tensor: fp32/exp_avg/exp_avg_sq) are
+    #   bias on : 10B 6,363 tensors -> 19,089 files (= parent); 63B 16,675 -> 50,025 (= parent)
+    #   bias off: 10B 3,243 tensors ->  9,729 files;             63B  8,419 -> 25,257
+    #   (bias False = --disable-bias-linear: linear biases go, layernorm biases stay.)
+    # Run only with MOE_TYPE X-MOE / ELMOE-3D (plain Experts class): both fused grouped-GEMM
+    # expert classes hard-code F.gelu. get_filename keys on h/ep/ffn/k/s/mbs, so the _eq and
+    # _eq_nb pair of one size shares a planner-profile filename (planner mode only).
+    "10B_swiglu_eq":    {"h": 2048, "ffn": 936,  "heads": 16, "ep": 64,  "k": 6, "s": 2048, "layers": 24,
+                         "swiglu": True, "eod_token": "<｜end▁of▁sentence｜>"},
+    "10B_swiglu_eq_nb": {"h": 2048, "ffn": 936,  "heads": 16, "ep": 64,  "k": 6, "s": 2048, "layers": 24,
+                         "swiglu": True, "bias": False, "eod_token": "<｜end▁of▁sentence｜>"},
+    "63B_swiglu_eq":    {"h": 5120, "ffn": 1024, "heads": 40, "ep": 128, "k": 6, "s": 4096, "layers": 32,
+                         "swiglu": True, "eod_token": "<｜end▁of▁sentence｜>"},
+    "63B_swiglu_eq_nb": {"h": 5120, "ffn": 1024, "heads": 40, "ep": 128, "k": 6, "s": 4096, "layers": 32,
+                         "swiglu": True, "bias": False, "eod_token": "<｜end▁of▁sentence｜>"},
     "173B":   {"h": 7168, "ffn": 2048, "heads": 56, "ep": 256, "k": 8, "s": 4096, "layers": 24},
     "537B":   {"h": 7168, "ffn": 2560, "heads": 56, "ep": 256, "k": 8, "s": 4096, "layers": 60},
     "1T":     {"h": 7168, "ffn": 2560, "heads": 56, "ep": 512, "k": 8, "s": 4096, "layers": 60},
@@ -36,6 +67,16 @@ MODEL_SPECS = {
     # Mirrors HF deepseek-ai/deepseek-moe-16b-base so its weights can be converted
     # in and loaded. ffn == moe_intermediate_size (1408); layer 0 is a dense MLP of
     # width intermediate_size (10944) via first_k_dense/dense_ffn. vocab 102400.
+    # 4-layer smoke-test clone of DeepSeek_16B (1 dense + 3 MoE at first_k_dense=1),
+    # seq 8192 so intra-document varlen attention is exercised at the LC target length.
+    # Random-init only -- there is no checkpoint with this shape.
+    "DeepSeek_16B_4L": {"h": 2048, "ffn": 1408, "heads": 16, "ep": 64,  "k": 6, "s": 8192, "layers": 4,
+                     "shared": 2, "first_k_dense": 1, "dense_ffn": 10944, "expert_interval": 1,
+                     "norm": "rmsnorm", "norm_eps": 1e-6, "bias": False, "swiglu": True,
+                     "untie_embeddings": True, "vocab": 102400,
+                     "tokenizer_type": "HFTokenizer",
+                     "eod_token": "<｜end▁of▁sentence｜>",
+                     "softmax_before_topk": True},
     "DeepSeek_16B": {"h": 2048, "ffn": 1408, "heads": 16, "ep": 64,  "k": 6, "s": 4096, "layers": 28,
                      "shared": 2, "first_k_dense": 1, "dense_ffn": 10944, "expert_interval": 1,
                      "norm": "rmsnorm", "norm_eps": 1e-6, "bias": False, "swiglu": True,
@@ -61,6 +102,20 @@ MODEL_SPECS = {
                        "routed_scaling_factor": 2.5, "moe_router_bias_update_speed": 0.001, "moe_seq_balance_coeff": 0.0,
                        "num_nextn_predict_layers": 0,
                        "rope_scaling": {"factor": 40, "original_max_position_embeddings": 4096, "beta_fast": 32, "beta_slow": 1, "mscale": 1.0, "mscale_all_dim": 1.0}}},
+    # 2026-10-08: the same model with the YaRN scale raised from 40 to 64 (target window 4,096 x 64 = 262,144) for the 256k extension
+    # stage; every other value identical to DeepSeek_V3_671B. Used by the 256k training links and by the evaluation of their
+    # checkpoints (and of the released base at factor 64, the step-0 baseline). The lineage sets the scale to the target once and
+    # trains afterwards (DeepSeek-V2 2024-05 and V3 2024-12, section 4.3: s = 40 for 160K, trained at 32K then 128K).
+    "DeepSeek_V3_671B_y64": {"h": 7168, "ffn": 2048, "heads": 128, "ep": 256, "k": 8, "s": 8192, "layers": 61,
+                "shared": 1, "first_k_dense": 3, "dense_ffn": 18432, "expert_interval": 1,
+                "norm": "rmsnorm", "norm_eps": 1e-06, "bias": False, "swiglu": True,
+                "untie_embeddings": True, "vocab": 129280,
+                "tokenizer_type": "NullTokenizer", "null_vocab": 129279, "rotary_base": 10000,
+                "v3": {"q_lora_rank": 1536, "kv_lora_rank": 512, "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+                       "scoring_func": "sigmoid", "topk_method": "noaux_tc", "n_group": 8, "topk_group": 4, "norm_topk_prob": True,
+                       "routed_scaling_factor": 2.5, "moe_router_bias_update_speed": 0.001, "moe_seq_balance_coeff": 0.0,
+                       "num_nextn_predict_layers": 0,
+                       "rope_scaling": {"factor": 64, "original_max_position_embeddings": 4096, "beta_fast": 32, "beta_slow": 1, "mscale": 1.0, "mscale_all_dim": 1.0}}},
     # moonshotai/Moonlight-16B-A3B (2026-09-12, the HF comparison milestone): the released DeepSeek-V3 architecture at 16B, every
     # value from its config.json (hidden 2048, 27 layers, 16 heads, kv_lora 512 and no q_lora, 64 routed + 2 shared experts, top 6,
     # sigmoid gate with the bias, one group, scaling 2.446, dense first layer 11264, rope theta
@@ -70,6 +125,30 @@ MODEL_SPECS = {
     # The released 671B cut to two layers (2026-09-14, the memory workflow's second reference: one dense layer, layer 0, and one
     # MoE layer, layer 1, every other value the 671B's): the calculator's prediction for a 1-2 node run is checked against the
     # memory snapshot before the full model is touched. Random init, the null tokenizer; no checkpoint matches this shape.
+    # [2026-09-19 09:10, the user] the four-MoE-layer profile model: every value the 671B's, 4 layers, none dense, one layer per
+    # stage under PP 4; the torch-profiler / TraceLens window of the 32k layout (TP 8 + SP x Ulysses 4 x EP 8). Random init, null tokenizer.
+    "DeepSeek_V3_671B_L4": {"h": 7168, "ffn": 2048, "heads": 128, "ep": 256, "k": 8, "s": 8192, "layers": 4,
+                "shared": 1, "first_k_dense": 0, "dense_ffn": 18432, "expert_interval": 1,
+                "norm": "rmsnorm", "norm_eps": 1e-06, "bias": False, "swiglu": True,
+                "untie_embeddings": True, "vocab": 129280,
+                "tokenizer_type": "NullTokenizer", "null_vocab": 129279, "rotary_base": 10000,
+                "v3": {"q_lora_rank": 1536, "kv_lora_rank": 512, "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+                       "scoring_func": "sigmoid", "topk_method": "noaux_tc", "n_group": 8, "topk_group": 4, "norm_topk_prob": True,
+                       "routed_scaling_factor": 2.5, "moe_router_bias_update_speed": 0.001, "moe_seq_balance_coeff": 0.0,
+                       "num_nextn_predict_layers": 0, "rope_scaling": {"factor": 40, "original_max_position_embeddings": 4096, "beta_fast": 32, "beta_slow": 1, "mscale": 1.0, "mscale_all_dim": 1.0}}},
+    # [2026-09-20 10:50, the user] the one-stage probe model of the 671B at PP 8: eight layers, the first dense and seven MoE (a middle
+    # stage of the 61-layer model holds 7-8 MoE layers; stage 0 holds the three dense ones), every other value the 671B's; PP 1 on
+    # 8-16 nodes with the production layouts' EP x TP x Ulysses, so one hour measures one stage's pace at 128k-512k and the torch
+    # profiler reads its window. Random init, null tokenizer.
+    "DeepSeek_V3_671B_L8D1": {"h": 7168, "ffn": 2048, "heads": 128, "ep": 256, "k": 8, "s": 8192, "layers": 8,
+                "shared": 1, "first_k_dense": 1, "dense_ffn": 18432, "expert_interval": 1,
+                "norm": "rmsnorm", "norm_eps": 1e-06, "bias": False, "swiglu": True,
+                "untie_embeddings": True, "vocab": 129280,
+                "tokenizer_type": "NullTokenizer", "null_vocab": 129279, "rotary_base": 10000,
+                "v3": {"q_lora_rank": 1536, "kv_lora_rank": 512, "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+                       "scoring_func": "sigmoid", "topk_method": "noaux_tc", "n_group": 8, "topk_group": 4, "norm_topk_prob": True,
+                       "routed_scaling_factor": 2.5, "moe_router_bias_update_speed": 0.001, "moe_seq_balance_coeff": 0.0,
+                       "num_nextn_predict_layers": 0, "rope_scaling": {"factor": 40, "original_max_position_embeddings": 4096, "beta_fast": 32, "beta_slow": 1, "mscale": 1.0, "mscale_all_dim": 1.0}}},
     "DeepSeek_V3_671B_L2": {"h": 7168, "ffn": 2048, "heads": 128, "ep": 256, "k": 8, "s": 4096, "layers": 2,
                 "shared": 1, "first_k_dense": 1, "dense_ffn": 18432, "expert_interval": 1,
                 "norm": "rmsnorm", "norm_eps": 1e-06, "bias": False, "swiglu": True,
@@ -79,6 +158,18 @@ MODEL_SPECS = {
                        "scoring_func": "sigmoid", "topk_method": "noaux_tc", "n_group": 8, "topk_group": 4, "norm_topk_prob": True,
                        "routed_scaling_factor": 2.5, "moe_router_bias_update_speed": 0.001, "moe_seq_balance_coeff": 0.0,
                        "num_nextn_predict_layers": 0, "rope_scaling": None}},
+    # [2026-10-06 04:40, the user] the planner-cache profiling sweep at 128k on 8 nodes: TWO MoE layers of the 671B (first_k_dense 0;
+    # the L2 entry above is one dense + one MoE), every other value the 671B's incl. the released YaRN (factor 40 -> 163,840 positions).
+    # PP 1, EP 16/32/64 x TP 8/4/2 x Ulysses 4/8/16, mbs 2, GBS 16 sequences, no recompute, random init, null tokenizer.
+    "DeepSeek_V3_671B_L2M": {"h": 7168, "ffn": 2048, "heads": 128, "ep": 256, "k": 8, "s": 8192, "layers": 2,
+                "shared": 1, "first_k_dense": 0, "dense_ffn": 18432, "expert_interval": 1,
+                "norm": "rmsnorm", "norm_eps": 1e-06, "bias": False, "swiglu": True,
+                "untie_embeddings": True, "vocab": 129280,
+                "tokenizer_type": "NullTokenizer", "null_vocab": 129279, "rotary_base": 10000,
+                "v3": {"q_lora_rank": 1536, "kv_lora_rank": 512, "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+                       "scoring_func": "sigmoid", "topk_method": "noaux_tc", "n_group": 8, "topk_group": 4, "norm_topk_prob": True,
+                       "routed_scaling_factor": 2.5, "moe_router_bias_update_speed": 0.001, "moe_seq_balance_coeff": 0.0,
+                       "num_nextn_predict_layers": 0, "rope_scaling": {"factor": 40, "original_max_position_embeddings": 4096, "beta_fast": 32, "beta_slow": 1, "mscale": 1.0, "mscale_all_dim": 1.0}}},
     "Moonlight_16B_A3B": {"h": 2048, "ffn": 1408, "heads": 16, "ep": 64, "k": 6, "s": 8192, "layers": 27,
                 "shared": 2, "first_k_dense": 1, "dense_ffn": 11264, "expert_interval": 1,
                 "norm": "rmsnorm", "norm_eps": 1e-05, "bias": False, "swiglu": True,

@@ -32,8 +32,11 @@ def non_torch_vram(world):
     lo, hi = math.log2(8), math.log2(512); x = min(max(math.log2(max(world, 8)), lo), hi)
     return NON_TORCH_VRAM_1NODE + (NON_TORCH_VRAM_512 - NON_TORCH_VRAM_1NODE) * (x - lo) / (hi - lo)
 ALLOC_SLACK = 0.18                # reserved / allocated - 1 on a typical rank without expandable segments: M1 60.2 / 51.3 = 0.173 (block recompute), R16f 52.6 / 44.1 = 0.195 (every layer checkpointed); the caching allocator's fragmentation
-SLACK_FLOOR = 10 * GiB            # the busiest rank of a stage: R671b (512 ranks, every rank's never-reset maximum) reserved minus allocated 8.4-15.7 GiB per stage at the worst rank while the allocated peak differs by 0.7 GiB across a stage's 16 ranks
-SLACK_WORST = 16 * GiB            # the largest slack seen (R671b stage 24: 15.7 GiB); the out-of-memory line is allocated + this + the non-torch part
+SLACK_FLOOR = 7 * GiB             # [2026-09-19 03:15] was 10: fitted over the heaviest stage of 14 runs with memsnap reserved maxima (M1, R16f, R671L2a/b, R671, R671b,
+                                  # R671S, R671T4L, R671T8L, R671U2b and the token-dropping runs MS1/MS4/MS5/MS6): max(0.18 x allocated, 7 GiB) gives MAE 2.06 GiB / MAPE 4.6 pct /
+                                  # bias +0.12 on the reserved peak against 3.34 / 7.7 / +2.60 for the floor of 10; the out-of-memory line (SLACK_WORST) is unchanged.
+                                  # The old line: the busiest rank of a stage: R671b (512 ranks, every rank's never-reset maximum) reserved minus allocated 8.4-15.7 GiB per stage at the worst rank while the allocated peak differs by 0.7 GiB across a stage's 16 ranks
+SLACK_WORST = 16 * GiB            # [2026-09-19 08:40, the user] no longer printed anywhere: 'vram_worst' stays in stage()/table() only for the older page generators; the placement number is vram_est. Was: the largest slack seen (R671b stage 24: 15.7 GiB); the out-of-memory line is allocated + this + the non-torch part
 ZERO_BUCKET = 5e8                 # DeepSpeed reduce_bucket_size elements (the job config); two bf16 buckets live at the backward's peak (M1 frames :2068/:2075)
 ATTN_LSE = 4                      # flash attention keeps the log-sum-exp per query per head in fp32
 
@@ -53,7 +56,11 @@ def load_registry():
 
 class Shapes:
     """the per-layer parameter and activation shapes of one model entry"""
-    def __init__(self, entry, tp=1, sp=False, expert_tp=False):
+    def __init__(self, entry, tp=1, sp=False, expert_tp=False, capacity=1.0, routed_fraction=None):
+        # [2026-09-19 03:40] routed_fraction f: the rows an expert stage actually receives as a fraction of k x T (measured, e.g. from memsnap);
+        # None = the bound (capacity x k x T). The 671B at initialization routes 27-61 pct of a layer's rows to one expert, so under
+        # dropping its received rows sit far below the bound (R32-64 / R32-128 stages 2-28: 8-16 GiB under the model); a trained router is balanced.
+        self.cap = capacity if routed_fraction is None else float(routed_fraction)   # 2026-09-19: token dropping at capacity factor c bounds the routed rows per rank by c x k x T (the worst case, every expert full); dropless = 1.0 (uniform routing assumed)
         e = entry; self.e = e; self.sp = bool(sp) and tp > 1   # Megatron sequence parallelism shards the residual stream by tp
         self.expert_tp = bool(expert_tp) and tp > 1              # default off: the sequence-sharded MoE block keeps whole experts on every tp rank and gives each one tp-th of the tokens
         self.h = e['h']; self.layers = e['layers']; self.heads = e['heads']; self.E = e['ep']; self.k = e['k']
@@ -140,10 +147,11 @@ class Shapes:
         h, k, I, tp, r = self.h, self.k, self.I, self.tp, self._res()
         b = h * BF16 / r                                          # norm output
         b += self.E * FP32 * 2 / tp                               # router logits and scores
-        b += k * h * BF16 / tp                                    # the dispatched tokens (expert GEMM inputs)
-        b += k * h * BF16 / tp                                    # the all-to-all output buffer
-        b += k * (2 if self.swiglu else 1) * I * BF16 / tp        # SwiGLU inputs of the routed experts
-        b += k * I * BF16 / tp                                    # the expert down-projection input
+        kc = k * self.cap                                         # routed rows per token: k (dropless, uniform) or k x capacity (token dropping, every expert full)
+        b += kc * h * BF16 / tp                                   # the dispatched tokens (expert GEMM inputs)
+        b += kc * h * BF16 / tp                                   # the all-to-all output buffer
+        b += kc * (2 if self.swiglu else 1) * I * BF16 / tp       # SwiGLU inputs of the routed experts
+        b += kc * I * BF16 / tp                                   # the expert down-projection input
         if self.shared:
             b += ((2 if self.swiglu else 1) * I * self.shared * BF16 + I * self.shared * BF16) / tp
         b += h * FP32 / tp                                        # the combine output in fp32 (on the token shard)
@@ -159,12 +167,12 @@ class Shapes:
 
 class MemoryModel:
     def __init__(self, model, nodes, pp, ep, mbs, gbs, seq, ckpt='full', tp=1, gpus_per_node=8, zero=1, partition=None,
-                 recompute_layers=None, chunked_ce=None, registry=None, sp=False, expert_tp=False, mask=True, seq_div=1):
+                 recompute_layers=None, chunked_ce=None, registry=None, sp=False, expert_tp=False, mask=True, seq_div=1, capacity=1.0, routed_fraction=None):
         reg = registry or load_registry()
         self.seq_div = int(seq_div)                               # a further division of every rank's sequence beyond tp (a context-parallel or Ulysses degree): the activation terms shrink by it, the weights do not; NOT a mechanism of this tree today, a what-if knob
         self.mask = bool(mask)                                    # the first stage keeps each in-flight micro-batch's [b, 1, s, s] bool attention mask (the code today); False = the mask no longer materialised
         self.sp = bool(sp) and tp > 1; self.expert_tp = bool(expert_tp) and tp > 1
-        self.name = model; self.entry = reg[model]; self.S = Shapes(self.entry, tp, self.sp, self.expert_tp)
+        self.name = model; self.entry = reg[model]; self.S = Shapes(self.entry, tp, self.sp, self.expert_tp, capacity=capacity, routed_fraction=routed_fraction)
         self.nodes, self.pp, self.ep, self.tp, self.mbs, self.gbs, self.seq = nodes, pp, ep, tp, mbs, gbs, seq
         self.ckpt = ckpt; self.zero = zero; self.chunked_ce = chunked_ce
         self.world = nodes * gpus_per_node
@@ -240,6 +248,9 @@ class MemoryModel:
         # 8k). It is NOT divided by seq_div: get_batch builds the whole-sequence mask on every sequence rank (R671U2b rank 0, 2026-09-17:
         # 32 x 1 GiB at 32k with the Ulysses degree 2, the pipe's _exec_load_micro_batch copies), so it is a term of its own.
         out['mask_inflight'] = (self.mbs * self.seq * self.seq * inflight) if (self.pp > 1 and s == 0 and self.mask) else 0
+        # [2026-09-19 03:30] the second mask: the pipeline driver precomputes a constant [1, 1, s, s] bool mask on EVERY rank at model build
+        # (pretrain_gpt_deepspeed.py lines 226-240, args.attn_mask), 1 GiB at 32k, 64 GiB at 256k; flash attention never reads it either
+        out['mask_const'] = (self.seq * self.seq) if (self.pp > 1 and self.mask) else 0
         # the recompute of one checkpointed layer during its backward: its full activations once, plus the layer's gradients
         recompute = max((f for f, c in zip(per_layer_full, per_layer_ckpt) if c), default=0)
         out['act_recompute_transient'] = recompute
@@ -249,7 +260,7 @@ class MemoryModel:
         moe_layers = [l for l in layers if S.is_moe(l)]
         tt = 1 if S.expert_tp else self.tp                        # the sequence-sharded MoE block routes one tp-th of the tokens per rank; with expert TP every token, sliced experts
         if moe_layers:
-            bwd = T / tt * (2 * S.k * S.h * BF16 + S.k * (2 if S.swiglu else 1) * S.I / (self.tp if S.expert_tp else 1) * BF16 + (2 if S.swiglu else 1) * S.I * S.shared / self.tp * BF16) + T * 2 * S.h * FP32 / rshard
+            bwd = T / tt * (2 * S.k * S.cap * S.h * BF16 + S.k * S.cap * (2 if S.swiglu else 1) * S.I / (self.tp if S.expert_tp else 1) * BF16 + (2 if S.swiglu else 1) * S.I * S.shared / self.tp * BF16) + T * 2 * S.h * FP32 / rshard
         else:
             bwd = T * ((2 if S.swiglu else 1) * S.dense_I / self.tp * BF16 + 2 * S.h * FP32 / rshard)
         out['act_backward_transient'] = bwd
@@ -262,7 +273,7 @@ class MemoryModel:
         out['embedding_act'] = (T * S.h * BF16) if s == 0 else 0
         # pipeline send/receive buffers (the fp32 residual crosses the stages) and the expert all-to-all send buffer
         out['pipe_buffers'] = (2 * T * S.h * FP32 / rshard) if self.pp > 1 else 0
-        out['a2a_send'] = T * S.k * S.h * BF16 / self.tp if any(S.is_moe(l) for l in layers) else 0
+        out['a2a_send'] = T * S.k * S.cap * S.h * BF16 / self.tp if any(S.is_moe(l) for l in layers) else 0
         out['tp_allreduce'] = (2 * T * S.h * BF16) if (self.tp > 1 and not self.sp) else ((2 * T * S.h * BF16 / self.tp) if self.tp > 1 else 0)   # the all-reduce (or reduce-scatter / all-gather) buffers of one layer
         if self.seq_div > 1:
             for k in ('act_kept_inflight', 'act_recompute_transient', 'act_backward_transient', 'logits_fp32', 'embedding_act', 'pipe_buffers', 'a2a_send', 'tp_allreduce'):
@@ -308,10 +319,10 @@ class MemoryModel:
 
 
 def fmt_table(rows):
-    head = f"{'stage':>5} {'layers':>8} {'inflight':>8} {'params B':>9} {'state':>7} {'act':>7} {'buffers':>8} {'alloc':>7} {'reserved':>9} {'VRAM':>7} {'worst':>7}  (GiB per GCD; worst = allocated + the largest slack + non-torch, the out-of-memory line)"
+    head = f"{'stage':>5} {'layers':>8} {'inflight':>8} {'params B':>9} {'state':>7} {'act':>7} {'buffers':>8} {'alloc':>7} {'reserved':>9} {'VRAM':>7}  (GiB per GCD; VRAM = allocated + max(0.18 x allocated, 7 GiB) + non-torch, the number a layout is judged by against 64)"
     lines = [head]
     for r in rows:
-        lines.append(f"{r['stage']:>5} {r['layers']:>8} {r['inflight']:>8} {r['params_B']:>9.2f} {r['state_GiB']:>7.1f} {r['act_GiB']:>7.1f} {r['buffers_GiB']:>8.1f} {r['allocated_GiB']:>7.1f} {r['reserved_GiB']:>9.1f} {r['vram_GiB']:>7.1f} {r['vram_worst_GiB']:>7.1f}")
+        lines.append(f"{r['stage']:>5} {r['layers']:>8} {r['inflight']:>8} {r['params_B']:>9.2f} {r['state_GiB']:>7.1f} {r['act_GiB']:>7.1f} {r['buffers_GiB']:>8.1f} {r['allocated_GiB']:>7.1f} {r['reserved_GiB']:>9.1f} {r['vram_GiB']:>7.1f}")
     return '\n'.join(lines)
 
 
@@ -339,7 +350,8 @@ def validate(measured_path):
 if __name__ == '__main__':
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--model'); ap.add_argument('--nodes', type=int); ap.add_argument('--pp', type=int, default=1); ap.add_argument('--ep', type=int, default=8)
-    ap.add_argument('--tp', type=int, default=1); ap.add_argument('--expert-tp', action='store_true', help='slice the experts by tp as well (default: the sequence-sharded MoE block, whole experts per tp rank, one tp-th of the tokens)'); ap.add_argument('--sp', action='store_true', help='Megatron sequence parallelism with tp > 1: the residual stream, norms, checkpoint inputs and pipe buffers shard by tp'); ap.add_argument('--seq-div', type=int, default=1, help='what-if: a further division of the sequence per rank beyond tp (a context-parallel or Ulysses degree); not a mechanism of this tree today'); ap.add_argument('--no-mask', action='store_true', help='the first stage no longer keeps the [s, s] attention mask per in-flight micro-batch (a code change; the default is the code as it is)'); ap.add_argument('--mbs', type=int, default=1); ap.add_argument('--gbs', type=int); ap.add_argument('--seq', type=int)
+    ap.add_argument('--capacity', type=float, default=1.0, help='token-dropping capacity factor (1.25 = the template default when moe_token_dropping is on): the routed rows per rank are bounded by capacity x k x T; 1.0 = dropless, uniform routing assumed'); ap.add_argument('--tp', type=int, default=1); ap.add_argument('--expert-tp', action='store_true', help='slice the experts by tp as well (default: the sequence-sharded MoE block, whole experts per tp rank, one tp-th of the tokens)'); ap.add_argument('--sp', action='store_true', help='Megatron sequence parallelism with tp > 1: the residual stream, norms, checkpoint inputs and pipe buffers shard by tp'); ap.add_argument('--seq-div', type=int, default=1, help='what-if: a further division of the sequence per rank beyond tp (a context-parallel or Ulysses degree); not a mechanism of this tree today'); ap.add_argument('--no-mask', action='store_true', help='the first stage no longer keeps the [s, s] attention mask per in-flight micro-batch (a code change; the default is the code as it is)'); ap.add_argument('--mbs', type=int, default=1); ap.add_argument('--gbs', type=int); ap.add_argument('--seq', type=int)
+    ap.add_argument('--routed-fraction', type=float, default=None, help='the rows an expert stage receives as a fraction of k x T (overrides the capacity bound; measured from memsnap on a collapsed-routing run)')
     ap.add_argument('--ckpt', default='full', choices=['full', 'none', 'block']); ap.add_argument('--recompute-layers', default='', help='block: e.g. 0-8')
     ap.add_argument('--chunked-ce', type=int, default=None); ap.add_argument('--partition', default=None, help='layers per stage, e.g. 2,2,...,1')
     ap.add_argument('--json', default=None); ap.add_argument('--validate', action='store_true'); ap.add_argument('--measured', default=os.path.join(HERE, 'v3_memory_measured.json'))
@@ -350,9 +362,9 @@ if __name__ == '__main__':
     if a.recompute_layers:
         lo, hi = a.recompute_layers.split('-'); rl = range(int(lo), int(hi) + 1)
     part = [int(x) for x in a.partition.split(',')] if a.partition else None
-    mm = MemoryModel(a.model, a.nodes, a.pp, a.ep, a.mbs, a.gbs, a.seq, a.ckpt, tp=a.tp, partition=part, recompute_layers=rl, chunked_ce=a.chunked_ce, sp=a.sp, expert_tp=a.expert_tp, mask=not a.no_mask, seq_div=a.seq_div)
+    mm = MemoryModel(a.model, a.nodes, a.pp, a.ep, a.mbs, a.gbs, a.seq, a.ckpt, tp=a.tp, partition=part, recompute_layers=rl, chunked_ce=a.chunked_ce, sp=a.sp, capacity=a.capacity, routed_fraction=a.routed_fraction, expert_tp=a.expert_tp, mask=not a.no_mask, seq_div=a.seq_div)
     print(f"{a.model}: {a.nodes} nodes, PP {a.pp} x EP {a.ep} x TP {a.tp}{' + SP' if mm.sp else ''}{' + expert TP' if mm.expert_tp else ''}, dp_non_moe {mm.dp_non_moe}, dp_moe {mm.dp_moe}, mbs {a.mbs}, GBS {a.gbs} -> {mm.micro_batches} micro-batches per pipeline, seq {a.seq}, ckpt {a.ckpt}")
     rows = mm.table(); print(fmt_table(rows))
-    print(f"heaviest stage: {max(rows, key=lambda r: r['vram_GiB'])['stage']} at {max(r['vram_GiB'] for r in rows):.1f} GiB VRAM, {max(r['vram_worst_GiB'] for r in rows):.1f} at the worst slack (64 GiB per GCD)")
+    print(f"heaviest stage: {max(rows, key=lambda r: r['vram_GiB'])['stage']} at {max(r['vram_GiB'] for r in rows):.1f} GiB VRAM (64 GiB per GCD)")
     if a.json:
         json.dump(dict(layout=vars(a), rows=rows, stages=[mm.stage(s) for s in range(a.pp)]), open(a.json, 'w'), indent=1, default=list); print('wrote', a.json)

@@ -287,12 +287,19 @@ def _initialize_distributed():
     #     "NCCL_SOCKET_IFNAME=", os.getenv("NCCL_SOCKET_IFNAME"),
     #     "GLOO_SOCKET_IFNAME=", os.getenv("GLOO_SOCKET_IFNAME"),
     #     "RESOLVES_TO=", socket.gethostbyname(os.getenv("MASTER_ADDR")))
+    # Honor --distributed-timeout-minutes on BOTH paths. torch 2.x defaults the
+    # NCCL process-group timeout to 10 minutes; on a cold node rank 0 can take
+    # far longer than that to reach this point (imports + JIT), and every other
+    # rank then dies with "retrieving ncclUniqueId from [0] ... wait timeout",
+    # burning the whole reservation. The timeout only matters when something is
+    # already slow, so raising it cannot hurt a healthy run.
+    _pg_timeout = timedelta(minutes=args.distributed_timeout_minutes)
     if args.deepspeed or args.ds_inference:
         print("deepspeed.init_distributed():" )
-        deepspeed.init_distributed()
+        deepspeed.init_distributed(timeout=_pg_timeout)
     else:
         print("before init_process_group:" )
-        torch.distributed.init_process_group(backend=args.distributed_backend,world_size=args.world_size,timeout=timedelta(minutes=10))
+        torch.distributed.init_process_group(backend=args.distributed_backend,world_size=args.world_size,timeout=_pg_timeout)
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.

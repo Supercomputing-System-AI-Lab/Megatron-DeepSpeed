@@ -122,6 +122,22 @@ fi
 # Evaluate the output to set the Bash variables
 eval "$CONFIG_VARS"
 
+# --- Long-context override: sequence length -----------------------------------
+# SEQ_LEN otherwise comes ONLY from the model_registry entry, so probing a new
+# length needs a new registry entry and a new MODEL_SIZE -- which changes two
+# things at once and breaks one-variable-per-job. This override changes exactly
+# the sequence length and nothing else, and it is applied HERE, before
+# megatron_options / GLOBAL_BATCH_SIZE / the ds_config / analyze_log are built,
+# so every consumer sees one consistent value rather than a duplicated
+# --seq-length flag whose meaning depends on argparse ordering.
+#
+# Unset = registry value = today's behaviour exactly.
+#   LC_SEQ_LEN=49152 sbatch ...
+if [ -n "${LC_SEQ_LEN:-}" ]; then
+    echo "  LC_SEQ_LEN override: SEQ_LEN ${SEQ_LEN} -> ${LC_SEQ_LEN}"
+    SEQ_LEN="${LC_SEQ_LEN}"
+fi
+
 echo "Model Config Loaded for ${MODEL_SIZE}:"
 echo "  HIDDEN_SIZE: $HIDDEN_SIZE"
 echo "  FFN_HIDDEN_SIZE:    $FFN_HIDDEN_SIZE"
@@ -326,7 +342,49 @@ export LAYER_TIMING_TARGETS=0
 if [ "${ACTIVATION_CHECKPOINT}" = "true" ]; then
     megatron_options="${megatron_options} --checkpoint-activations"
     megatron_options="${megatron_options} --checkpoint-num-layers $CHECKPOINT_NUM_LAYERS"
+
+    # --- Long-context lever: offload the activation-checkpoint boundaries ----
+    # At checkpoint_num_layers=1 the run retains one bf16 [s, b, h] tensor per
+    # layer -- 28 * 2048 * 2 = 114,688 B/token, which is 3.50 GiB at 32k and
+    # 14.00 GiB at 128k, all of it on device because partition_activations and
+    # checkpoint_in_cpu both default to False.
+    #
+    # Both Megatron args already exist (arguments.py --partition-activations,
+    # --checkpoint-in-cpu) and are already handed to DeepSpeed at
+    # megatron/initialize.py:204-211; DeepSpeed then clones each checkpointed
+    # tensor to host (activation_checkpointing/checkpointing.py:526-529 for the
+    # CPU-only case, :393-395 under partitioning). Nothing new is being built
+    # here -- the knob simply was not reachable from the template.
+    #
+    # DEFAULT IS OFF, so every existing render of this template is byte
+    # identical to what it produced before. Costs host round-trips per layer
+    # per pass, so it buys memory with throughput: measure both.
+    #   CPU_CKPT=1 sbatch ...
+    if [ "${CPU_CKPT:-0}" = "1" ]; then
+        megatron_options="${megatron_options} --partition-activations --checkpoint-in-cpu"
+        echo "  CPU_CKPT: enabled (--partition-activations --checkpoint-in-cpu)"
+    fi
 fi
+
+# --- Long-context lever: chunked cross-entropy --------------------------------
+# The LM head materialises [s, b, padded_vocab] logits. At s=131072 and
+# padded_vocab=100096 that is V*10 = 1,000,960 B/token, or 122 GiB, measured
+# (longctx128k/probe_lm_head.py). --seq-chunked-ce N computes the loss in N-token
+# chunks instead, which is bit-identical (tests/test_lm_head_probe.py) and takes
+# the head to V*2 per token.
+#
+# The flag has existed in megatron/arguments.py since the 32k work but was never
+# exposed here, so the 32k run carries it as a HAND EDIT in its rendered file
+# (temp_slurm/lc32k_cont_32n.slurm:608). That is a reproducibility hole: the
+# rendered script and the template disagree. Closing it.
+#
+# DEFAULT IS 0 = flag absent = today's template behaviour exactly.
+#   SEQ_CHUNKED_CE=2048 sbatch ...
+if [[ "${SEQ_CHUNKED_CE:-0}" =~ ^[0-9]+$ ]] && [ "${SEQ_CHUNKED_CE:-0}" -gt 0 ]; then
+    megatron_options="${megatron_options} --seq-chunked-ce ${SEQ_CHUNKED_CE}"
+    echo "  SEQ_CHUNKED_CE: ${SEQ_CHUNKED_CE}"
+fi
+
 if [[ $EP_SIZE -gt 1 ]]; then
     megatron_options="${megatron_options} --create-moe-param-group"
 fi

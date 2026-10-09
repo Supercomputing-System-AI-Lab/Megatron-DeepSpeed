@@ -7,62 +7,93 @@ import glob
 from torch.profiler import profile, record_function, ProfilerActivity, schedule
 
 _PROF = None
+_PENDING = None   # the profiler whose export is deferred to the end of training (PROFILE_EXPORT_AT_END=1, 2026-10-06)
 
-def merge_traces():
-    """
-    Merges multiple Chrome trace files from different ranks into a single file.
-    This function should be called by only one rank after all ranks have
-    finished profiling and saved their individual traces.
-    """
-    # Directory where individual rank traces are saved
-    trace_dir = os.path.abspath(os.getenv ("profile_dir"))
-    
-    # Path for the final merged trace file
-    merged_file_path = os.path.join (trace_dir, "merged.json")
+def merge_traces(ranks=None, gzip_out=None):
+    """Merge the per-rank Chrome traces (trace_rank<r>_of_<w>.json under $profile_dir) into ONE file that ui.perfetto.dev loads.
+    2026-09-18: (1) a subset of ranks -- `ranks` or the env PROFILE_MERGE_RANKS: a comma list ("0,16,32,48"), "stages" (the first
+    rank AND the first rank + 4 of every pipeline stage, from PROFILE_MERGE_PP_SIZE or the pipeline group; two ranks per stage for
+    cross reference) or "all" (the old behaviour: 64 x 90 MB = a
+    file no browser opens); default "stages". (2) gzip (PROFILE_MERGE_GZIP=1, the default): Perfetto reads .json.gz directly and the
+    file is ~20x smaller. (3) the pid is 1000 + the RANK parsed from the file name (the old code numbered the files in sorted-string
+    order, so rank 10 came before rank 2 and the process labels were wrong beyond 9 ranks), with a process_sort_index so the rows
+    appear in rank order. Output: merged_ranks_<r>_<r>....json[.gz] next to the per-rank files; the path is returned.
+    Call it only when every rank has finished exporting (an iteration boundary, or the end of training)."""
+    import gzip, re
+    trace_dir = os.path.abspath(os.getenv("profile_dir"))
+    files = {}
+    for f in glob.glob(os.path.join(trace_dir, "trace_rank*_of_*.json")) + glob.glob(os.path.join(trace_dir, "trace_rank*_of_*.json.gz")):
+        m = re.search(r"trace_rank(\d+)_of_(\d+)\.json(\.gz)?$", f)
+        if m: files[int(m.group(1))] = f
+    if not files:
+        print("No trace files found to merge."); return None
+    world = int(re.search(r"_of_(\d+)\.json(\.gz)?$", next(iter(files.values()))).group(1))
+    def _load(f):
+        with (gzip.open(f, "rt") if f.endswith(".gz") else open(f)) as fh: return json.load(fh)
+    sel = ranks if ranks is not None else os.getenv("PROFILE_MERGE_RANKS", "stages")
+    if isinstance(sel, str):
+        if sel == "all": ranks = sorted(files)
+        elif sel == "stages":
+            pp = int(os.getenv("PROFILE_MERGE_PP_SIZE", "0") or 0)
+            if pp <= 0:
+                try:
+                    from megatron.core import mpu; pp = mpu.get_pipeline_model_parallel_world_size()
+                except Exception: pp = 1
+            stride = world // pp   # the first rank and the first rank + 4 of every stage (the user, 2026-09-18: two ranks per stage for cross reference)
+            ranks = [r for s in range(pp) for r in (s * stride, s * stride + 4) if r < (s + 1) * stride]
+        else: ranks = [int(x) for x in sel.split(",") if x.strip().isdigit()]
+    ranks = [r for r in ranks if r in files]
+    if gzip_out is None: gzip_out = os.getenv("PROFILE_MERGE_GZIP", "1") == "1"
+    out = os.path.join(trace_dir, "merged_ranks_" + "_".join(map(str, ranks)) + (".json.gz" if gzip_out else ".json"))
+    events = []; meta = None
+    for r in ranks:
+        data = _load(files[r])
+        meta = meta or {k: v for k, v in data.items() if k != "traceEvents"}
+        pid = 1000 + r
+        events.append({"name": "process_name", "ph": "M", "pid": pid, "tid": 0, "args": {"name": f"rank {r}"}})
+        events.append({"name": "process_sort_index", "ph": "M", "pid": pid, "tid": 0, "args": {"sort_index": r}})
+        for e in data["traceEvents"]:
+            if e.get("ph") == "M" and e.get("name") == "process_name": continue
+            e["pid"] = pid; events.append(e)
+        print(f"[profiler_manager.py] merge: rank {r} ({os.path.getsize(files[r]) // 1048576} MB) added", flush=True)
+    merged = dict(meta or {}); merged["traceEvents"] = events
+    opener = (lambda: gzip.open(out, "wt")) if gzip_out else (lambda: open(out, "w"))
+    with opener() as f: json.dump(merged, f)
+    print(f"[profiler_manager.py] merged {len(ranks)} of {len(files)} rank traces into {out} ({os.path.getsize(out) // 1048576} MB)", flush=True)
+    return out
 
-    # Use glob to find all trace files. This is more robust than hardcoding names.
-    trace_files = sorted(glob.glob(os.path.join(trace_dir, "trace_rank*.json")))
 
-    if not trace_files:
-        print("No trace files found to merge.")
+def finalize_if_pending():
+    """PROFILE_EXPORT_AT_END=1 (2026-10-06): export the deferred trace on the ranks that traced, close the profiler, then rank 0 merges
+    the traced ranks' files (PROFILE_MERGE_RANKS, default = PROFILE_RANKS). Every rank must call this: two barriers."""
+    global _PENDING
+    if os.getenv('to_profile') != 'True' or os.getenv('PROFILE_EXPORT_AT_END') != '1':
         return
+    if _PENDING is not None:
+        _export_trace(_PENDING)
+        _PENDING = None
+    finalize_profiler(merge=False)
+    if dist.is_available() and dist.is_initialized(): dist.barrier()
+    rank, _ = _get_rank_world()
+    if rank == 0:
+        sel = os.getenv('PROFILE_MERGE_RANKS') or os.getenv('PROFILE_RANKS') or 'stages'
+        try: merge_traces(ranks=sel)
+        except Exception as ex: print(f"[profiler_manager.py] merge of the deferred traces failed: {ex}", flush=True)
+    if dist.is_available() and dist.is_initialized(): dist.barrier()
 
-    print(f"Found {len(trace_files)} trace files to merge.")
 
-    all_events = []
-    
-    # We will remap the original PIDs to new, unique PIDs
-    # Let's just use the rank number as the new PID for simplicity and clarity.
-    for rank, trace_file in enumerate(trace_files):
-        with open(trace_file, 'r') as f:
-            data = json.load(f)
-        
-        # Original PIDs in this file. We need to track them to remap TIDs correctly.
-        original_pids = set()
-
-        # Add a metadata event to name this process in the Perfetto UI
-        all_events.append({
-            "name": "process_name", 
-            "ph": "M", 
-            "pid": rank,  # The new, unique PID
-            "args": {"name": f"Rank {rank}"}
-        })
-        
-        for event in data['traceEvents']:
-            original_pid = event.get('pid')
-            if original_pid is not None:
-                original_pids.add(original_pid)
-
-                # Overwrite the PID with our new unique rank-based PID
-                event['pid'] = rank
-                all_events.append(event)
-
-    # Write the final merged file
-    with open(merged_file_path, 'w') as f:
-        json.dump({'traceEvents': all_events}, f)
-
-    print(f"Successfully merged {len(trace_files)} traces into {merged_file_path}")
-
+def merge_after_training():
+    """The micro-batch window (PROFILE_MICROBATCHES=1) cannot merge inside the iteration (rank 0 would read files still being
+    written, and a barrier inside the pipeline schedule deadlocks); call this once after the training loop: every rank has
+    exported, a barrier orders the reads after the writes, rank 0 merges the selected ranks (merge_traces). 2026-09-18."""
+    finalize_if_pending()   # the deferred per-iteration export (PROFILE_EXPORT_AT_END=1), a no-op otherwise
+    if os.getenv("to_profile") != "True" or os.getenv("PROFILE_MICROBATCHES") != "1": return   # the per-iteration mode merges in finalize_profiler
+    rank, _ = _get_rank_world()
+    if dist.is_available() and dist.is_initialized(): dist.barrier()
+    if rank == 0:
+        try: merge_traces()
+        except Exception as ex: print(f"[profiler_manager.py] merge after training failed: {ex}", flush=True)
+    if dist.is_available() and dist.is_initialized(): dist.barrier()
 
 
 def _get_rank_world():
@@ -120,17 +151,44 @@ def _get_rank_world():
 #         pass
 
 
+def rank_selected():
+    """PROFILE_RANKS (2026-10-06): 'all' (default) or a comma list of global ranks that run the torch profiler; the other ranks do not
+    trace at all (64 ranks x 50-100 MB per traced iteration is a write storm and a memory cost for nothing)."""
+    sel = os.getenv('PROFILE_RANKS', 'all').strip()
+    if sel.lower() == 'all':
+        return True
+    r, _ = _get_rank_world()
+    return r in {int(x) for x in sel.split(',') if x.strip().lstrip('-').isdigit()}
+
+
 def _trace_handler(prof):
+    global _PENDING
+    if os.getenv('PROFILE_EXPORT_AT_END') == '1':
+        _PENDING = prof   # exported by finalize_if_pending after the training loop (2026-10-06)
+        print(f"--- Profiler: trace of rank {_get_rank_world()[0]} kept in memory, export deferred to the end of training ---", flush=True)
+        return
+    _export_trace(prof)
+
+
+def _export_trace(prof):
     out_dir = os.path.abspath(os.getenv('profile_dir', '.'))
     os.makedirs(out_dir, exist_ok=True)
     r, w = _get_rank_world()
     
     
     # 1. Safely export chrome trace
+    # 2026-09-18 (the user): the per-rank trace is written gzipped (trace_rank<r>_of_<w>.json.gz, PROFILE_TRACE_GZIP=1, the default;
+    # torch's export_chrome_trace gzips itself when the path ends with .gz): ~20x smaller, and Perfetto / the merge read .gz directly.
+    want_gz = os.getenv("PROFILE_TRACE_GZIP", "1") == "1"
     fname_json = os.path.join(out_dir, f"trace_rank{r}_of_{w}.json")
     try:
-        print(f"--- Profiler Exporting chrome trace for rank {r} ---")
+        print(f"--- Profiler Exporting chrome trace for rank {r} ({'.json.gz' if want_gz else '.json'}) ---")
         prof.export_chrome_trace(fname_json)
+        if want_gz:   # gzip it ourselves (torch 2.9's export_chrome_trace does not gzip on a .gz suffix), then drop the plain file
+            import gzip, shutil
+            with open(fname_json, "rb") as fin, gzip.open(fname_json + ".gz", "wb", compresslevel=6) as fout: shutil.copyfileobj(fin, fout, 1 << 20)
+            os.remove(fname_json)
+            print(f"--- rank {r}: trace gzipped to {fname_json}.gz ({os.path.getsize(fname_json + '.gz') // 1048576} MB) ---")
     except Exception as e:
         print(f"[Rank {r}] Warning: Failed to export chrome trace: {e}")
     # NOTE: memory (.pickle) is NOT dumped here. The CUDA-allocator snapshot is handled
@@ -215,15 +273,19 @@ def _get_profiler(wait=0, warmup=0, active=2, repeat=1):
         print(f'[profiler_manager.py]: loading pre-allocated global _PROF')
     return _PROF
 
-def finalize_profiler():
+def finalize_profiler(merge=True):
+    # merge=False (2026-09-13, the micro-batch window of training.py): the per-rank traces stay unmerged, because this runs in the
+    # middle of an iteration and rank 0 would read the other ranks' trace files while they are still being written
     global _PROF
     rank, _ = _get_rank_world()
     print(f'[profiler_manager.py] {rank=} closing profiler')
     if _PROF is not None:
         _PROF.__exit__(None, None, None)
         _PROF = None
-        
-    if rank == 0:
+
+    # the micro-batch window (PROFILE_MICROBATCHES=1) keeps its per-rank traces: the exit-path call in pretrain_gpt_deepspeed.py would
+    # otherwise merge 8 x 2.2 GB into one 16 GB file, 16 minutes of the allocation that nothing reads (run Y1r, 2026-09-14)
+    if rank == 0 and merge and os.getenv('PROFILE_MICROBATCHES') != '1':
         print(f'[profiler_manager.py] {rank=} merging traces', flush=True)
         # Assuming merge_traces is defined somewhere or you import it
         merge_traces()

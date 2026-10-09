@@ -17,6 +17,12 @@ import json
 import time
 import argparse
 
+# Darshan (2026-09-05, UCP I/O campaign): the template preloads libdarshan on this python process
+# only. Drop the preload from the environment so exec'd children (kernel builds: gcc/ld/ninja,
+# rocminfo, ps, sh) are not instrumented -- each would write its own log. Forked children
+# (dataloader workers) keep the in-process instrumentation and write their own log, which is wanted.
+os.environ.pop('LD_PRELOAD', None)
+
 
 # =========================================================
 # 1. Argument Parsing
