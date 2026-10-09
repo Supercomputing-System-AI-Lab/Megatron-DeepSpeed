@@ -60,8 +60,11 @@ def find_log(job_root, tag):
             continue
         if f"_{tag}_" not in os.path.basename(job_dir):
             continue
-        for name in ("full_run.log", "rank_0.log"):
-            log = os.path.join(job_dir, name)
+        # [X-MoE resilience 2026-10-09] a resilient job folder keeps its logs per attempt: the last attempt's files first
+        _att = sorted(glob.glob(os.path.join(job_dir, "attempts", "attempt_*")), key=lambda x: int(x.rsplit("_", 1)[-1]))
+        _cands = ([os.path.join(_att[-1], "full_run.log"), os.path.join(_att[-1], "ranks", "rank_0.log")] if _att else []) + \
+                 [os.path.join(job_dir, "full_run.log"), os.path.join(job_dir, "rank_0.log")]
+        for log in _cands:
             if os.path.isfile(log):
                 candidates.append((os.path.getmtime(log), log))
                 break

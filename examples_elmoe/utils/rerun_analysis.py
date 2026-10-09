@@ -34,6 +34,22 @@ def find_variable(pattern, text, var_name, required=True, is_int=True, default=N
         sys.exit(1)
     return None
 
+def rank_log_dir(path):
+    """[X-MoE resilience 2026-10-09] The folder of the rank logs (see analyze_log.rank_log_dir): RANK_LOG_DIR, else <dir>/ranks,
+    else the last attempts/attempt_<k>/ranks of a resilient job folder, else the folder itself (the flat layout)."""
+    env = os.environ.get("RANK_LOG_DIR")
+    if env and os.path.isdir(env):
+        return env
+    d = path if os.path.isdir(path) else os.path.dirname(os.path.abspath(path))
+    if os.path.isdir(os.path.join(d, "ranks")):
+        return os.path.join(d, "ranks")
+    att = sorted((int(m.group(1)), x) for x in os.listdir(os.path.join(d, "attempts"))
+                 for m in [re.match(r"attempt_(\d+)$", x)] if m) if os.path.isdir(os.path.join(d, "attempts")) else []
+    if att:                                   # the job folder of the resilient layout: its last attempt
+        return os.path.join(d, "attempts", att[-1][1], "ranks")
+    return d
+
+
 def main():
     parser = argparse.ArgumentParser(description="Rerun analysis by merging SLURM .o and Rank logs.")
     parser.add_argument("input_file", type=str, help="Path to EITHER the .o file OR the rank log file.")
@@ -119,8 +135,8 @@ def main():
     if "rank_" in input_path:
         rank_file = input_path
     else:
-        # Construct expected path: Look in input directory first
-        rank_file = os.path.join(input_dir, f"rank_{last_rank}.log")
+        # Construct expected path: the rank logs' folder of the input (flat: the input directory; resilient: the attempt's ranks/)
+        rank_file = os.path.join(rank_log_dir(input_path), f"rank_{last_rank}.log")
         if not os.path.exists(rank_file):
             # Fallback to the old strict job_ID directory structure
             rank_file = os.path.join(logs_dir, f"job_{job_id}", f"rank_{last_rank}.log")

@@ -6,6 +6,24 @@ import os
 import argparse
 from pathlib import Path
 
+def rank_log_dir(path):
+    """[X-MoE resilience 2026-10-09] The folder of the rank_<r>.log files for a log or job path: RANK_LOG_DIR when set (the
+    resilient layout's attempts/attempt_<k>/ranks/), else <dir>/ranks/ when it exists (a full_run.log inside attempts/attempt_<k>/),
+    else the last attempt's ranks/ for a resilient job folder, else the folder itself (the flat layout:
+    logs/job_<id>_*/rank_<r>.log)."""
+    env = os.environ.get("RANK_LOG_DIR")
+    if env and os.path.isdir(env):
+        return env
+    d = path if os.path.isdir(path) else os.path.dirname(os.path.abspath(path))
+    if os.path.isdir(os.path.join(d, "ranks")):
+        return os.path.join(d, "ranks")
+    att = sorted((int(m.group(1)), x) for x in os.listdir(os.path.join(d, "attempts"))
+                 for m in [re.match(r"attempt_(\d+)$", x)] if m) if os.path.isdir(os.path.join(d, "attempts")) else []
+    if att:                                   # the job folder of the resilient layout: its last attempt
+        return os.path.join(d, "attempts", att[-1][1], "ranks")
+    return d
+
+
 def get_job_info(input_path):
     """
     Extracts the Job ID and the base job directory from a given file path.
@@ -132,8 +150,10 @@ def main():
     pipeline_stage_memory = {}
     pipeline_stage_interval = 8
     
+    rank_dir = rank_log_dir(args.log_file_path)   # flat: the job folder; resilient: attempts/attempt_<k>/ranks/
+    print(f"Rank log directory: {rank_dir}")
     for rank_num in range(0, total_gpus, pipeline_stage_interval):
-        rank_log_file = os.path.join(job_dir, f"rank_{rank_num}.log")
+        rank_log_file = os.path.join(rank_dir, f"rank_{rank_num}.log")
         # The function now returns a tuple of (max_reserved, max_allocated)
         peak_mems = find_peak_memory_in_file(rank_log_file)
         pipeline_stage_memory[rank_num] = peak_mems
@@ -147,7 +167,7 @@ def main():
     all_ranks_allocated_list = []
     print("\n--- Analyzing memory for all individual ranks for full lists... ---")
     for rank_num in range(total_gpus):
-        rank_log_file = os.path.join(job_dir, f"rank_{rank_num}.log")
+        rank_log_file = os.path.join(rank_dir, f"rank_{rank_num}.log")
         reserved, allocated = find_peak_memory_in_file(rank_log_file)
 
         # Append the formatted string or "N/A" to the lists

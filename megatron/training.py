@@ -166,6 +166,40 @@ def _debug_dump_loaded_weights(model):
                   f"flat[:4]={[round(v,8) for v in flat[:4].tolist()]}{extra}", flush=True)
 
 
+# [X-MoE resilience 2026-10-09] XMOE_PG_TIMEOUT_ALL_MIN: the timeout of EVERY process group created without one (Megatron's
+# tensor/data/pipeline groups and DeepSpeed's), so a hang inside a TP or DP collective is detected as fast as one in the expert
+# group (XMOE_PG_TIMEOUT_MIN covers DeepSpeed's groups only). Unset: torch's default (10 min), as before.
+if os.environ.get('XMOE_PG_TIMEOUT_ALL_MIN') and not getattr(torch.distributed.new_group, '_xmoe', False):
+    from datetime import timedelta as _xmoe_td
+    _xmoe_orig_new_group = torch.distributed.new_group
+    def _xmoe_new_group(*a, **k):
+        if k.get('timeout') is None and len(a) < 2:
+            k['timeout'] = _xmoe_td(minutes=float(os.environ['XMOE_PG_TIMEOUT_ALL_MIN']))
+        return _xmoe_orig_new_group(*a, **k)
+    _xmoe_new_group._xmoe = True
+    torch.distributed.new_group = _xmoe_new_group
+
+
+# [X-MoE resilience 2026-10-09] the heartbeat, the detectors and the fault injection live in
+# examples_elmoe/scripts-frontier/resilience/bin/hb.py; nothing is imported unless XMOE_HB=1, XMOE_DETECT=1 or an injection is set.
+_XMOE_RES = {'mod': None, 'tried': False}
+
+
+def _xmoe_res():
+    if not _XMOE_RES['tried']:
+        _XMOE_RES['tried'] = True
+        if os.environ.get('XMOE_HB') == '1' or os.environ.get('XMOE_DETECT') == '1' or \
+                os.environ.get('XMOE_INJECT') or os.environ.get('XMOE_INJECT_SCHEDULE'):
+            _d = os.environ.get('RES_BIN') or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                                           'examples_elmoe', 'scripts-frontier', 'resilience', 'bin')
+            if _d not in sys.path:
+                sys.path.insert(0, _d)
+            import hb as _hbmod
+            sys.modules['xmoe_hb'] = _hbmod            # the call sites in deepspeed look it up by this name
+            _XMOE_RES['mod'] = _hbmod
+    return _XMOE_RES['mod']
+
+
 def pretrain(train_valid_test_dataset_provider,
              model_provider,
              model_type,
@@ -209,6 +243,14 @@ def pretrain(train_valid_test_dataset_provider,
     initialize_megatron(extra_args_provider=extra_args_provider,
                         args_defaults=args_defaults)
     print_rank_0 (f'after initialize_megatron')
+    _res = _xmoe_res()
+    if _res is not None:
+        _res._ctx['rank'] = torch.distributed.get_rank()
+        _res._ctx['local_rank'] = int(os.getenv('LOCAL_RANK', '0'))
+        _res._ctx['job_dir'] = os.environ.get('RES_JOB_DIR')
+        _res.start(torch.distributed.get_rank(), int(os.getenv('LOCAL_RANK', '0')))
+        if os.environ.get('XMOE_DETECT') == '1':
+            sys.excepthook = _res.excepthook        # D4 GPU OOM -> 11, D9 HIP -> 16, any other exception -> 17
     
     # Set pytorch JIT layer fusion options and warmup JIT functions.
     #if get_accelerator().device_name() == 'cuda':
@@ -252,6 +294,7 @@ def pretrain(train_valid_test_dataset_provider,
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
+    if _res is not None: _res.set_phase('load')
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
         model_provider, model_type, teacher=False, data_post_process=data_post_process,
         build_train_valid_test_datasets_provider=train_valid_test_dataset_provider)
@@ -292,6 +335,7 @@ def pretrain(train_valid_test_dataset_provider,
             train_data_iterator = None
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
+    if _res is not None: _res.set_phase('init')
 
     # args.teacher_model is used as global variable to pass the teacher model
     # for knowledge distillation. Users do not need to set it in the command
@@ -877,6 +921,7 @@ def train_step(forward_step_func, data_iterator,
 
     # Update parameters.
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+    if _XMOE_RES['mod'] is not None: _XMOE_RES['mod'].set_phase('step')
     if args.deepspeed:
         increment = get_num_microbatches() * \
                     args.micro_batch_size * \
@@ -1253,6 +1298,19 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         total_loss_dict[advanced_iters_key] = 0
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
+        if _XMOE_RES['mod'] is not None and os.environ.get('RES_JOB_DIR') and os.environ.get('XMOE_HB') == '1':
+            # [X-MoE resilience 2026-10-09] training.log (design 3.11): one line per step across attempts. Every rank is here
+            # (the interval timer above already used a barrier); one MAX all-reduce of a single float gives the HBM maximum.
+            try:
+                _xm = torch.tensor([torch.cuda.max_memory_allocated() / 1e9], device=get_accelerator().current_device_name())
+                torch.distributed.all_reduce(_xm, op=torch.distributed.ReduceOp.MAX)
+                _xm = float(_xm.item())
+            except Exception:
+                _xm = None
+            _w = 0 if mpu.get_pipeline_model_parallel_world_size() == 1 else torch.distributed.get_world_size() - 1
+            if torch.distributed.get_rank() == _w:
+                _XMOE_RES['mod'].training_log_line(iteration, loss_for_wandb.get('lm loss'), tflops, elapsed_time_per_iteration, _xm,
+                                                   bool(args.save and args.save_interval and iteration % args.save_interval == 0))
         print_rank_last(log_string)
 
         # Wandb: log the rest of the iteration-line fields + memory.
@@ -1303,9 +1361,18 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler):
     timers = get_timers()
     # Extra barrier is added to make sure
     # all ranks report the max time.
-    timers('save-checkpoint', log_level=0).start(barrier=True)
-    save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
-    timers('save-checkpoint').stop(barrier=True)
+    _res = _XMOE_RES['mod']
+    if _res is None:
+        timers('save-checkpoint', log_level=0).start(barrier=True)
+        save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
+        timers('save-checkpoint').stop(barrier=True)
+    else:
+        with _res.SaveDeadline(iteration):           # D3: exit 12 when the save is later than its deadline
+            timers('save-checkpoint', log_level=0).start(barrier=True)
+            _res.set_phase('save')
+            _res.inject('save', iteration)           # fshang: this rank's save sleeps 10 min
+            save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
+            timers('save-checkpoint').stop(barrier=True)
     checkpoint_throughput_calculator(model, timers('save-checkpoint').elapsed(reset=False))
     timers.log(['save-checkpoint'])
 
@@ -1427,9 +1494,26 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         assert model[0].random_ltd_enabled()
         args.random_ltd_layer_num = model[0].random_ltd_scheduler.get_random_ltd_layer_num()
         
+    _res = _XMOE_RES['mod']
+    if _res is not None:
+        _res.S['step'] = iteration                    # the heartbeat's step starts at the resumed iteration, not 0
+        _res._ctx['resumed_from'] = iteration         # training.log names the save the attempt resumed from
+        _res.inject('loop_start', iteration)          # inithang: sleep 20 min before the first step of this attempt
+        _fsf = forward_step_func
+        def forward_step_func(*a, **k):               # one line per micro-batch: the phase, and the 'slow' injection
+            _res.set_phase('forward')
+            _res.inject('micro', args.iteration)
+            out = _fsf(*a, **k)
+            _res.set_phase('backward')
+            return out
     while iteration < args.train_iters and (args.train_tokens is None or \
         args.consumed_train_tokens < args.train_tokens):
         update_num_microbatches(args.consumed_train_samples)
+        if _res is not None:
+            _res.begin_step()
+            _res.set_phase('forward')
+            _res.inject('step_start', iteration)      # hang / exit / kill / oom / slow / nan (each once per job)
+            _xmoe_t0 = time.time()
         # [X-MoE 2026-10-08] fault injection for the hang-detection test: XMOE_HANG_INJECT="<rank>:<iteration>" makes that one rank
         # sleep forever at the start of that iteration (a fail-silent stop of a single rank); every other rank then blocks in its next
         # collective. It measures what NCCL_TIMEOUT, the process-group timeout and the watchers actually do: in V3X0 (job 5638129) a
@@ -1514,6 +1598,22 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                         config)
         iteration += 1
         args.iteration = iteration
+        if _res is not None:
+            _xmoe_loss = None
+            try:
+                if loss_dict and 'lm loss' in loss_dict:
+                    _lv = loss_dict['lm loss']
+                    _xmoe_loss = float(_lv.item() if hasattr(_lv, 'item') else _lv)
+                    _mul = _res.inject('loss', iteration - 1)   # nan: this rank's loss reads NaN for 3 steps
+                    if _mul is not None and _mul != 1.0:
+                        _xmoe_loss = _xmoe_loss * _mul
+            except Exception:
+                _xmoe_loss = None
+            if _xmoe_loss is not None and os.environ.get('XMOE_DETECT') == '1':
+                if _res.loss_rule(iteration, _xmoe_loss):     # D7: NaN or spike -> counted as skipped; 3 in succession -> exit 13
+                    skipped_iter = 1
+            _res.end_step(iteration, time.time() - _xmoe_t0, _xmoe_loss)
+            _res.set_phase('step')
         if _route_on:
             _route_log.flush(iteration)   # the routing record: one host copy + one append per step
 

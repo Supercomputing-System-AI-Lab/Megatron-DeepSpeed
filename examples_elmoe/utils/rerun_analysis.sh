@@ -81,11 +81,20 @@ LAST_RANK=$(( TOTAL_GPUS - 1 ))
 DP_SIZE=$(( TOTAL_GPUS / PP_SIZE / MP_SIZE ))
 
 # Verify rank 0 and last rank files exist
-RANK_LOG_FILE_2="${JOB_DIR}/rank_0.log"
-RANK_LOG_FILE="${JOB_DIR}/rank_${LAST_RANK}.log"
+# [X-MoE resilience 2026-10-09] the rank logs: RANK_LOG_DIR when set; else the last attempts/attempt_<k>/ranks/ of a resilient job
+# folder (design 3.11; full_run.log then goes to that attempt's folder); else the job folder itself (the flat layout)
+RUN_DIR="${JOB_DIR}"; RANK_DIR="${RANK_LOG_DIR:-}"
+if [ -z "$RANK_DIR" ]; then
+    LAST_ATT=$(ls -d "$JOB_DIR"/attempts/attempt_* 2>/dev/null | sed 's/.*attempt_//' | sort -n | tail -1)
+    if [ -n "$LAST_ATT" ]; then RUN_DIR="$JOB_DIR/attempts/attempt_$LAST_ATT"; RANK_DIR="$RUN_DIR/ranks"; else RANK_DIR="$JOB_DIR"; fi
+fi
+echo "Rank logs: $RANK_DIR"
+export RANK_LOG_DIR="$RANK_DIR"
+RANK_LOG_FILE_2="${RANK_DIR}/rank_0.log"
+RANK_LOG_FILE="${RANK_DIR}/rank_${LAST_RANK}.log"
 
 # 6. Reconstruct full_run.log
-MERGED_LOG="${JOB_DIR}/full_run.log"
+MERGED_LOG="${RUN_DIR}/full_run.log"
 echo "Constructing merged log at: $MERGED_LOG"
 
 cat "${SLURM_LOG_FILE}" > "${MERGED_LOG}"

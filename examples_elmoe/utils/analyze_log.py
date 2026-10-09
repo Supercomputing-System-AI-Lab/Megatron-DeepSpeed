@@ -361,6 +361,24 @@ def write_profile_json(data, args):
         
     return filename
 
+def rank_log_dir(path):
+    """[X-MoE resilience 2026-10-09] The folder of the rank_<r>.log files for a log or job path: RANK_LOG_DIR when set (the
+    resilient layout's attempts/attempt_<k>/ranks/), else <dir>/ranks/ when it exists (a full_run.log inside attempts/attempt_<k>/),
+    else the last attempt's ranks/ for a resilient job folder, else the folder itself (the flat layout:
+    logs/job_<id>_*/rank_<r>.log)."""
+    env = os.environ.get("RANK_LOG_DIR")
+    if env and os.path.isdir(env):
+        return env
+    d = path if os.path.isdir(path) else os.path.dirname(os.path.abspath(path))
+    if os.path.isdir(os.path.join(d, "ranks")):
+        return os.path.join(d, "ranks")
+    att = sorted((int(m.group(1)), x) for x in os.listdir(os.path.join(d, "attempts"))
+                 for m in [re.match(r"attempt_(\d+)$", x)] if m) if os.path.isdir(os.path.join(d, "attempts")) else []
+    if att:                                   # the job folder of the resilient layout: its last attempt
+        return os.path.join(d, "attempts", att[-1][1], "ranks")
+    return d
+
+
 def extract_job_id(log_file_path):
     """
     Attempts to extract Job ID from:
@@ -380,6 +398,10 @@ def extract_job_id(log_file_path):
     match_dir = re.search(r"job_(\d+)", parent_dir)
     if match_dir:
         return match_dir.group(1)
+    # 3. Any ancestor folder (the resilient layout: logs/job_<id>_*/attempts/attempt_<k>/full_run.log)
+    match_any = re.search(r"/job_(\d+)", abs_path)
+    if match_any:
+        return match_any.group(1)
     
     return None
 
@@ -394,7 +416,7 @@ def compare_predicted_vs_actual_memory(args):
     stage two ways -- MAX over DP and MEAN over DP -- and report MAE and MAPE of each against
     the per-stage prediction."""
     import os, re
-    job_dir = os.path.dirname(os.path.abspath(args.log_file))
+    job_dir = rank_log_dir(args.log_file)      # the rank logs' folder (flat: the job folder; resilient: the attempt's ranks/)
     pp = args.pp
     gpus_per_node = args.gpus_per_node
     total_nodes = args.nodes

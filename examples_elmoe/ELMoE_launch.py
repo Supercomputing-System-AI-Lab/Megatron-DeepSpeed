@@ -351,7 +351,73 @@ def main():
         mbs_check = '--micro-batch-size' in sys.argv
         print(f"[ELMoE_launch.py] --micro-batch-size in argv: {mbs_check}")
 
+    if os.environ.get('XMOE_DRY_RUN') == '1':
+        sys.exit(_xmoe_dry_run(sys.argv[1:]))
     runpy.run_module('pretrain_gpt_deepspeed', run_name='__main__')
+
+
+def _xmoe_dry_run(argv):
+    """[X-MoE resilience 2026-10-09] G2 the dry run (XMOE_DRY_RUN=1): parse and validate the run's arguments with Megatron's own
+    parser, check that every path the arguments name exists (data prefixes .bin/.idx, tokenizer files, the DeepSpeed json, the load
+    folder; the save folder's parent is writable), print one line per check, return 0 when all pass, 2 otherwise. No GPU, no
+    process group, no model."""
+    import glob as _glob
+    problems, checks = [], []
+    def opt(name, multi=False):
+        if name not in argv:
+            return [] if multi else None
+        i = argv.index(name) + 1
+        vals = []
+        while i < len(argv) and not argv[i].startswith('--'):
+            vals.append(argv[i]); i += 1
+        return vals if multi else (vals[0] if vals else None)
+    for prefix in [v for v in opt('--data-path', True) if not _is_number(v)]:
+        for ext in ('.bin', '.idx'):
+            ok = os.path.exists(prefix + ext)
+            checks.append(('data', prefix + ext, ok))
+    for name in ('--tokenizer-model', '--vocab-file', '--merge-file', '--deepspeed_config', '--deepspeed-config'):
+        v = opt(name)
+        if v:
+            checks.append((name, v, os.path.exists(v)))
+    v = opt('--load')
+    if v:
+        checks.append(('--load', v, True))   # an empty or missing load folder means a start from scratch: reported, not failed
+        print(f"[dry-run] --load {v}: {'exists' if os.path.isdir(v) else 'absent (start from scratch)'}"
+              f"{'; latest = ' + open(os.path.join(v, 'latest')).read().strip() if os.path.exists(os.path.join(v, 'latest')) else ''}")
+    v = opt('--save')
+    if v:
+        parent = os.path.dirname(os.path.abspath(v)) or '.'
+        checks.append(('--save parent writable', parent, os.access(parent, os.W_OK)))
+    for kind, path, ok in checks:
+        print(f"[dry-run] {kind:24s} {'OK     ' if ok else 'MISSING'} {path}")
+        if not ok:
+            problems.append(f'{kind} {path}')
+    os.environ.setdefault('RANK', '0')
+    os.environ['WORLD_SIZE'] = os.environ.get('RES_WORLD', os.environ.get('WORLD_SIZE', '1'))
+    try:
+        from megatron.arguments import parse_args, validate_args
+        saved = sys.argv
+        sys.argv = [sys.argv[0]] + argv
+        args = parse_args(None, False)
+        validate_args(args)
+        sys.argv = saved
+        print(f"[dry-run] megatron arguments parse + validate OK: world {args.world_size}, tp {args.tensor_model_parallel_size}, "
+              f"pp {args.pipeline_model_parallel_size}, dp {args.data_parallel_size}, mbs {args.micro_batch_size}, "
+              f"gbs {args.global_batch_size}, seq {args.seq_length}, layers {args.num_layers}, train_iters {args.train_iters}, "
+              f"save_interval {args.save_interval}")
+    except SystemExit as e:
+        problems.append(f'argument parser exit {e.code}')
+    except Exception as e:
+        problems.append(f'argument validation: {type(e).__name__}: {e}')
+    print(f"[dry-run] {'PASS' if not problems else 'FAIL: ' + '; '.join(problems)}")
+    return 0 if not problems else 2
+
+
+def _is_number(x):
+    try:
+        float(x); return True
+    except ValueError:
+        return False
 
 if __name__ == '__main__':
     import runpy 

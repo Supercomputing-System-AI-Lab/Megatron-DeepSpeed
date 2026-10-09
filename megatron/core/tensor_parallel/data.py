@@ -96,8 +96,11 @@ def broadcast_data(keys, data, datatype):
         src_rank = get_tensor_model_parallel_src_rank()
         group = get_tensor_model_parallel_group()
 
+    _xh = __import__('sys').modules.get('xmoe_hb')   # [X-MoE resilience 2026-10-09] heartbeat hook (XMOE_HB=1): the batch broadcast
+    if _xh: _xh.coll_enter('broadcast')               # is where a TP group's ranks wait for a stopped member (H16 5641684)
     key_size, key_numel, total_numel = _build_key_size_numel_dictionaries(
         keys, data, group=group, rank=rank, src_rank=src_rank)
+    if _xh: _xh.coll_exit()
 
     # Pack on rank zero.
     if rank == 0:

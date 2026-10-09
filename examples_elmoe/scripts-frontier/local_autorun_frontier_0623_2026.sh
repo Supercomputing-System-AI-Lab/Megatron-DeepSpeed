@@ -526,6 +526,30 @@ fi
 # No-op when no AUTORUN_* rider is set.
 apply_autorun_riders() {
     local f="$1"
+    # [X-MoE resilience 2026-10-09] AUTORUN_RESILIENT=1: ask Slurm for N + s nodes (N train, s spares; the template's NODES stays N).
+    # AUTORUN_SPARES = auto (default: ceil(0.015 N) at N >= 32, else 0) | 0 | <s>. Verified or ABORT.
+    if [ "${AUTORUN_RESILIENT:-0}" = "1" ]; then
+        local n_train; n_train=$(grep -m1 -E "^NODES=[0-9]+" "$f" | cut -d= -f2)
+        local sp="${AUTORUN_SPARES:-auto}"
+        if [ "$sp" = "auto" ]; then
+            if [ "$n_train" -ge 32 ]; then sp=$(( (n_train * 15 + 999) / 1000 )); [ "$sp" -lt 1 ] && sp=1; else sp=0; fi
+        fi
+        sed -i -e "s/^#SBATCH -N ${n_train}\$/#SBATCH -N $(( n_train + sp ))   # [rider AUTORUN_RESILIENT] ${n_train} train + ${sp} spare(s)/" \
+               -e "s/^#SBATCH -J /#SBATCH -J res-/" "$f"
+        if ! grep -q "^#SBATCH -N $(( n_train + sp )) " "$f" || ! grep -q "^if \[ \"\${AUTORUN_RESILIENT:-0}\" = \"1\" \]" "$f"; then
+            echo "FATAL [rider AUTORUN_RESILIENT]: the node count or the resilient template did not land in $f — refusing to submit"
+            exit 1
+        fi
+        echo "[rider AUTORUN_RESILIENT] ${n_train} training nodes + ${sp} spare(s) = $(( n_train + sp )) nodes requested; gate ${AUTORUN_GATE:-auto}"
+        __RES_SP=$sp
+        # a restart is a NATIVE resume of the run's own last save (weights + optimizer + iteration + data position): the template's
+        # manual --finetune (which loads the weights only and restarts the iteration at 0) must be off (found by M1c 5641534)
+        sed -i '/^[[:space:]]*--finetune \\$/d' "$f"
+        if grep -q -- "^[[:space:]]*--finetune \\\\\$" "$f"; then
+            echo "FATAL [rider AUTORUN_RESILIENT]: --finetune is still in $f — refusing to submit"; exit 1
+        fi
+        echo "[rider AUTORUN_RESILIENT] --finetune removed: every restart is a native resume from the latest save"
+    fi
     # Resume-mode riders are mutually exclusive: abort before any edit lands.
     if [ "${AUTORUN_UCP_RESUME:-0}" = "1" ] && { [ "${AUTORUN_UCP_FINETUNE:-0}" = "1" ] || [ "${AUTORUN_NATIVE_RESUME:-0}" = "1" ]; }; then
         echo "FATAL [rider conflict]: AUTORUN_UCP_RESUME is mutually exclusive with AUTORUN_UCP_FINETUNE / AUTORUN_NATIVE_RESUME — refusing to submit"
@@ -692,6 +716,14 @@ PYINJ
             exit 1
         fi
     fi
+    if [ "${AUTORUN_RESILIENT:-0}" = "1" ]; then
+        # [X-MoE resilience 2026-10-09] the allocation holds N + s nodes by design: the guard compares SLURM_NNODES with N + s
+        sed -i -e 's/\[ "\${SLURM_NNODES}" -ne "\${NODES}" \]/[ "${SLURM_NNODES}" -ne "$(( NODES + '"${__RES_SP:-0}"' ))" ]/' \
+               -e 's/FATAL launch geometry: NODES=\${NODES} but SLURM_NNODES/FATAL launch geometry (resilient, '"${__RES_SP:-0}"' spares): NODES=${NODES} + spares but SLURM_NNODES/' "$f"
+        if ! grep -q 'NODES + '"${__RES_SP:-0}"' ))" \]' "$f"; then
+            echo "FATAL [rider AUTORUN_RESILIENT]: the geometry guard was not adapted to the spares in $f -- refusing to submit"; exit 1
+        fi
+    fi
     if [ -n "${AUTORUN_SAVE_INTERVAL:-}" ]; then
         # [2026-09-20] the pattern pinned SAVE_INTERVAL=10; the template now ships 100, so the rider silently matched nothing and
         # then aborted. It now matches whatever integer the template carries, and the verify below still refuses to submit on a miss.
@@ -795,6 +827,11 @@ PY
 # --- 2. SCRIPT LOGIC (No need to edit below) ---
 ##########################################################################
 TEMPLATE_FILE="frontier_elmoe.slurm_0623_2026.template"
+# [X-MoE resilience 2026-10-09] AUTORUN_RESILIENT=1 renders the resilient template (the restart loop, the gate, the spares);
+# AUTORUN_TEMPLATE=<file> names any other template. Unset: as before.
+if [ -n "${AUTORUN_TEMPLATE:-}" ]; then TEMPLATE_FILE="${AUTORUN_TEMPLATE}"
+elif [ "${AUTORUN_RESILIENT:-0}" = "1" ]; then TEMPLATE_FILE="frontier_elmoe.slurm_resilient.template"; fi
+echo "[rider] template: ${TEMPLATE_FILE}"
 
 if [ ! -f "$TEMPLATE_FILE" ]; then
     echo "ERROR: The template file '$TEMPLATE_FILE' was not found."
@@ -932,7 +969,7 @@ for node_key in "${!PP_STRATEGY_MAP[@]}"; do
                 ${TEMPLATE_FILE} > ${TEMP_SLURM_SCRIPT}
 
             apply_autorun_riders "${TEMP_SLURM_SCRIPT}"   # [rider hook] no-op unless AUTORUN_* set
-            sbatch ${TEMP_SLURM_SCRIPT}
+            ${AUTORUN_SBATCH_CMD:-sbatch} ${TEMP_SLURM_SCRIPT}   # [X-MoE resilience] AUTORUN_SBATCH_CMD=echo renders without submitting
             # rm ${TEMP_SLURM_SCRIPT}
             sleep 1
         done
@@ -1027,7 +1064,7 @@ for node_key in "${!EP_BATCH_MAP[@]}"; do
         #   harmless only while nothing read them.
 
         apply_autorun_riders "${TEMP_SLURM_SCRIPT}"   # [rider hook] no-op unless AUTORUN_* set
-        sbatch ${TEMP_SLURM_SCRIPT}
+        ${AUTORUN_SBATCH_CMD:-sbatch} ${TEMP_SLURM_SCRIPT}   # [X-MoE resilience] AUTORUN_SBATCH_CMD=echo renders without submitting
         # rm ${TEMP_SLURM_SCRIPT}
         sleep 1
     done
@@ -1108,7 +1145,7 @@ for node_key in "${!DENSE_BATCH_MAP[@]}"; do
             ${TEMPLATE_FILE} > ${TEMP_SLURM_SCRIPT}
 
         apply_autorun_riders "${TEMP_SLURM_SCRIPT}"   # [rider hook] no-op unless AUTORUN_* set
-        sbatch ${TEMP_SLURM_SCRIPT}
+        ${AUTORUN_SBATCH_CMD:-sbatch} ${TEMP_SLURM_SCRIPT}   # [X-MoE resilience] AUTORUN_SBATCH_CMD=echo renders without submitting
         sleep 1
     done
 done
@@ -1175,7 +1212,7 @@ for node_key in "${!PROFILE_MAP[@]}"; do
                 ${TEMPLATE_FILE} > ${TEMP_SLURM_SCRIPT}
 
             apply_autorun_riders "${TEMP_SLURM_SCRIPT}"   # [rider hook] no-op unless AUTORUN_* set
-            sbatch ${TEMP_SLURM_SCRIPT}
+            ${AUTORUN_SBATCH_CMD:-sbatch} ${TEMP_SLURM_SCRIPT}   # [X-MoE resilience] AUTORUN_SBATCH_CMD=echo renders without submitting
             # rm ${TEMP_SLURM_SCRIPT}
             sleep 1
         done 

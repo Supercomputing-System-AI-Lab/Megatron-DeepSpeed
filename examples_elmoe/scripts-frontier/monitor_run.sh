@@ -37,7 +37,9 @@ TRACE_FRAMES="${5:-20}"   # stack frames kept per rank in TRACE (deepest first)
 # MON_PROC_MATCH=evaluate_v04.py so the same monitor works for the eval srun.
 PROC_MATCH="${MON_PROC_MATCH:-ELMoE_launch.py}"
 
-MONDIR="${JOB_DIR}/monitor"
+# [X-MoE resilience 2026-10-09] MONITOR_DATA_DIR moves the per-node files and the tsv (the resilient job folder: <JOB_DIR>/data/monitor/,
+# design 3.11); a-monitor.txt stays at the top level. Unset: <JOB_DIR>/monitor/, as before.
+MONDIR="${MONITOR_DATA_DIR:-${JOB_DIR}/monitor}"
 SUMMARY="${JOB_DIR}/a-monitor.txt"   # top-level for quick access (per-node files & tsv stay in monitor/)
 TSV="${MONDIR}/monitor.tsv"
 SSH="ssh -q -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o LogLevel=ERROR"
