@@ -399,6 +399,17 @@ def _xmoe_dry_run(argv):
         saved = sys.argv
         sys.argv = [sys.argv[0]] + argv
         args = parse_args(None, False)
+        # [2026-10-09 22:25, job 5645677] the fork's parse_args takes the world size from MPI (comm.Get_size() = 1 in this single
+        # process; WORLD_SIZE in the environment is read only with --using-torchrun), so validate_args failed its divisibility check
+        # "world size (1) is not divisible by tensor parallel size x pipeline parallel size" for every run with Ulysses > 1. The job's
+        # real world size comes from RES_WORLD (the template exports TOTAL_GPUS); it is set here, before validate_args, and printed.
+        rw = os.environ.get('RES_WORLD')
+        if rw:
+            args.world_size = int(rw); args.rank = 0
+        src = 'from RES_WORLD, the job TOTAL_GPUS' if rw else 'from the parser (RES_WORLD is not set: a single process reads 1 from MPI)'
+        print(f"[dry-run] world size used for the checks: {args.world_size} ({src}); "
+              f"tensor parallel {args.tensor_model_parallel_size} x pipeline parallel {args.pipeline_model_parallel_size} x "
+              f"Ulysses sequence parallel {getattr(args, 'ds_sequence_parallel_size', 1)} must divide it")
         validate_args(args)
         sys.argv = saved
         print(f"[dry-run] megatron arguments parse + validate OK: world {args.world_size}, tp {args.tensor_model_parallel_size}, "

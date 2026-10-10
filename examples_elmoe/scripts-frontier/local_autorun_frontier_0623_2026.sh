@@ -534,14 +534,26 @@ apply_autorun_riders() {
         if [ "$sp" = "auto" ]; then
             if [ "$n_train" -ge 32 ]; then sp=$(( (n_train * 15 + 999) / 1000 )); [ "$sp" -lt 1 ] && sp=1; else sp=0; fi
         fi
-        sed -i -e "s/^#SBATCH -N ${n_train}\$/#SBATCH -N $(( n_train + sp ))   # [rider AUTORUN_RESILIENT] ${n_train} train + ${sp} spare(s)/" \
+        # [X-MoE resilience 2026-10-10] AUTORUN_UCP_WORKERS=<u> (default 0): u more nodes, taken by the restart loop from the END of the
+        # allocation (after the spares), that never train and convert every complete save to the universal form (restart_loop.sh, the UCP
+        # worker duty). The export is baked into the rendered script so that `scontrol write batch_script` shows it.
+        local ucp="${AUTORUN_UCP_WORKERS:-0}"
+        case "$ucp" in ''|*[!0-9]*) echo "FATAL [rider AUTORUN_UCP_WORKERS]: '$ucp' is not a whole number"; exit 1;; esac
+        sed -i -e "s/^#SBATCH -N ${n_train}\$/#SBATCH -N $(( n_train + sp + ucp ))   # [rider AUTORUN_RESILIENT] ${n_train} train + ${sp} spare(s) + ${ucp} UCP worker(s)/" \
                -e "s/^#SBATCH -J /#SBATCH -J res-/" "$f"
-        if ! grep -q "^#SBATCH -N $(( n_train + sp )) " "$f" || ! grep -q "^if \[ \"\${AUTORUN_RESILIENT:-0}\" = \"1\" \]" "$f"; then
+        if ! grep -q "^#SBATCH -N $(( n_train + sp + ucp )) " "$f" || ! grep -q "^if \[ \"\${AUTORUN_RESILIENT:-0}\" = \"1\" \]" "$f"; then
             echo "FATAL [rider AUTORUN_RESILIENT]: the node count or the resilient template did not land in $f — refusing to submit"
             exit 1
         fi
-        echo "[rider AUTORUN_RESILIENT] ${n_train} training nodes + ${sp} spare(s) = $(( n_train + sp )) nodes requested; gate ${AUTORUN_GATE:-auto}"
-        __RES_SP=$sp
+        echo "[rider AUTORUN_RESILIENT] ${n_train} training nodes + ${sp} spare(s) + ${ucp} UCP worker(s) = $(( n_train + sp + ucp )) nodes requested; gate ${AUTORUN_GATE:-auto}"
+        __RES_SP=$sp; __RES_UCP=$ucp
+        if [ "$ucp" -gt 0 ]; then
+            sed -i "s/^NODES=${n_train}\$/&\nexport AUTORUN_UCP_WORKERS=${ucp}   # [rider AUTORUN_UCP_WORKERS] the last ${ucp} node(s) of the allocation convert every complete save to the universal form and never train/" "$f"
+            if [ "$(grep -c "^export AUTORUN_UCP_WORKERS=${ucp} " "$f")" != 1 ]; then
+                echo "FATAL [rider AUTORUN_UCP_WORKERS]: the export did not land exactly once in $f — refusing to submit"; exit 1
+            fi
+            echo "[rider AUTORUN_UCP_WORKERS] ${ucp} UCP worker node(s) at the end of the allocation: every complete save is converted to the universal form inside the job (ds_to_universal, ${ucp} byte-balanced shares, 64/64 workers), one conversion at a time; the retention keeps the newest 2 ZeRO saves and the newest 8 universals"
+        fi
         # a restart is a NATIVE resume of the run's own last save (weights + optimizer + iteration + data position): the template's
         # manual --finetune (which loads the weights only and restarts the iteration at 0) must be off (found by M1c 5641534)
         sed -i '/^[[:space:]]*--finetune \\$/d' "$f"
@@ -718,9 +730,9 @@ PYINJ
     fi
     if [ "${AUTORUN_RESILIENT:-0}" = "1" ]; then
         # [X-MoE resilience 2026-10-09] the allocation holds N + s nodes by design: the guard compares SLURM_NNODES with N + s
-        sed -i -e 's/\[ "\${SLURM_NNODES}" -ne "\${NODES}" \]/[ "${SLURM_NNODES}" -ne "$(( NODES + '"${__RES_SP:-0}"' ))" ]/' \
-               -e 's/FATAL launch geometry: NODES=\${NODES} but SLURM_NNODES/FATAL launch geometry (resilient, '"${__RES_SP:-0}"' spares): NODES=${NODES} + spares but SLURM_NNODES/' "$f"
-        if ! grep -q 'NODES + '"${__RES_SP:-0}"' ))" \]' "$f"; then
+        sed -i -e 's/\[ "\${SLURM_NNODES}" -ne "\${NODES}" \]/[ "${SLURM_NNODES}" -ne "$(( NODES + '"${__RES_SP:-0}"' + '"${__RES_UCP:-0}"' ))" ]/' \
+               -e 's/FATAL launch geometry: NODES=\${NODES} but SLURM_NNODES/FATAL launch geometry (resilient, '"${__RES_SP:-0}"' spares + '"${__RES_UCP:-0}"' UCP workers): NODES=${NODES} + spares + workers but SLURM_NNODES/' "$f"
+        if ! grep -q 'NODES + '"${__RES_SP:-0}"' + '"${__RES_UCP:-0}"' ))" \]' "$f"; then
             echo "FATAL [rider AUTORUN_RESILIENT]: the geometry guard was not adapted to the spares in $f -- refusing to submit"; exit 1
         fi
     fi
@@ -741,6 +753,18 @@ PYINJ
             echo "FATAL [rider AUTORUN_EXIT_MINS]: override did not land in $f — refusing to submit"
             exit 1
         fi
+    fi
+    if [ "${AUTORUN_WALL_AWARE_EXIT:-0}" = "1" ]; then
+        # [X-MoE resilience 2026-10-10] AUTORUN_WALL_AWARE_EXIT=1: the trainer's exit follows the job's real Slurm end time
+        # (megatron/training.py, XMOE_WALL_AWARE_EXIT=1: after every iteration it exits when one more step and its save would not
+        # fit before SLURM_JOB_END_TIME, and never before the save is complete on every rank). The export is baked into the rendered
+        # script right after the EXIT_DURATION line (so `scontrol write batch_script` shows it), with the three margins. The 260-node
+        # job 5645677 lost 22 min of 256 nodes to a third step that --exit-duration-in-mins = wall - 20 let start at minute 94 of 120.
+        sed -i "s/^EXIT_DURATION=\(.*\)\$/&\nexport XMOE_WALL_AWARE_EXIT=1 XMOE_WALL_MARGIN_FRAC=${XMOE_WALL_MARGIN_FRAC:-0.1} XMOE_WALL_MARGIN_S=${XMOE_WALL_MARGIN_S:-240} XMOE_SAVE_EST_S=${XMOE_SAVE_EST_S:-120}   # [rider AUTORUN_WALL_AWARE_EXIT] the exit follows the Slurm end time; EXIT_DURATION is only the fallback/" "$f"
+        if [ "$(grep -c '^export XMOE_WALL_AWARE_EXIT=1 ' "$f")" != 1 ]; then
+            echo "FATAL [rider AUTORUN_WALL_AWARE_EXIT]: the export did not land exactly once in $f — refusing to submit"; exit 1
+        fi
+        echo "[rider AUTORUN_WALL_AWARE_EXIT] the trainer's exit follows the job's Slurm end time (SLURM_JOB_END_TIME, else scontrol EndTime): it stops after the last step whose successor and save would not fit, and only once that save is complete on every rank; AUTORUN_EXIT_MINS=${AUTORUN_EXIT_MINS:-unset} is kept only as the fallback end time when Slurm gives none (margins: step x $(python3 -c "print(1 + float('${XMOE_WALL_MARGIN_FRAC:-0.1}'))"), save estimate ${XMOE_SAVE_EST_S:-120} s before the first save, fixed ${XMOE_WALL_MARGIN_S:-120} s)"
     fi
     if [ "${AUTORUN_DS_CONFIG_PER_JOB:-0}" = "1" ]; then   # [rider AUTORUN_DS_CONFIG_PER_JOB] (X-MoE 2026-09-18)
         sed -i 's|^config_json="${config_dir}/ds_config_gpt_Zero0_${NAME}.json"$|config_json="${config_dir}/ds_config_gpt_Zero0_${NAME}_job${SLURM_JOB_ID}.json"   # [rider AUTORUN_DS_CONFIG_PER_JOB]|' "$f"

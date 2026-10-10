@@ -200,6 +200,215 @@ def _xmoe_res():
     return _XMOE_RES['mod']
 
 
+# [X-MoE resilience 2026-10-10] THE WALL-AWARE EXIT (XMOE_WALL_AWARE_EXIT=1; unset or 0 = today's behaviour, unchanged).
+# WHY: in the 260-node job 5645677 (wall 2 h, steps of 43 min) the exit was --exit-duration-in-mins = wall - 20, checked by
+# Megatron only at the END of an iteration against the trainer's own start time; the steps ended at minute 51 and 94, the third
+# step started at 94 and the wall killed it at 120, so 22 minutes of 256 nodes were lost, and a hard stop at the wall can land in
+# the middle of a save. The user (2026-10-09 23:50): the exit must follow the job's real Slurm end time, and a save must never be
+# cut by the wall.
+# HOW: the arithmetic lives in examples_elmoe/scripts-frontier/resilience/bin/wall_exit.py (no torch, so it is unit-tested on a
+# login node). At the start of train() the end time is read from SLURM_JOB_END_TIME (Slurm exports the job's projected end as an
+# epoch), else from `scontrol show job` once, else from --exit-duration-in-mins (the trainer's start + the minutes); the source is
+# logged. After every iteration rank 0 computes remaining = end - now and the cost of one more step = the slowest of the last 3
+# iterations x (1 + XMOE_WALL_MARGIN_FRAC) + the measured save (its synchronous part + the asynchronous engine's commit-to-'latest'
+# time; XMOE_SAVE_EST_S before the first save) + XMOE_WALL_MARGIN_S, and shares the decision with every rank through one all-reduce.
+# When remaining < cost the trainer saves (unless this step's save is already in flight), waits until that save is complete on
+# every rank and 'latest' names it, writes one sentence with the arithmetic (rank_0.log, training.log, data/wall_exit.tsv) and
+# exits with code 0. While the flag is on, --exit-duration-in-mins is NOT checked (the wall rule takes precedence; it is only the
+# fallback source of the end time).
+# THE EXIT IS HARD (2026-10-10 02:30, from job 5646541): the first version ended with sys.exit(0), and the ranks did not end. The
+# evidence: the exit sentence was printed at 01:31:41; within 0-4 s every rank printed torch's "destroy_process_group() was not
+# called before program exit" (the ProcessGroupNCCL destructors had started, so Python's teardown had already passed the thread
+# joins and the atexit handlers); the destructors then finalized the six RCCL communicators of every rank one by one, the 8-rank
+# (node) step finished on all 8 ranks of a node within 1 ms at 01:31:48/50, and the 16-rank communicators never finished until the
+# Slurm pre-wall handler killed the step 46 s later ("Abort COMPLETE" x3 per rank at 01:32:27). The "new 8-rank communicator after
+# the exit" seen in rank_0.log was only RCCL's C stdio buffer being flushed at exit (that communicator's Init START is at line 1186
+# of the same log, during the first step). So the trainer must never enter torch's teardown: after the save is published on every
+# rank and ONE confirming all-reduce, every rank flushes its logs, stops the asynchronous engine's writer thread (a bounded join;
+# the commit threads are already joined by wait_published) and calls os._exit(0), with no further collective and no teardown.
+# This is the same exit path hb.die() and the profiled branch of pretrain_gpt_deepspeed.py already use.
+_XMOE_WALL = {'on': os.environ.get('XMOE_WALL_AWARE_EXIT') == '1', 'mod': None, 'pred': None, 'end': None, 'src': None, 'tried': False}
+
+
+def _xmoe_res_bin():
+    """The folder of the resilience helpers (RES_BIN, else the tree's examples_elmoe/scripts-frontier/resilience/bin)."""
+    return os.environ.get('RES_BIN') or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                                    'examples_elmoe', 'scripts-frontier', 'resilience', 'bin')
+
+
+def _xmoe_wall_mod():
+    """Import wall_exit.py once; None when the flag is off or the import fails (then the old behaviour stays)."""
+    if not _XMOE_WALL['tried']:
+        _XMOE_WALL['tried'] = True
+        if _XMOE_WALL['on']:
+            try:
+                _d = _xmoe_res_bin()
+                if _d not in sys.path:
+                    sys.path.insert(0, _d)
+                import wall_exit as _we
+                _XMOE_WALL['mod'] = _we
+                _XMOE_WALL['pred'] = _we.Predictor()
+            except Exception as e:
+                print(f'[wall-aware exit] XMOE_WALL_AWARE_EXIT=1 but wall_exit.py could not be imported ({e}): the old exit rule stays', flush=True)
+                _XMOE_WALL['on'] = False
+    return _XMOE_WALL['mod']
+
+
+def _xmoe_wall_init(args):
+    """Called once before the training loop on every rank: resolve the end time (rank 0 asks Slurm; the value is shared through
+    an all-reduce so that every rank holds the same number), seed the save cost from the job folder, log the rule once."""
+    we = _xmoe_wall_mod()
+    if we is None:
+        return
+    rank = torch.distributed.get_rank()
+    end, src, note = (None, None, '')
+    if rank == 0:
+        end, src, note = we.resolve_end_time(env=os.environ, job_id=os.environ.get('SLURM_JOB_ID'), train_start=_TRAIN_START_TIME,
+                                             exit_duration_min=args.exit_duration_in_mins)
+    # share rank 0's end time and the source index: [end epoch, source code]; the other ranks contribute zeros (MAX keeps rank 0's)
+    srcs = ['SLURM_JOB_END_TIME', 'scontrol show job EndTime', '--exit-duration-in-mins']
+    t = torch.tensor([float(end or 0.0), float(srcs.index(src) + 1 if src in srcs else 0)], dtype=torch.float64,
+                     device=get_accelerator().current_device_name())
+    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
+    end_v, src_i = t[0].item(), int(t[1].item())
+    if end_v <= 0:
+        _XMOE_WALL['on'] = False
+        print_rank_0(f'[wall-aware exit] {note}; the old exit rule (--exit-duration-in-mins {args.exit_duration_in_mins}) stays in force')
+        return
+    _XMOE_WALL['end'], _XMOE_WALL['src'] = end_v, srcs[src_i - 1]
+    pred = _XMOE_WALL['pred']
+    pred.seed_from_files(os.environ.get('RES_DATA_DIR') or (os.path.join(os.environ['RES_JOB_DIR'], 'data') if os.environ.get('RES_JOB_DIR') else None))
+    save_s, save_src = pred.save_cost()
+    print_rank_0(f'[wall-aware exit] on: {note}; {we.fmt(end_v - time.time())} s remain now; after every iteration the trainer exits when the '
+                 f'remaining time is shorter than the slowest of the last 3 iterations x {1 + pred.margin_frac:.1f} + the save cost '
+                 f'({we.fmt(save_s)} s now, from {save_src}) + {we.fmt(pred.margin_s)} s; '
+                 + (f'--exit-duration-in-mins {args.exit_duration_in_mins} (the rider\'s EXIT_DURATION) is ignored while this rule is on'
+                    if args.exit_duration_in_mins and _XMOE_WALL['src'] != '--exit-duration-in-mins' else
+                    'no --exit-duration-in-mins is set' if not args.exit_duration_in_mins else 'the end time itself came from --exit-duration-in-mins'))
+
+
+def _xmoe_wall_latest(args, model):
+    """(expected tag, what 'latest' names now): the DeepSpeed tag of the save of this step and the content of <save>/latest."""
+    tag = f'global_step{model[0].global_steps}' if args.deepspeed else None
+    try:
+        cur = open(os.path.join(args.save, 'latest')).read().strip()
+    except Exception:
+        cur = None
+    return tag, cur
+
+
+def _xmoe_hard_exit(eng, code=0):
+    """End this rank NOW, symmetrically on every rank, without torch's teardown (see the block above for why): flush Python's
+    stdout/stderr and every C stdio stream (the rank log is fd 1; RCCL writes its INFO lines through C stdio), give the
+    asynchronous checkpoint engine's writer thread a bounded chance to return (its queue is empty once 'latest' names the save,
+    so the join is a formality), wait 3 s so that every rank's last all-reduce kernels have drained before any rank's buffers
+    vanish, then os._exit(code). The heartbeat thread is a daemon and dies with the process; the node writer child sees its
+    parent gone and copies once more by itself."""
+    try:
+        sys.stdout.flush(); sys.stderr.flush()
+    except Exception:
+        pass
+    try:
+        import ctypes
+        ctypes.CDLL(None).fflush(None)            # every C stdio stream, so that the RCCL lines in the rank log are not lost
+    except Exception:
+        pass
+    try:
+        if eng is not None and hasattr(eng, 'stop_for_exit'):
+            eng.stop_for_exit(timeout=30.0)
+    except Exception as e:
+        print(f'[wall-aware exit] the engine\'s writer thread was not joined cleanly ({e}); exiting anyway', flush=True)
+    time.sleep(3.0)
+    try:
+        sys.stdout.flush(); sys.stderr.flush()
+    except Exception:
+        pass
+    os._exit(int(code))
+
+
+def _xmoe_wall_decide(iteration, model, optimizer, opt_param_scheduler, saved_checkpoint, step_seconds):
+    """After an iteration (the point where Megatron checks --exit-duration-in-mins): rank 0 decides whether one more step and
+    its save fit before the end time; every rank receives the same decision; on 'exit' the save is made (or waited for), its
+    completion is verified on every rank ('latest' names the step), one sentence is logged, and the process exits with code 0."""
+    we = _XMOE_WALL['mod']
+    if we is None or not _XMOE_WALL['on']:
+        return
+    args = get_args()
+    pred = _XMOE_WALL['pred']
+    pred.record_step(step_seconds)
+    rank, world = torch.distributed.get_rank(), torch.distributed.get_world_size()
+    eng = getattr(model[0], 'checkpoint_engine', None) if args.deepspeed else None
+    last = getattr(eng, 'last_complete', None)                       # rank 0 of the async engine: the last save's commit-to-'latest' time
+    if rank == 0 and last:
+        pred.record_save(async_s=last.get('commit_to_latest_s'), src=f'the last save ({last.get("tag")}): the synchronous part + {we.fmt(last.get("commit_to_latest_s"))} s from the commit to \'latest\'')
+    d = pred.decide(time.time(), _XMOE_WALL['end']) if rank == 0 else dict(done=False, remaining=0, step_s=0, factor=0, step_pred=0, save_s=0, margin_s=0, cost=0)
+    # one all-reduce (MAX) of rank 0's numbers: the decision and the figures of the sentence reach every rank; the others send zeros
+    t = torch.tensor([1.0 if d['done'] else 0.0, float(d.get('remaining') or 0), float(d.get('step_s') or 0), float(d.get('factor') or 0),
+                      float(d.get('save_s') or 0), float(d.get('margin_s') or 0), float(d.get('cost') or 0)], dtype=torch.float64,
+                     device=get_accelerator().current_device_name())
+    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
+    done = bool(t[0].item() > 0.5)
+    d = dict(done=done, remaining=t[1].item(), step_s=t[2].item(), factor=t[3].item(), save_s=t[4].item(), margin_s=t[5].item(), cost=t[6].item())
+    if not done:
+        # a line per step only near the end (the remaining time under 3 x the cost) or on request (XMOE_WALL_VERBOSE=1)
+        if os.environ.get('XMOE_WALL_VERBOSE') == '1' or d['remaining'] < 3 * max(d['cost'], 1.0):
+            print_rank_0('[wall-aware exit] ' + we.continue_sentence(iteration, d, _XMOE_WALL['end'], _XMOE_WALL['src']))
+        return
+    _res = _XMOE_RES['mod']
+    t_exit0 = time.time()
+    started_save = False
+    if args.save and not saved_checkpoint:
+        print_rank_0(f'[wall-aware exit] step {iteration}: {we.fmt(d["remaining"])} s remain and one more step would need {we.arithmetic(d)}: saving now, then exiting')
+        save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler)
+        started_save = True
+    elif args.save:
+        print_rank_0(f'[wall-aware exit] step {iteration}: {we.fmt(d["remaining"])} s remain and one more step would need {we.arithmetic(d)}: the save of this step is already in flight, no second save is started; waiting for it')
+    else:
+        print_rank_0(f'[wall-aware exit] step {iteration}: {we.fmt(d["remaining"])} s remain and one more step would need {we.arithmetic(d)}: no --save, nothing to wait for')
+    # wait until the save is complete on EVERY rank: the asynchronous engine's commit thread of this rank, then 'latest' on disk
+    # (rank 0's commit thread writes it only after every rank's marker exists), then one barrier so that no rank exits early
+    if _res is not None:
+        _res.save_mark(f'wall-aware exit: waiting for the save of step {iteration} to be complete on all ranks')
+    tag, cur = _xmoe_wall_latest(args, model) if args.save else (None, None)
+    wait_s, save_ok = 0.0, (not args.save)
+    if args.save:
+        budget = max(30.0, d['remaining'] - 30.0)
+        if eng is not None and hasattr(eng, 'wait_published'):
+            save_ok, wait_s, cur = eng.wait_published(tag, timeout=budget)
+        else:
+            # the synchronous engine wrote 'latest' inside save_checkpoint itself; verify
+            save_ok, wait_s = (cur == tag), time.time() - t_exit0
+    t_ok = torch.tensor([0.0 if save_ok else 1.0], dtype=torch.float64, device=get_accelerator().current_device_name())
+    torch.distributed.all_reduce(t_ok, op=torch.distributed.ReduceOp.MAX)   # the ONE confirming collective: every rank must see the save complete
+    save_ok = bool(t_ok.item() < 0.5)
+    # no barrier after this point and no other collective: the all-reduce above is the last time the ranks talk to each other
+    sentence = we.exit_sentence(iteration, d, _XMOE_WALL['end'], _XMOE_WALL['src'], world, cur, save_ok, time.time() - t_exit0, started_save)
+    print_rank_0('[wall-aware exit] ' + sentence)
+    jd = os.environ.get('RES_JOB_DIR')
+    writer = 0 if mpu.get_pipeline_model_parallel_world_size() == 1 else world - 1    # training.log's writer rank (hb.training_log_line)
+    if jd and rank == writer:
+        try:
+            with open(os.path.join(jd, 'training.log'), 'a') as fh:
+                fh.write(f'# {time.strftime("%Y-%m-%d %H:%M:%S")} the planned exit (wall-aware) at step {iteration}: {sentence}\n')
+        except Exception as e:
+            print(f'[wall-aware exit] training.log not written: {e}', flush=True)
+    if rank == 0:
+        dd = os.environ.get('RES_DATA_DIR') or (os.path.join(jd, 'data') if jd else None)
+        if dd:
+            try:
+                p = os.path.join(dd, 'wall_exit.tsv')
+                new = not os.path.exists(p)
+                with open(p, 'a') as fh:
+                    if new:
+                        fh.write(we.RECORD_HEADER)
+                    fh.write(we.record_line(os.environ.get('RES_ATTEMPT', '0'), iteration, d, _XMOE_WALL['end'], _XMOE_WALL['src'], cur, save_ok,
+                                            time.time() - t_exit0, sentence))
+            except Exception as e:
+                print(f'[wall-aware exit] wall_exit.tsv not written: {e}', flush=True)
+    print_datetime(f'exiting program after the wall-aware exit at iteration {iteration}')
+    _xmoe_hard_exit(eng, 0)
+
+
 def pretrain(train_valid_test_dataset_provider,
              model_provider,
              model_type,
@@ -1374,6 +1583,10 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler):
             save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
             timers('save-checkpoint').stop(barrier=True)
     checkpoint_throughput_calculator(model, timers('save-checkpoint').elapsed(reset=False))
+    if _XMOE_WALL['pred'] is not None:
+        # [wall-aware exit] the synchronous part of this save (the host copy and the barriers; with the asynchronous engine the
+        # background writes and the commit are not in it: the engine's commit-to-'latest' time is added by _xmoe_wall_decide)
+        _XMOE_WALL['pred'].record_save(sync_s=timers('save-checkpoint').elapsed(reset=False))
     timers.log(['save-checkpoint'])
 
 
@@ -1506,8 +1719,11 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             out = _fsf(*a, **k)
             _res.set_phase('backward')
             return out
+    if _XMOE_WALL['on']:
+        _xmoe_wall_init(args)                         # [wall-aware exit] the end time from Slurm, logged once; off when none is known
     while iteration < args.train_iters and (args.train_tokens is None or \
         args.consumed_train_tokens < args.train_tokens):
+        _xmoe_wall_t0 = time.time()                   # [wall-aware exit] the iteration's wall time, measured from here to the save block
         update_num_microbatches(args.consumed_train_samples)
         if _res is not None:
             _res.begin_step()
@@ -1680,6 +1896,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                        config, False)
 
         # Checkpointing
+        _xmoe_wall_step_s = time.time() - _xmoe_wall_t0   # [wall-aware exit] this iteration's time without its save
         saved_checkpoint = False
         if args.exit_signal_handler:
             signal_handler = get_signal_handler()
@@ -1695,8 +1912,13 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                      opt_param_scheduler)
             saved_checkpoint = True
 
-        # Exiting based on duration
-        if args.exit_duration_in_mins:
+        # [wall-aware exit, 2026-10-10] with XMOE_WALL_AWARE_EXIT=1 the decision below replaces the duration check: it exits
+        # when one more step and its save would not fit before the job's Slurm end time, and never before the save is complete
+        if _XMOE_WALL['on']:
+            _xmoe_wall_decide(iteration, model, optimizer, opt_param_scheduler, saved_checkpoint, _xmoe_wall_step_s)
+
+        # Exiting based on duration (not checked while the wall-aware exit is on: the wall rule takes precedence)
+        if args.exit_duration_in_mins and not _XMOE_WALL['on']:
             train_time = (time.time() - _TRAIN_START_TIME) / 60.0
             done_cuda = get_accelerator().IntTensor(
                 [train_time > args.exit_duration_in_mins])
