@@ -1154,7 +1154,13 @@ def train_step(forward_step_func, data_iterator,
     # Update learning rate.
     if args.deepspeed:
         skipped_iter = 0
-        grad_norm = None
+        # [2026-10-13] the single-stage DeepSpeed path never read the norm (only the pipeline path did, so every PP=1 run printed no
+        # 'grad norm'); the engine caches it at step() (the bf16/ZeRO optimizer's all-groups norm, the one used for clipping), so
+        # reading it here costs nothing and changes no training arithmetic
+        try:
+            grad_norm = model[0].get_global_grad_norm()
+        except Exception:
+            grad_norm = None
         num_zeros_in_grad = None
         
         loss_reduced = {}
