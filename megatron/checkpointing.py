@@ -544,9 +544,16 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
         # the iteration start fresh (DeepSpeed base_optimizer._load_hp_weights_only, 2026-09-12; before that the
         # universal path restored the moments and the groups' lr and step regardless of the flag). The right flag for
         # a bootstrap: an HF import, a checkpoint re-laid out for fine-tuning. Drop it to resume.
-        print_rank_0('--universal-checkpoint with --finetune: the fp32 master weights and the buffers are loaded from '
-                     'the atoms; the optimizer moments, the step, the LR schedule and the iteration start fresh '
-                     '(weights only). Drop --finetune to resume.')
+        if os.environ.get('XMOE_FINETUNE_KEEP_OPTIM') == '1':
+            # [X-MoE 2026-10-15, adam_warmstart] the HOT start: deepspeed/runtime/base_optimizer.py _load_hp_weights_and_moments
+            print_rank_0('--universal-checkpoint with --finetune + XMOE_FINETUNE_KEEP_OPTIM=1 (the HOT Adam start): the fp32 master '
+                         'weights, the buffers AND the Adam moments (exp_avg, exp_avg_sq) are loaded from the atoms and the optimizer '
+                         'step counter is set from the checkpoint; the LR schedule, the iteration, the consumed samples and the data '
+                         'position start fresh. Drop --finetune to resume.')
+        else:
+            print_rank_0('--universal-checkpoint with --finetune: the fp32 master weights and the buffers are loaded from '
+                         'the atoms; the optimizer moments, the step, the LR schedule and the iteration start fresh '
+                         '(weights only). Drop --finetune to resume.')
 
     if args.deepspeed:
         if args.finetune:

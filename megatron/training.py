@@ -230,6 +230,90 @@ def _xmoe_res():
 _XMOE_WALL = {'on': os.environ.get('XMOE_WALL_AWARE_EXIT') == '1', 'mod': None, 'pred': None, 'end': None, 'src': None, 'tried': False}
 
 
+# [X-MoE 2026-10-15, the Adam warm-start probe (assistant_deep_dive/2026-10-15-adam_warmstart)] two probe knobs, both off by default.
+# XMOE_SAVE_STEPS="2,3,5,10,20,40": the training loop saves at the listed iterations IN ADDITION to --save-interval (the checkpointing
+# block below and the 'saved' flag of training.log). Unset or empty = today's behaviour, unchanged.
+# XMOE_LOG_DW=1: one line per iteration on rank 0 with the global update of the fp32 master weights across that iteration's optimizer
+# step: |dw|_2 and max|dw| summed/maxed over every rank's ZeRO partition (every partition is held exactly once in the world: the dense
+# groups are sharded over their data-parallel group, each expert group over its own), the number of changed elements, the optimizer's
+# step counter (apex FusedAdam keeps it in param_groups[0]['step']), the lr, and rank 0's local |exp_avg_sq|_2. The snapshot before
+# the step is a host copy of this rank's partitions (the 16B at 1 node: about 8 GB per rank, 1-2 s), so it is a probe instrument.
+def _xmoe_parse_steps(text):
+    out = set()
+    for tok in (text or '').replace(';', ',').split(','):
+        tok = tok.strip()
+        if tok:
+            out.add(int(tok))
+    return out
+
+
+_XMOE_SAVE_STEPS = _xmoe_parse_steps(os.environ.get('XMOE_SAVE_STEPS'))
+_XMOE_LOG_DW = os.environ.get('XMOE_LOG_DW') == '1'
+
+
+def _xmoe_dw_groups(engine):
+    """This rank's fp32 master partitions: ZeRO-1/2 (single_partition_of_fp32_groups) or the bf16 optimizer (fp32_groups_flat_partition)."""
+    opt = getattr(engine, 'optimizer', None)
+    for name in ('single_partition_of_fp32_groups', 'fp32_groups_flat_partition'):
+        g = getattr(opt, name, None)
+        if g is not None:
+            return list(g)
+    return []
+
+
+def _xmoe_dw_snapshot(engine):
+    return [p.detach().to('cpu', copy=True) for p in _xmoe_dw_groups(engine)]
+
+
+def _xmoe_adam_step(engine):
+    """apex FusedAdam's step counter (param_groups[0]['step']; None before the first step of a fresh optimizer)."""
+    try:
+        return getattr(engine.optimizer, 'optimizer', engine.optimizer).param_groups[0].get('step', None)
+    except Exception:
+        return None
+
+
+def _xmoe_sumsq_chunked(t, chunk=1 << 26):
+    acc = 0.0
+    for c in t.flatten().split(chunk):
+        cd = c.double()
+        acc += float((cd * cd).sum().item())
+    return acc
+
+
+def _xmoe_dw_report(engine, optimizer, snap, iteration):
+    """Every rank computes its partitions' delta against the snapshot; one all-reduce each for the sum of squares, the max and the
+    changed count; rank 0 prints the line."""
+    dev = get_accelerator().current_device_name()
+    sq, mx, nz, n = 0.0, 0.0, 0.0, 0.0
+    groups = _xmoe_dw_groups(engine)
+    for p, s0 in zip(groups, snap):
+        d = p.detach().float() - s0.to(p.device).float()
+        sq += _xmoe_sumsq_chunked(d)
+        mx = max(mx, float(d.abs().max().item()) if d.numel() else 0.0)
+        nz += float((d != 0).sum().item())
+        n += float(d.numel())
+        del d
+    v2 = 0.0
+    base = getattr(engine.optimizer, 'optimizer', None)
+    if base is not None:
+        for p in groups:
+            st = base.state.get(p, {})
+            if 'exp_avg_sq' in st:
+                v2 += _xmoe_sumsq_chunked(st['exp_avg_sq'])
+    t = torch.tensor([sq, nz, n], dtype=torch.float64, device=dev)
+    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+    m = torch.tensor([mx], dtype=torch.float64, device=dev)
+    torch.distributed.all_reduce(m, op=torch.distributed.ReduceOp.MAX)
+    try:
+        lr = float(optimizer.param_groups[0]['lr'])
+    except Exception:
+        lr = float('nan')
+    print_rank_0(f'[dw] iteration {iteration} | lr {lr:.6e} | adam step {_xmoe_adam_step(engine)} | |dw|_2 {t[0].item() ** 0.5:.6e} | '
+                 f'max|dw| {m.item():.6e} | changed {int(t[1].item())} of {int(t[2].item())} fp32 masters | '
+                 f'rank0 |exp_avg_sq|_2 {v2 ** 0.5:.6e}')
+
+
 def _xmoe_res_bin():
     """The folder of the resilience helpers (RES_BIN, else the tree's examples_elmoe/scripts-frontier/resilience/bin)."""
     return os.environ.get('RES_BIN') or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -1525,7 +1609,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             _w = 0 if mpu.get_pipeline_model_parallel_world_size() == 1 else torch.distributed.get_world_size() - 1
             if torch.distributed.get_rank() == _w:
                 _XMOE_RES['mod'].training_log_line(iteration, loss_for_wandb.get('lm loss'), tflops, elapsed_time_per_iteration, _xm,
-                                                   bool(args.save and args.save_interval and iteration % args.save_interval == 0))
+                                                   bool(args.save and ((args.save_interval and iteration % args.save_interval == 0)
+                                                                       or iteration in _XMOE_SAVE_STEPS)))   # [XMOE_SAVE_STEPS]
         print_rank_last(log_string)
 
         # Wandb: log the rest of the iteration-line fields + memory.
@@ -1727,8 +1812,16 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             return out
     if _XMOE_WALL['on']:
         _xmoe_wall_init(args)                         # [wall-aware exit] the end time from Slurm, logged once; off when none is known
+    if _XMOE_SAVE_STEPS:
+        print_rank_0(f'[XMOE_SAVE_STEPS] saves at iterations {sorted(_XMOE_SAVE_STEPS)} in addition to --save-interval {args.save_interval}')
+    if _XMOE_LOG_DW:
+        print_rank_0(f'[dw] XMOE_LOG_DW=1: one line per iteration with the global fp32 master update (|dw|_2, max|dw|, changed count), '
+                     f'the Adam step counter, the lr and rank 0\'s |exp_avg_sq|_2; adam step before the first iteration: {_xmoe_adam_step(model[0])}')
+    _dw_snap = None
     while iteration < args.train_iters and (args.train_tokens is None or \
         args.consumed_train_tokens < args.train_tokens):
+        if _XMOE_LOG_DW:
+            _dw_snap = _xmoe_dw_snapshot(model[0])    # [dw] this rank's fp32 masters before the step
         _xmoe_wall_t0 = time.time()                   # [wall-aware exit] the iteration's wall time, measured from here to the save block
         update_num_microbatches(args.consumed_train_samples)
         if _res is not None:
@@ -1820,6 +1913,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                         config)
         iteration += 1
         args.iteration = iteration
+        if _XMOE_LOG_DW:
+            _xmoe_dw_report(model[0], optimizer, _dw_snap, iteration)   # [dw] the update of this iteration, one line on rank 0
+            _dw_snap = None
         if _res is not None:
             _xmoe_loss = None
             try:
@@ -1912,8 +2008,10 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 print_datetime('exiting program after receiving SIGTERM.')
                 sys.exit()
 
-        if args.save and args.save_interval and \
-           iteration % args.save_interval == 0:
+        if args.save and ((args.save_interval and iteration % args.save_interval == 0)
+                          or iteration in _XMOE_SAVE_STEPS):   # [XMOE_SAVE_STEPS, 2026-10-15] the listed iterations save too
+            if iteration in _XMOE_SAVE_STEPS:
+                print_rank_0(f'[XMOE_SAVE_STEPS] iteration {iteration} is in the listed save steps {sorted(_XMOE_SAVE_STEPS)}: saving')
             save_checkpoint_and_time(iteration, model, optimizer,
                                      opt_param_scheduler)
             saved_checkpoint = True

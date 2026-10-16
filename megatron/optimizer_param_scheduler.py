@@ -3,8 +3,18 @@
 """Learning rate decay and weight decay incr functions."""
 
 import math
+import os
 
 from megatron import print_rank_0, get_args
+
+# [X-MoE 2026-10-15, the Adam warm-start probe] XMOE_LR_ZERO_STEPS=N (unset or 0 = today's behaviour, unchanged): the optimizer steps of
+# iterations 1..N run at a learning rate of exactly 0, then the configured schedule applies from iteration N+1 as if nothing had
+# happened. The scheduler counts SAMPLES (the engine passes increment = the global batch size after every step), and the lr used by the
+# step of iteration k is get_lr() at num_steps = (k - 1) x GBS, so the rule is num_steps < N x GBS. Why lr 0 and not a skipped step:
+# apex FusedAdam still updates m, v and the step counter at lr 0 (p -= lr x (m_hat / (sqrt(v_hat) + eps) + wd x p) = p - 0.0, so every
+# fp32 master stays bit-identical, the weight decay included), which is the warm-up the experiment wants. A native resume restores
+# num_steps from the checkpoint, so a run saved after its N lr-0 steps continues at the schedule's lr.
+_XMOE_LR_ZERO_STEPS = int(os.environ.get('XMOE_LR_ZERO_STEPS', '0') or 0)
 
 class OptimizerParamScheduler(object):
     """Anneals learning rate and weight decay"""
@@ -51,6 +61,11 @@ class OptimizerParamScheduler(object):
         # Set the learning rate
         self.step(0)
         print_rank_0('> learning rate decay style: {}'.format(self.lr_decay_style))
+        if _XMOE_LR_ZERO_STEPS > 0:
+            print_rank_0('> XMOE_LR_ZERO_STEPS={}: lr = 0 for the optimizer steps of iterations 1..{} (num_steps < {} samples at '
+                         'global batch {}), then the configured schedule (max_lr {}, min_lr {}, style {})'.format(
+                             _XMOE_LR_ZERO_STEPS, _XMOE_LR_ZERO_STEPS, _XMOE_LR_ZERO_STEPS * args.global_batch_size,
+                             args.global_batch_size, self.max_lr, self.min_lr, self.lr_decay_style))
 
 
     def get_wd(self):
@@ -81,6 +96,9 @@ class OptimizerParamScheduler(object):
     def get_lr(self):
         """Learning rate decay functions from:
               https://openreview.net/pdf?id=BJYwwY9ll pg. 4"""
+
+        if _XMOE_LR_ZERO_STEPS > 0 and self.num_steps < _XMOE_LR_ZERO_STEPS * get_args().global_batch_size:
+            return 0.0   # [XMOE_LR_ZERO_STEPS] the lr-0 warm-up: m, v and the step advance, the weights do not move
 
         # Use linear warmup for the initial part.
         if self.lr_warmup_tokens is None:
