@@ -561,6 +561,31 @@ apply_autorun_riders() {
             echo "FATAL [rider AUTORUN_RESILIENT]: --finetune is still in $f — refusing to submit"; exit 1
         fi
         echo "[rider AUTORUN_RESILIENT] --finetune removed: every restart is a native resume from the latest save"
+        # [X-MoE resilience 2026-10-13] AUTORUN_INIT_LOAD_DIR=<dir> (+ AUTORUN_INIT_UNIVERSAL=1): the run STARTS from another run's checkpoint,
+        # weights only (--finetune: a fresh optimizer, iteration 0), and every restart after the run's own first save resumes that save
+        # natively (restart_loop.sh res_init_load). The export is baked after NODES= so that `scontrol write batch_script` shows it. The
+        # template's --load stays the run's own save directory (AUTORUN_LOAD_DIR must equal AUTORUN_SAVE_DIR). Verified or ABORT.
+        if [ -n "${AUTORUN_INIT_LOAD_DIR:-}" ]; then
+            if [ "${AUTORUN_NATIVE_RESUME:-0}" = 1 ] || [ "${AUTORUN_UCP_FINETUNE:-0}" = 1 ] || [ "${AUTORUN_UCP_RESUME:-0}" = 1 ]; then
+                echo "FATAL [rider AUTORUN_INIT_LOAD_DIR]: mutually exclusive with AUTORUN_NATIVE_RESUME / AUTORUN_UCP_FINETUNE / AUTORUN_UCP_RESUME — refusing to submit"; exit 1
+            fi
+            if [ -z "${AUTORUN_SAVE_DIR:-}" ] || [ "${AUTORUN_LOAD_DIR:-}" != "${AUTORUN_SAVE_DIR}" ]; then
+                echo "FATAL [rider AUTORUN_INIT_LOAD_DIR]: AUTORUN_LOAD_DIR must equal AUTORUN_SAVE_DIR (the run's own lineage; the initial checkpoint is AUTORUN_INIT_LOAD_DIR) — refusing to submit"; exit 1
+            fi
+            case "${AUTORUN_INIT_LOAD_DIR}" in /*) ;; *) echo "FATAL [rider AUTORUN_INIT_LOAD_DIR]: give an absolute path (got ${AUTORUN_INIT_LOAD_DIR})"; exit 1;; esac
+            local itag
+            if [ "${AUTORUN_INIT_UNIVERSAL:-0}" = 1 ]; then itag=$(cat "${AUTORUN_INIT_LOAD_DIR}/latest_universal" 2>/dev/null); else itag=$(cat "${AUTORUN_INIT_LOAD_DIR}/latest" 2>/dev/null); fi
+            if [ -z "$itag" ] || [ ! -d "${AUTORUN_INIT_LOAD_DIR}/${itag}" ]; then
+                echo "FATAL [rider AUTORUN_INIT_LOAD_DIR]: ${AUTORUN_INIT_LOAD_DIR} has no $( [ "${AUTORUN_INIT_UNIVERSAL:-0}" = 1 ] && echo latest_universal || echo latest ) tag naming a folder — refusing to submit"; exit 1
+            fi
+            sed -i "s|^NODES=${n_train}\$|&\nexport RES_INIT_LOAD_DIR=${AUTORUN_INIT_LOAD_DIR} RES_INIT_UNIVERSAL=${AUTORUN_INIT_UNIVERSAL:-0}   # [rider AUTORUN_INIT_LOAD_DIR] the first weights (weights only, iteration 0) until the run's own first save|" "$f"
+            if [ "$(grep -c "^export RES_INIT_LOAD_DIR=${AUTORUN_INIT_LOAD_DIR} " "$f")" != 1 ]; then
+                echo "FATAL [rider AUTORUN_INIT_LOAD_DIR]: the export did not land exactly once in $f — refusing to submit"; exit 1
+            fi
+            echo "[rider AUTORUN_INIT_LOAD_DIR] the first weights: ${AUTORUN_INIT_LOAD_DIR} (${itag}, $( [ "${AUTORUN_INIT_UNIVERSAL:-0}" = 1 ] && echo universal || echo native)), weights only with --finetune until the run's own first save in ${AUTORUN_SAVE_DIR}; then native resumes"
+        fi
+    elif [ -n "${AUTORUN_INIT_LOAD_DIR:-}" ]; then
+        echo "FATAL [rider AUTORUN_INIT_LOAD_DIR]: needs AUTORUN_RESILIENT=1 (the restart loop applies it) — refusing to submit"; exit 1
     fi
     # Resume-mode riders are mutually exclusive: abort before any edit lands.
     if [ "${AUTORUN_UCP_RESUME:-0}" = "1" ] && { [ "${AUTORUN_UCP_FINETUNE:-0}" = "1" ] || [ "${AUTORUN_NATIVE_RESUME:-0}" = "1" ]; }; then
