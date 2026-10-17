@@ -541,6 +541,11 @@ apply_autorun_riders() {
         case "$ucp" in ''|*[!0-9]*) echo "FATAL [rider AUTORUN_UCP_WORKERS]: '$ucp' is not a whole number"; exit 1;; esac
         sed -i -e "s/^#SBATCH -N ${n_train}\$/#SBATCH -N $(( n_train + sp + ucp ))   # [rider AUTORUN_RESILIENT] ${n_train} train + ${sp} spare(s) + ${ucp} UCP worker(s)/" \
                -e "s/^#SBATCH -J /#SBATCH -J res-/" "$f"
+        # [2026-10-16 bug fix] Slurm revokes the whole allocation when one of its nodes fails unless the JOB was submitted with
+        # --no-kill (sbatch(1)); the srun steps' --no-kill keeps a step, not the allocation (the one real node loss, 5641643, ended the
+        # job). Table 2's "node lost -> spare node" needs the allocation to survive, so the resilient job asks for it.
+        sed -i "s|^#SBATCH -N $(( n_train + sp + ucp )) .*|&\n#SBATCH --no-kill   # [rider AUTORUN_RESILIENT] keep the allocation when a node fails (the restart loop swaps in a spare)|" "$f"
+        if ! grep -q "^#SBATCH --no-kill" "$f"; then echo "FATAL [rider AUTORUN_RESILIENT]: --no-kill did not land in $f"; exit 1; fi
         if ! grep -q "^#SBATCH -N $(( n_train + sp + ucp )) " "$f" || ! grep -q "^if \[ \"\${AUTORUN_RESILIENT:-0}\" = \"1\" \]" "$f"; then
             echo "FATAL [rider AUTORUN_RESILIENT]: the node count or the resilient template did not land in $f — refusing to submit"
             exit 1
