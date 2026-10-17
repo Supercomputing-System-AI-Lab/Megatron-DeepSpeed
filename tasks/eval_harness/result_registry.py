@@ -52,6 +52,11 @@ FORWARD_SOURCES = (
     'tasks/eval_harness/megatron_ds_eval/loader.py',           # decides which bytes become weights
 )
 
+# Environment switches that change the numbers of a forward, with their defaults (code_fingerprint folds each effective value in).
+FORWARD_ENV_SWITCHES = {
+    'XMOE_ROPE_FP32_FREQ': '1',   # 2026-10-17: rotary inv_freq kept fp32 through the bf16 model cast; default on, '0' = the old rounding
+}
+
 # RULER's leaf tasks live in TWO name families; its lm-eval group task is 'ruler'.
 # Any own-keys rule of the shape `k == task or k.startswith(task + '_')` therefore
 # counts only the ruler_* five of RULER's thirteen leaves (500 docs of 1300), so a
@@ -205,7 +210,13 @@ def code_fingerprint(repo_root, sources=FORWARD_SOURCES, length=8):
         h.update(rel.encode('utf-8'))
         h.update(data)
         hashed.append(rel)
-    return h.hexdigest()[:length], {'hashed': hashed, 'missing': missing}
+    # 2026-10-17: environment switches that change the forward's numbers are part of its identity, so a run with a switch in
+    # one state never reads (or writes) the answer file of a run with it in the other. The EFFECTIVE value of every switch
+    # (the environment's, else the default) enters the hash.
+    env = {k: os.environ.get(k, default) for k, default in FORWARD_ENV_SWITCHES.items()}
+    for k, v in env.items():
+        h.update(f'env:{k}={v}'.encode('utf-8'))
+    return h.hexdigest()[:length], {'hashed': hashed, 'missing': missing, 'env': env}
 
 
 def git_info(repo_root):

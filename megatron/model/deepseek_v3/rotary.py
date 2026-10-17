@@ -4,12 +4,31 @@ and the softmax-scale multiplier of the released model, and the interleaved rota
 
 Every formula is the one of the released implementation as shipped in transformers 4.56 (models/deepseek_v3/modeling_deepseek_v3.py
 and modeling_rope_utils._compute_yarn_parameters): the same order of operations, so a table built here equals the reference bit for
-bit in fp32 (tests/test_v3_yarn_table.py checks that). Positions and frequencies stay fp32; the cast to the tensor's dtype happens
-at the apply, the rule of megatron/model/rotary_pos_embedding.py.
+bit in fp32 (tests/test_v3_yarn_table.py checks that). Positions stay fp32; the frequencies stay fp32 too (ROPE_FP32_FREQ below, the default; XMOE_ROPE_FP32_FREQ=0
+restores the old behaviour, where the model casts round the inv_freq buffer); the cast to the tensor's dtype happens at the apply,
+the rule of megatron/model/rotary_pos_embedding.py.
 """
 import math
+import os
 
 import torch
+
+# 2026-10-17 (assistant_deep_dive/2026-10-17-rope_bf16): inv_freq is a buffer, and the model casts round it: DeepSpeed's
+# engine (deepspeed/runtime/engine.py _configure_distributed_model: self.module.bfloat16()) in training and the eval loader
+# (tasks/eval_harness/megatron_ds_eval/loader.py: model[0].bfloat16()) round 31 of the 32 YaRN-64 frequencies to bf16 (up
+# to 0.33 %); the angle error is distance x frequency error (0.7 rad at 4k, several turns by 32k on the fast pairs).
+# The fp32 values are kept through any cast (YarnRotaryTable._apply): the DEFAULT since 2026-10-17 (the user: "set the fp32 rope
+# as default"). XMOE_ROPE_FP32_FREQ=0 restores the rounded frequencies, to reproduce a run or an answer file made before the fix.
+# Memory: +64 bytes per attention layer (32 fp32 instead of bf16); the cos/sin were fp32 either way (fp32 positions x inv_freq).
+ROPE_FP32_FREQ = os.environ.get('XMOE_ROPE_FP32_FREQ', '1') == '1'
+_announced = []
+
+
+def _announce(what):
+    if ROPE_FP32_FREQ and what not in _announced:
+        _announced.append(what)
+        if os.environ.get('RANK', '0') == '0':
+            print(f'[rope] {what} keeps inv_freq in fp32 through the model casts (default; XMOE_ROPE_FP32_FREQ=0 restores the bf16-rounded frequencies)', flush=True)
 
 
 def yarn_get_mscale(scale=1.0, mscale=1.0):
@@ -65,6 +84,18 @@ class YarnRotaryTable(torch.nn.Module):
             inv_freq_interpolation = 1.0 / (factor * pos_freqs)
             inv_freq = inv_freq_interpolation * (1 - extrapolation_factor) + inv_freq_extrapolation * extrapolation_factor
         self.register_buffer('inv_freq', inv_freq, persistent=False)
+        _announce('YarnRotaryTable')
+
+    def _apply(self, fn, *args, **kwargs):
+        """Unless XMOE_ROPE_FP32_FREQ=0, the fp32 inv_freq survives .bfloat16() / .half() / .to(dtype) (the device moves still
+        apply); the router-bias guard of deepspeed/moe/moe_v2.py upcasts after the cast, which cannot restore the rounded bits,
+        so this keeps the values from before the cast instead."""
+        if not ROPE_FP32_FREQ:
+            return super()._apply(fn, *args, **kwargs)
+        keep = self._buffers['inv_freq'].detach().to(torch.float32).clone()
+        r = super()._apply(fn, *args, **kwargs)
+        self._buffers['inv_freq'] = keep.to(self._buffers['inv_freq'].device)
+        return r
 
     def softmax_scale_factor(self):
         """The multiplier on qk_head_dim ** -0.5 (the released DeepseekV3Attention.__init__): mscale squared when

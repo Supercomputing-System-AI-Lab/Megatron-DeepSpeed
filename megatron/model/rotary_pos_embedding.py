@@ -5,6 +5,7 @@
 # common/megatron/rotary_pos_embedding.py
 
 import importlib.util
+import os
 import torch
 
 from torch import einsum, nn
@@ -18,8 +19,23 @@ class RotaryEmbedding(nn.Module):
         super().__init__()
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer('inv_freq', inv_freq)
+        # 2026-10-17 (assistant_deep_dive/2026-10-17-rope_bf16): the July fix below keeps the POSITIONS in fp32, but the model
+        # casts (DeepSpeed engine self.module.bfloat16(); the eval loader's model[0].bfloat16()) still round this buffer: 63 of
+        # the 64 frequencies move (up to 0.37 % at base 5e6), and .float() in forward cannot restore them. _apply keeps the fp32
+        # values: the DEFAULT since 2026-10-17; XMOE_ROPE_FP32_FREQ=0 restores the rounded frequencies (to reproduce an old run).
+        self._rope_fp32_freq = os.environ.get('XMOE_ROPE_FP32_FREQ', '1') == '1'
+        if self._rope_fp32_freq and os.environ.get('RANK', '0') == '0':
+            print('[rope] RotaryEmbedding keeps inv_freq in fp32 through the model casts (default; XMOE_ROPE_FP32_FREQ=0 restores the bf16-rounded frequencies)', flush=True)
         if importlib.util.find_spec('einops') is None:
             raise RuntimeError("einops is required for Rotary Embedding")
+
+    def _apply(self, fn, *args, **kwargs):
+        if not getattr(self, '_rope_fp32_freq', False):
+            return super()._apply(fn, *args, **kwargs)
+        keep = self._buffers['inv_freq'].detach().to(torch.float32).clone()
+        r = super()._apply(fn, *args, **kwargs)
+        self._buffers['inv_freq'] = keep.to(self._buffers['inv_freq'].device)
+        return r
 
     def forward(self, max_seq_len, offset=0):
         # BEFORE
