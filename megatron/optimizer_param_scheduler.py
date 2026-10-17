@@ -15,6 +15,11 @@ from megatron import print_rank_0, get_args
 # fp32 master stays bit-identical, the weight decay included), which is the warm-up the experiment wants. A native resume restores
 # num_steps from the checkpoint, so a run saved after its N lr-0 steps continues at the schedule's lr.
 _XMOE_LR_ZERO_STEPS = int(os.environ.get('XMOE_LR_ZERO_STEPS', '0') or 0)
+# [X-MoE 2026-10-17, the 671B 256k pilot] XMOE_LR_WARMUP_STEPS=N (unset or 0 = unchanged): the update of iteration k runs at
+# max_lr x k / N for k = 1..N, then the configured schedule. The token-based --lr-warmup-tokens cannot give this: get_lr() at the first
+# update sees 0 tokens (the scheduler is stepped once at construction), and step() reads consumed_train_tokens before the loop adds the
+# step's tokens, so a token warm-up gives the first TWO updates lr 0. Same counting as XMOE_LR_ZERO_STEPS: k = num_steps // GBS + 1.
+_XMOE_LR_WARMUP_STEPS = int(os.environ.get('XMOE_LR_WARMUP_STEPS', '0') or 0)
 
 class OptimizerParamScheduler(object):
     """Anneals learning rate and weight decay"""
@@ -61,6 +66,10 @@ class OptimizerParamScheduler(object):
         # Set the learning rate
         self.step(0)
         print_rank_0('> learning rate decay style: {}'.format(self.lr_decay_style))
+        if _XMOE_LR_WARMUP_STEPS > 0:
+            print_rank_0('> XMOE_LR_WARMUP_STEPS={}: the update of iteration k uses max_lr x k/{} for k = 1..{} (max_lr {}), then the '
+                         'configured schedule (style {})'.format(_XMOE_LR_WARMUP_STEPS, _XMOE_LR_WARMUP_STEPS, _XMOE_LR_WARMUP_STEPS,
+                                                                 self.max_lr, self.lr_decay_style))
         if _XMOE_LR_ZERO_STEPS > 0:
             print_rank_0('> XMOE_LR_ZERO_STEPS={}: lr = 0 for the optimizer steps of iterations 1..{} (num_steps < {} samples at '
                          'global batch {}), then the configured schedule (max_lr {}, min_lr {}, style {})'.format(
@@ -99,6 +108,11 @@ class OptimizerParamScheduler(object):
 
         if _XMOE_LR_ZERO_STEPS > 0 and self.num_steps < _XMOE_LR_ZERO_STEPS * get_args().global_batch_size:
             return 0.0   # [XMOE_LR_ZERO_STEPS] the lr-0 warm-up: m, v and the step advance, the weights do not move
+
+        if _XMOE_LR_WARMUP_STEPS > 0:
+            k = int(self.num_steps) // get_args().global_batch_size + 1   # the 1-based iteration whose update uses this lr
+            if k <= _XMOE_LR_WARMUP_STEPS:
+                return self.max_lr * float(k) / float(_XMOE_LR_WARMUP_STEPS)
 
         # Use linear warmup for the initial part.
         if self.lr_warmup_tokens is None:
