@@ -86,3 +86,8 @@ examples_elmoe/*.pyc
 examples_elmoe/*.bak*
 examples_elmoe/core
 examples_elmoe/scripts-frontier/deepspeed/
+
+# GPU core dumps, fused-kernel build folders and lock files (they reached a commit on 2026-10-09)
+gpucore.*
+megatron/fused_kernels/build*/
+*.lock
