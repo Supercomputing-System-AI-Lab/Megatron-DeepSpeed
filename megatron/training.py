@@ -200,6 +200,27 @@ def _xmoe_res():
     return _XMOE_RES['mod']
 
 
+# [ft-sys-v2 2026-11-05] the in-process part of the heartbeat system (examples_elmoe/scripts-frontier/ft-sys-v2/heartbeat-sys/
+# hb_monitor.py): a count of every torch.distributed communication call, and a monitor thread that writes this rank's line to host
+# memory every 5 s for the node's agent. Nothing is imported unless XMOE_FT_V2=1, so training is unchanged by default. The monitor
+# makes no GPU call (design map 1.5); the trainer only hands it Python values (the step, the phase).
+_XMOE_FTV2 = {'mod': None, 'tried': False}
+
+
+def _xmoe_ftv2():
+    if not _XMOE_FTV2['tried']:
+        _XMOE_FTV2['tried'] = True
+        if os.environ.get('XMOE_FT_V2') == '1':
+            _d = os.environ.get('FTV2_HB_DIR') or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                                               'examples_elmoe', 'scripts-frontier', 'ft-sys-v2', 'heartbeat-sys')
+            if _d not in sys.path:
+                sys.path.insert(0, _d)
+            import hb_monitor as _m
+            _m.install_counter()
+            _XMOE_FTV2['mod'] = _m
+    return _XMOE_FTV2['mod']
+
+
 # [X-MoE resilience 2026-10-10] THE WALL-AWARE EXIT (XMOE_WALL_AWARE_EXIT=1; unset or 0 = today's behaviour, unchanged).
 # WHY: in the 260-node job 5645677 (wall 2 h, steps of 43 min) the exit was --exit-duration-in-mins = wall - 20, checked by
 # Megatron only at the END of an iteration against the trainer's own start time; the steps ended at minute 51 and 94, the third
@@ -532,10 +553,13 @@ def pretrain(train_valid_test_dataset_provider,
     rank = int (os.getenv ("RANK"))
     # torch.cuda.set_device(local_rank)
 
+    _xmoe_ftv2()             # [ft-sys-v2] the call counter goes in before the first communication call
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(extra_args_provider=extra_args_provider,
                         args_defaults=args_defaults)
     print_rank_0 (f'after initialize_megatron')
+    if _XMOE_FTV2['mod'] is not None:
+        _XMOE_FTV2['mod'].start(torch.distributed.get_rank(), int(os.getenv('LOCAL_RANK', os.getenv('SLURM_LOCALID', '0'))))
     _res = _xmoe_res()
     if _res is not None:
         _res._ctx['rank'] = torch.distributed.get_rank()
@@ -1662,6 +1686,8 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler):
     # Extra barrier is added to make sure
     # all ranks report the max time.
     _res = _XMOE_RES['mod']
+    if _XMOE_FTV2['mod'] is not None:
+        _XMOE_FTV2['mod'].set_phase('save')           # [ft-sys-v2] a save: the coordinator uses its longer still-limit
     if _res is None:
         timers('save-checkpoint', log_level=0).start(barrier=True)
         save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
@@ -1822,6 +1848,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         args.consumed_train_tokens < args.train_tokens):
         if _XMOE_LOG_DW:
             _dw_snap = _xmoe_dw_snapshot(model[0])    # [dw] this rank's fp32 masters before the step
+        if _XMOE_FTV2['mod'] is not None:
+            _XMOE_FTV2['mod'].set_step(iteration)     # [ft-sys-v2] the step on this rank's heartbeat line (a Python value)
+            _XMOE_FTV2['mod'].set_phase('train')
         _xmoe_wall_t0 = time.time()                   # [wall-aware exit] the iteration's wall time, measured from here to the save block
         update_num_microbatches(args.consumed_train_samples)
         if _res is not None:
