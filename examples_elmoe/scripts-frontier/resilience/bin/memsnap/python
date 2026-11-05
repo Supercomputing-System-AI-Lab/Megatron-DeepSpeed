@@ -1,0 +1,18 @@
+#!/bin/bash
+# The memory-snapshot shim (2026-09-14, run M1): put this folder first on PATH inside a job (the AUTORUN_PRE_CMD rider). The template's
+# `python ../ELMoE_launch.py ...` (which runs pretrain_gpt_deepspeed in the same process, ELMoE_launch.py line 354) then runs through
+# memsnap_boot.py on every rank: the CUDA peak-memory counters stop being
+# reset (DeepSpeed's see_memory_usage / empty_cache reset them, so a log's "max allocated" is otherwise not the peak), and rank
+# MEMSNAP_RANK (default 0) records the caching allocator's history and dumps it at exit to ${MEMSNAP_OUT}. Every other python call of
+# the template runs the campaign interpreter unchanged. The model code is not touched.
+# [2026-10-10, resilience round 6] this copy lives in resilience/bin/memsnap and is put first on PATH by restart_loop.sh for every training
+# attempt when AUTORUN_MEM_PROFILER=1 (the OOM rule: the memory profiler runs on every attempt); the real interpreter is the v5 campaign
+# env (the v4 path of the 2026-09-14 copy was purged on 2026-10-05), overridable with RES_PY.
+REAL=${RES_PY:-/lustre/orion/world-shared/gen150/zixianw4/envs/TORCH-ROCM6.4.1_env_groupgemm_v5/bin/python}
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+flags=()
+while [ $# -gt 0 ] && [ "${1#-}" != "$1" ] && [ "$1" != "-c" ] && [ "$1" != "-m" ]; do flags+=("$1"); shift; done
+case "${1:-}" in
+    *ELMoE_launch.py|*pretrain_gpt_deepspeed.py) exec "$REAL" "${flags[@]}" "$HERE/memsnap_boot.py" "$@" ;;
+esac
+exec "$REAL" "${flags[@]}" "$@"

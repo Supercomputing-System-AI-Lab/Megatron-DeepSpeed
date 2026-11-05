@@ -1,0 +1,76 @@
+answers_srun	yes	8.3	2026-10-09	5644650	5	fixed expectation of the test; run time measured	replaced by job 5646685 on 2026-10-10 03:25
+rocm_smi_ids	8	0.9	2026-10-09	5644650	5	fixed expectation of the test; run time measured	replaced by job 5646685 on 2026-10-10 03:25
+ras_ue	0	0.2	2026-10-09	5644650	5	fixed expectation of the test; run time measured	replaced by job 5646685 on 2026-10-10 03:25
+xgmi_err	0	0.2	2026-10-09	5644650	5	fixed expectation of the test; run time measured	replaced by job 5646685 on 2026-10-10 03:25
+rocm_version	6.4.1-83	0.0	2026-10-09	5644650	5	majority value (5 of 5 nodes)	replaced by job 5646685 on 2026-10-10 03:25
+rccl_md5	5eb198b87e46:2157272953	0.1	2026-10-09	5644650	5	majority value (5 of 5 nodes)	replaced by job 5646685 on 2026-10-10 03:25
+ofi_plugin_md5	b72efa9729d4:121552	0.0	2026-10-09	5644650	5	majority value (5 of 5 nodes)	replaced by job 5646685 on 2026-10-10 03:25
+libfabric	fi_info: 2.3.1	0.0	2026-10-09	5644650	5	majority value (5 of 5 nodes)	replaced by job 5646685 on 2026-10-10 03:25
+shm_free_gb	> 1	0.0	2026-10-09	5644650	5	fixed expectation of the test; run time measured	replaced by job 5646685 on 2026-10-10 03:25
+gemm	114.5	90.5	2026-10-09	5644650	5	median of 40 values (GCDs), min 108.8, max 117.6	replaced by job 5646685 on 2026-10-10 03:25
+xgmi_a2a	65.9	32.6	2026-10-09	5644650	5	median of 5 values (nodes), min 65.4, max 66.0	replaced by job 5646685 on 2026-10-10 03:25
+counters_after	same	0.1	2026-10-09	5644650	5	fixed expectation of the test; run time measured	replaced by job 5646685 on 2026-10-10 03:25
+answers_srun	yes	9.6	2026-10-10	5646685	3	fixed expectation of the test; run time measured	replaced by job 5646729 on 2026-10-10 03:55
+rocm_smi_ids	8	1.0	2026-10-10	5646685	3	fixed expectation of the test; run time measured	replaced by job 5646729 on 2026-10-10 03:55
+ras_ue	0	0.3	2026-10-10	5646685	3	fixed expectation of the test; run time measured	replaced by job 5646729 on 2026-10-10 03:55
+xgmi_err	0	0.3	2026-10-10	5646685	3	fixed expectation of the test; run time measured	replaced by job 5646729 on 2026-10-10 03:55
+rocm_version	6.4.1-83	0.0	2026-10-10	5646685	3	majority value (3 of 3 nodes)	replaced by job 5646729 on 2026-10-10 03:55
+rccl_md5	5eb198b87e46:2157272953	0.2	2026-10-10	5646685	3	majority value (3 of 3 nodes)	replaced by job 5646729 on 2026-10-10 03:55
+ofi_plugin_md5	b72efa9729d4:121552	0.1	2026-10-10	5646685	3	majority value (3 of 3 nodes)	replaced by job 5646729 on 2026-10-10 03:55
+libfabric	fi_info: 2.3.1	0.1	2026-10-10	5646685	3	majority value (3 of 3 nodes)	replaced by job 5646729 on 2026-10-10 03:55
+shm_free_gb	> 1	0.0	2026-10-10	5646685	3	fixed expectation of the test; run time measured	replaced by job 5646729 on 2026-10-10 03:55
+gemm	114.1	92.4	2026-10-10	5646685	3	median of 24 values (GCDs), min 107.5, max 117.0	replaced by job 5646729 on 2026-10-10 03:55
+xgmi_a2a	65.8	33.0	2026-10-10	5646685	3	median of 3 values (nodes), min 65.7, max 66.0	replaced by job 5646729 on 2026-10-10 03:55
+pair	17.3	48.2	2026-10-10	5646685	3	median of 12 values (GCDs), min 17.0, max 18.3	replaced by job 5646729 on 2026-10-10 03:55
+counters_after	same	0.3	2026-10-10	5646685	3	fixed expectation of the test; run time measured	replaced by job 5646729 on 2026-10-10 03:55
+answers_srun	yes	0.1	2026-10-10	5646729	3	fixed expectation of the test; run time measured	replaced by job 5647441 on 2026-10-10 11:51
+rocm_smi_ids	8	0.9	2026-10-10	5646729	3	fixed expectation of the test; run time measured	replaced by job 5647441 on 2026-10-10 11:51
+ras_ue	0	0.2	2026-10-10	5646729	3	fixed expectation of the test; run time measured	replaced by job 5647441 on 2026-10-10 11:51
+xgmi_err	0	0.2	2026-10-10	5646729	3	fixed expectation of the test; run time measured	replaced by job 5647441 on 2026-10-10 11:51
+rocm_version	6.4.1-83	0.0	2026-10-10	5646729	3	majority value (3 of 3 nodes)	replaced by job 5647441 on 2026-10-10 11:51
+rccl_md5	5eb198b87e46:2157272953	0.1	2026-10-10	5646729	3	majority value (3 of 3 nodes)	replaced by job 5647441 on 2026-10-10 11:51
+ofi_plugin_md5	b72efa9729d4:121552	0.0	2026-10-10	5646729	3	majority value (3 of 3 nodes)	replaced by job 5647441 on 2026-10-10 11:51
+libfabric	fi_info: 2.3.1	0.0	2026-10-10	5646729	3	majority value (3 of 3 nodes)	replaced by job 5647441 on 2026-10-10 11:51
+shm_free_gb	> 1	0.0	2026-10-10	5646729	3	fixed expectation of the test; run time measured	replaced by job 5647441 on 2026-10-10 11:51
+gemm	113.8	90.8	2026-10-10	5646729	3	median of 24 values (GCDs), min 110.8, max 119.3	replaced by job 5647441 on 2026-10-10 11:51
+xgmi_a2a	65.8	32.1	2026-10-10	5646729	3	median of 3 values (nodes), min 65.7, max 65.8	replaced by job 5647441 on 2026-10-10 11:51
+pair	12.1	18.4	2026-10-10	5646729	3	median of 24 values (GCDs), min 9.9, max 14.8	replaced by job 5647441 on 2026-10-10 11:51
+counters_after	same	0.1	2026-10-10	5646729	3	fixed expectation of the test; run time measured	replaced by job 5647441 on 2026-10-10 11:51
+answers_srun	yes	0.3	2026-10-10	5647441	262	fixed expectation of the test; run time measured	replaced by job 5647442 on 2026-10-10 11:51
+rocm_smi_ids	8	3.3	2026-10-10	5647441	262	fixed expectation of the test; run time measured	replaced by job 5647442 on 2026-10-10 11:51
+ras_ue	0	1.8	2026-10-10	5647441	262	fixed expectation of the test; run time measured	replaced by job 5647442 on 2026-10-10 11:51
+xgmi_err	0	1.2	2026-10-10	5647441	262	fixed expectation of the test; run time measured	replaced by job 5647442 on 2026-10-10 11:51
+rocm_version	6.4.1-83	0.0	2026-10-10	5647441	262	majority value (262 of 262 nodes)	replaced by job 5647442 on 2026-10-10 11:51
+rccl_md5	5eb198b87e46:2157272953	4.1	2026-10-10	5647441	262	majority value (262 of 262 nodes)	replaced by job 5647442 on 2026-10-10 11:51
+ofi_plugin_md5	b72efa9729d4:121552	0.1	2026-10-10	5647441	262	majority value (262 of 262 nodes)	replaced by job 5647442 on 2026-10-10 11:51
+libfabric	fi_info: 2.3.1	0.2	2026-10-10	5647441	262	majority value (262 of 262 nodes)	replaced by job 5647442 on 2026-10-10 11:51
+shm_free_gb	> 1	0.1	2026-10-10	5647441	262	fixed expectation of the test; run time measured	replaced by job 5647442 on 2026-10-10 11:51
+gemm	114.0	111.3	2026-10-10	5647441	262	median of 2096 values (GCDs), min 105.8, max 119.4	replaced by job 5647442 on 2026-10-10 11:51
+xgmi_a2a	65.8	33.5	2026-10-10	5647441	262	median of 262 values (nodes), min 65.5, max 66.2	replaced by job 5647442 on 2026-10-10 11:51
+pair	11.3	133.4	2026-10-10	5647441	262	median of 2096 values (GCDs), min 9.8, max 15.7	replaced by job 5647442 on 2026-10-10 11:51
+counters_after	same	0.3	2026-10-10	5647441	262	fixed expectation of the test; run time measured	replaced by job 5647442 on 2026-10-10 11:51
+answers_srun	yes	0.3	2026-10-10	5647442	262	fixed expectation of the test; run time measured	replaced by job 5650829 on 2026-10-11 15:31
+rocm_smi_ids	8	3.3	2026-10-10	5647442	262	fixed expectation of the test; run time measured	replaced by job 5650829 on 2026-10-11 15:31
+ras_ue	0	1.5	2026-10-10	5647442	262	fixed expectation of the test; run time measured	replaced by job 5650829 on 2026-10-11 15:31
+xgmi_err	0	1.5	2026-10-10	5647442	262	fixed expectation of the test; run time measured	replaced by job 5650829 on 2026-10-11 15:31
+rocm_version	6.4.1-83	0.0	2026-10-10	5647442	262	majority value (262 of 262 nodes)	replaced by job 5650829 on 2026-10-11 15:31
+rccl_md5	5eb198b87e46:2157272953	4.0	2026-10-10	5647442	262	majority value (262 of 262 nodes)	replaced by job 5650829 on 2026-10-11 15:31
+ofi_plugin_md5	b72efa9729d4:121552	0.3	2026-10-10	5647442	262	majority value (262 of 262 nodes)	replaced by job 5650829 on 2026-10-11 15:31
+libfabric	fi_info: 2.3.1	0.3	2026-10-10	5647442	262	majority value (262 of 262 nodes)	replaced by job 5650829 on 2026-10-11 15:31
+shm_free_gb	> 1	0.1	2026-10-10	5647442	262	fixed expectation of the test; run time measured	replaced by job 5650829 on 2026-10-11 15:31
+gemm	114.0	108.1	2026-10-10	5647442	262	median of 2096 values (GCDs), min 86.5, max 120.8	replaced by job 5650829 on 2026-10-11 15:31
+xgmi_a2a	65.9	33.7	2026-10-10	5647442	262	median of 262 values (nodes), min 65.4, max 66.2	replaced by job 5650829 on 2026-10-11 15:31
+counters_after	same	0.1	2026-10-10	5647442	262	fixed expectation of the test; run time measured	replaced by job 5650829 on 2026-10-11 15:31
+pair	11.3	114.2	2026-10-10	5647442	262	median of 2096 values (GCDs), min 9.5, max 15.7	replaced by job 5700876 on 2026-10-17 23:58
+answers_srun	yes	2.7	2026-10-11	5650829	262	fixed expectation of the test; run time measured	replaced by job 5700876 on 2026-10-17 23:58
+rocm_smi_ids	8	2.9	2026-10-11	5650829	262	fixed expectation of the test; run time measured	replaced by job 5700876 on 2026-10-17 23:58
+ras_ue	0	1.5	2026-10-11	5650829	262	fixed expectation of the test; run time measured	replaced by job 5700876 on 2026-10-17 23:58
+xgmi_err	0	1.4	2026-10-11	5650829	262	fixed expectation of the test; run time measured	replaced by job 5700876 on 2026-10-17 23:58
+rocm_version	6.4.1-83	0.3	2026-10-11	5650829	262	majority value (262 of 262 nodes)	replaced by job 5700876 on 2026-10-17 23:58
+rccl_md5	5eb198b87e46:2157272953	0.9	2026-10-11	5650829	262	majority value (262 of 262 nodes)	replaced by job 5700876 on 2026-10-17 23:58
+ofi_plugin_md5	b72efa9729d4:121552	0.4	2026-10-11	5650829	262	majority value (262 of 262 nodes)	replaced by job 5700876 on 2026-10-17 23:58
+libfabric	fi_info: 2.3.1	0.3	2026-10-11	5650829	262	majority value (262 of 262 nodes)	replaced by job 5700876 on 2026-10-17 23:58
+shm_free_gb	> 1	0.3	2026-10-11	5650829	262	fixed expectation of the test; run time measured	replaced by job 5700876 on 2026-10-17 23:58
+gemm	114.1	96.1	2026-10-11	5650829	262	median of 2096 values (GCDs), min 78.4, max 120.8	replaced by job 5700876 on 2026-10-17 23:58
+xgmi_a2a	65.8	33.9	2026-10-11	5650829	262	median of 262 values (nodes), min 65.5, max 66.1	replaced by job 5700876 on 2026-10-17 23:58
+counters_after	same	0.1	2026-10-11	5650829	262	fixed expectation of the test; run time measured	replaced by job 5700876 on 2026-10-17 23:58

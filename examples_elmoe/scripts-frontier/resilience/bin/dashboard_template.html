@@ -1,0 +1,613 @@
+<meta charset="utf-8">
+<title>V3 256k Run Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&family=Saira+Condensed:wght@500;600;700&display=swap">
+<style>
+/* Layout: a control-room console. Run vitals on top; then training curves beside the health and gate summary; then the machine
+   map (pipeline stages x replicas of node blocks) beside a docked node inspector; then the fleet and the twelve-hour timeline. */
+:root{
+  --bg:#eef2f5; --panel:#ffffff; --ink:#122130; --muted:#5a6b7b; --line:#d5dde5; --soft:#e7edf2;
+  --accent:#0b7285; --accent-soft:#d3eef2;
+  --ph-fwd:#3a7cc4; --ph-bwd:#8a63d2; --ph-col:#139a91; --ph-save:#d99a00; --ph-init:#8d99a5; --ph-other:#c3ccd5;
+  --train:#3a7cc4; --spare:#2f9e44; --worker:#d99a00; --resort:#b26a1f; --off:#9aa6b2;
+  --ok:#2f9e44; --warn:#d98f0a; --crit:#cf2d5a;
+  --display:"Saira Condensed","Arial Narrow",Arial,sans-serif; --body:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#0c131a; --panel:#121c25; --ink:#e2e9ef; --muted:#8b9db0; --line:#24323f; --soft:#18242f;
+  --accent:#3fc1d3; --accent-soft:#11323a;
+  --ph-fwd:#5b9be0; --ph-bwd:#a88aea; --ph-col:#2fc2b6; --ph-save:#f0b52a; --ph-init:#6d7b89; --ph-other:#3a4856;
+  --train:#5b9be0; --spare:#4cc265; --worker:#f0b52a; --resort:#e08a3c; --off:#5c6a78;
+  --ok:#4cc265; --warn:#f0a634; --crit:#ff5a86; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#0c131a; --panel:#121c25; --ink:#e2e9ef; --muted:#8b9db0; --line:#24323f; --soft:#18242f;
+  --accent:#3fc1d3; --accent-soft:#11323a;
+  --ph-fwd:#5b9be0; --ph-bwd:#a88aea; --ph-col:#2fc2b6; --ph-save:#f0b52a; --ph-init:#6d7b89; --ph-other:#3a4856;
+  --train:#5b9be0; --spare:#4cc265; --worker:#f0b52a; --resort:#e08a3c; --off:#5c6a78;
+  --ok:#4cc265; --warn:#f0a634; --crit:#ff5a86; color-scheme:dark}
+html,body{background:var(--bg);color:var(--ink)}
+body{font-family:var(--body);font-size:14px;line-height:1.45;padding:0 16px;padding-block:18px 40px}
+.wrap{max-width:1500px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
+h1{font-family:var(--display);font-weight:600;font-size:30px;letter-spacing:.02em;margin:0;text-wrap:balance}
+h2{font-family:var(--display);font-weight:600;font-size:19px;letter-spacing:.04em;margin:0;text-transform:uppercase}
+h3{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:0;font-weight:600}
+.sub{color:var(--muted);font-size:13px}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+header{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:12px}
+.tabs,.modes{display:flex;gap:6px;flex-wrap:wrap}
+.tab{font:600 14px var(--body);padding:8px 14px;border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:6px;cursor:pointer}
+.tab[aria-selected="true"]{border-color:var(--accent);box-shadow:inset 0 -3px 0 var(--accent)}
+.mode{font:500 12px var(--body);padding:5px 10px;border-radius:999px;border:1px solid var(--line);background:transparent;color:var(--ink);cursor:pointer}
+.mode[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:var(--panel)}
+button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.vitals{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.vital{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px 12px;min-width:0}
+.vital .k{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.vital .v{font-family:var(--mono);font-size:22px;font-weight:500;font-variant-numeric:tabular-nums}
+.vital .v .sub{display:inline-block}
+.vital .n{font-size:12px;color:var(--muted)}
+.wallbar{grid-column:span 2;min-width:0}
+.bar{height:10px;border-radius:5px;background:var(--soft);position:relative;overflow:hidden;margin-top:8px}
+.bar i{position:absolute;inset:0 auto 0 0;background:var(--accent)}
+.row{display:grid;gap:14px;align-items:stretch}
+.r-train{grid-template-columns:minmax(0,1.5fr) minmax(0,1fr)}
+.r-map{grid-template-columns:minmax(0,1.6fr) minmax(320px,1fr)}
+.r-fleet{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
+.gg{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+@media (max-width:1100px){.gg{grid-template-columns:minmax(0,1fr)}}
+.ck{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}.ck:has(> :only-child){grid-template-columns:minmax(0,1fr)}
+@media (max-width:1100px){.ck{grid-template-columns:minmax(0,1fr)}}
+td.sc{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
+td.sc i{display:block;height:4px;border-radius:2px;margin-top:2px;background:var(--soft)}
+td.sc i b{display:block;height:4px;border-radius:2px}
+@media (max-width:1100px){.r-train,.r-map,.r-fleet{grid-template-columns:minmax(0,1fr)}.wallbar{grid-column:span 1}}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;min-width:0;display:flex;flex-direction:column;gap:12px}
+.phead{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:8px}
+.note{font-size:12px;color:var(--muted)}
+.legend{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12px;color:var(--muted);align-items:center}
+.sw{display:inline-block;width:12px;height:12px;border-radius:3px;vertical-align:-2px;margin-right:5px}
+.ramp{width:120px;height:10px;border-radius:5px;display:inline-block;vertical-align:-1px;margin:0 6px}
+svg text{fill:var(--muted);font-family:var(--mono);font-size:11px}
+svg .axis{stroke:var(--line)} svg .gridl{stroke:var(--soft)}
+svg text.pt{fill:var(--ink);font-family:var(--body);font-size:13px;font-weight:600}
+/* machine map: fits its column, never scrolls */
+.map{display:grid;grid-template-columns:118px repeat(4,minmax(0,1fr));gap:5px 12px;align-items:center}
+.rowlab{font-size:12px;line-height:1.25;min-width:0}
+.rowlab b{font-family:var(--mono);font-weight:500}
+.rowlab span{color:var(--muted);display:block}
+.rep{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:3px}
+.colhead{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.blk{aspect-ratio:1;width:100%;max-width:30px;border-radius:3px;background:var(--ph-other);border:0;padding:0;cursor:pointer;position:relative}
+.map.focus .blk{opacity:.16}
+.map.focus .blk.self,.map.focus .blk.rel-rep,.map.focus .blk.rel-dp,.map.focus .blk.rel-pp{opacity:1}
+.blk.self{outline:3px solid var(--crit);outline-offset:1px;z-index:2}
+.blk.rel-rep{outline:2px solid var(--ink);outline-offset:1px}
+.blk.rel-dp{outline:2px solid var(--accent);outline-offset:1px}
+.blk.rel-pp{outline:2px dashed var(--ph-save);outline-offset:1px}
+.blk.pinned{outline:3px solid var(--crit);outline-offset:1px}
+.blk .dot{position:absolute;right:1px;top:1px;width:5px;height:5px;border-radius:50%;background:var(--crit)}
+/* inspector */
+.insp{overflow:visible}
+.r-map{align-items:start}
+.insp .title{font:600 17px var(--body)}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{font-family:var(--mono);font-size:12px;padding:3px 8px;border-radius:6px;border:1px solid var(--line);background:var(--soft);white-space:nowrap}
+.cmp{display:grid;grid-template-columns:110px minmax(0,1fr) 92px;gap:6px 10px;align-items:center;font-size:12px}
+.cmp .track{height:10px;background:var(--soft);border-radius:5px;position:relative}
+.cmp .track i{position:absolute;left:0;top:0;bottom:0;border-radius:5px;background:var(--accent)}
+.cmp .track b{position:absolute;top:-3px;bottom:-3px;width:2px;background:var(--ink)}
+.cmp .track u{position:absolute;top:-3px;bottom:-3px;width:2px;background:var(--crit);text-decoration:none}
+.cmp .track s{position:absolute;top:-4px;bottom:-4px;width:0;border-left:2px dashed var(--ink);text-decoration:none}
+/* [2026-10-13, the user] the alarms: their own block, always shown, scrollable, newest first */
+.alarmblk{margin:0 0 10px}.ahead{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin:0 0 4px}
+.alarmlist{max-height:240px;overflow-y:auto;border:1px solid var(--line);border-radius:6px;background:var(--panel);font-size:12px;line-height:1.4}
+.alarmlist div{padding:4px 8px;border-bottom:1px solid var(--soft);border-left:3px solid var(--warn)}.alarmlist div:last-child{border-bottom:0}
+.alarmlist div.al{border-left-color:var(--crit)}.alarmlist div.cl{border-left-color:var(--ok);color:var(--muted)}
+.alarmlist div.none{border-left-color:var(--ok);color:var(--muted)}.alarmlist .at{font-family:var(--mono);color:var(--muted);margin-right:6px;white-space:nowrap}
+table.t{border-collapse:collapse;width:100%;font-size:12px}
+table.t th,table.t td{padding:3px 5px;text-align:left;border-bottom:1px solid var(--soft);vertical-align:top}
+table.t td.num,table.t td.mono{white-space:nowrap}
+.insp table.t th,.insp table.t td{padding:3px 3px}
+table.t.wrap td{white-space:normal}
+.prog{height:10px;border-radius:5px;background:var(--soft);position:relative;overflow:hidden;min-width:80px}
+.prog i{position:absolute;inset:0 auto 0 0;border-radius:5px}
+table.t th{color:var(--muted);font-weight:500;font-size:11px;letter-spacing:.04em}
+table.t td.num{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right}
+.strip{display:inline-flex;gap:1px;vertical-align:middle}
+.strip i{display:inline-block;width:5px;height:12px;border-radius:1px}
+.insight{font-size:13px;line-height:1.45;padding:8px 10px;border-left:3px solid var(--accent);background:var(--accent-soft);border-radius:0 6px 6px 0}
+.insight li{margin:2px 0}
+.tw{overflow:visible}
+.pill{display:inline-block;font-size:11px;padding:2px 8px;border-radius:999px;letter-spacing:.03em}
+.pill.ok{background:color-mix(in srgb,var(--ok) 22%,transparent)}
+.pill.warn{background:color-mix(in srgb,var(--warn) 28%,transparent)}
+.pill.crit{background:color-mix(in srgb,var(--crit) 25%,transparent)}
+.pill.mute{background:var(--soft)}
+.alloc{display:flex;flex-wrap:wrap;gap:2px}
+.alloc i{width:9px;height:9px;border-radius:2px;display:inline-block}
+.alloc i.duty{box-shadow:0 0 0 2px var(--ink)}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;font-size:13px}
+.kv dt{color:var(--muted)} .kv dd{margin:0;font-family:var(--mono)}
+details summary{cursor:pointer;color:var(--muted);font-size:12px}
+pre.beat{white-space:pre-wrap;overflow-wrap:anywhere;font-family:var(--mono);font-size:11px;background:var(--soft);padding:8px;border-radius:6px;margin:6px 0 0}
+footer{font-size:12px;color:var(--muted)}
+@media (prefers-reduced-motion:no-preference){.blk{transition:opacity .15s,background .25s}}
+/* phone: drop the optional columns, tighten the panels (last, so it wins) */
+@media (max-width:640px){.insp td.num{white-space:normal}.insp td svg{min-width:16px!important}.panel{padding:10px}.opt{display:none}table.t{font-size:11px}table.t th,table.t td{padding:2px 3px}.prog{min-width:40px}}
+.t td.wcell{white-space:normal;min-width:170px;max-width:420px;vertical-align:top}
+</style>
+
+<div class="wrap">
+  <header>
+    <div><h1 id="title">Run console</h1><div class="sub" id="subtitle"></div></div>
+    <div class="tabs" role="tablist" aria-label="Run" id="tabs"></div>
+  </header>
+
+  <section class="vitals" id="vitals" aria-label="Run vitals"></section>
+
+  <div class="row r-train">
+    <section class="panel" aria-label="Training">
+      <div class="phead"><h2>Training</h2><div class="modes" id="metricTabs"></div></div>
+      <svg id="chart" viewBox="0 0 860 540" width="100%" role="img" aria-label="Training metric per step"></svg>
+      <div class="legend" id="chartLegend"></div>
+      <div class="note" id="chartNote"></div>
+    </section>
+    <section class="panel" aria-label="Health and gates">
+      <div class="phead"><h2>Health and gates</h2><span id="healthPill"></span></div>
+      <div class="alarmblk"><div class="ahead"><h3>Alarms</h3><span class="sub" id="alarmCount"></span></div>
+        <div class="alarmlist" id="alarmList" tabindex="0" role="log" aria-label="Alarms, newest first"></div></div>
+      <div id="alarmsBox"></div>
+      <div><h3>Corrected ECC errors by GCD</h3><div id="eccBox"></div></div>
+    </section>
+  </div>
+
+  <section class="panel" aria-label="Checkpoints and evaluations">
+    <div class="phead"><h2>Checkpoints and evaluations</h2><span class="sub" id="ckSum"></span></div>
+    <div class="note" id="ckNote"></div>
+    <div class="ck" id="ckTables"></div>
+  </section>
+
+  <div class="row r-map">
+    <section class="panel" aria-label="Machine map">
+      <div class="phead"><h2>Machine map</h2><div class="modes" id="modes"></div></div>
+      <div class="note"><span id="mapNote"></span> Hover to inspect, click to pin.
+        <span id="phaseNote"></span></div>
+      <div class="map" id="map"></div>
+      <div class="legend" id="mapLegend"></div>
+      <div class="legend"><span><span class="sw" style="outline:2px solid var(--ink);outline-offset:1px;background:transparent"></span><span id="relNote"></span></span>
+        <span><span class="sw" style="outline:2px solid var(--accent);outline-offset:1px;background:transparent"></span>data-parallel peers: gradient all-reduce</span>
+        <span><span class="sw" style="outline:2px dashed var(--ph-save);outline-offset:1px;background:transparent"></span>pipeline neighbours</span></div>
+      <div><h3>Per stage: compute share of the step and device memory (VRAM)</h3>
+        <div class="note">Compute share = the median, over the stage's <span id="stGcds"></span> GCDs, of the last step's time spent outside collective calls (step time minus the time inside all-to-all, all-reduce and pipeline send/receive, timed by the heartbeat hooks). VRAM = the device memory used on the stage's fullest GCD, its peak since the attempt started (rocm-smi used / total, sampled every 1-3 minutes by the job's monitor); dashed tick = the most memory PyTorch allocated on the stage this attempt, read from the heartbeats (a part of the VRAM); grey tick = the memory model's predicted VRAM; the bar ends at the 64 GiB of a GCD, the real limit.</div><svg id="stages" viewBox="0 0 860 150" width="100%" role="img" aria-label="Per-stage busy share and memory"></svg></div>
+    </section>
+    <section class="panel insp" aria-label="Node inspector" id="insp"></section>
+  </div>
+
+  <div class="row r-fleet">
+    <section class="panel" aria-label="Fleet">
+      <div class="phead"><h2>Fleet</h2><span class="sub" id="fleetSum"></span></div>
+      <div><h3>The allocation</h3><div class="alloc" id="alloc"></div><div class="legend" id="allocLegend" style="margin-top:6px"></div></div>
+      <div><h3>Spare nodes</h3><table class="t wrap" id="spareTable"></table></div>
+      <div><h3>Last resort: nodes the pre-run GEMM found slow, used only when no healthy spare is left</h3><table class="t" id="resortTable"></table></div>
+      <div><h3>UCP workers: converting saves to universal checkpoints</h3><table class="t" id="ucpTable"></table>
+        <div class="note" id="ucpNote"></div></div>
+    </section>
+    <section class="panel" aria-label="Timeline">
+      <div class="phead"><h2 id="tlTitle">Job timeline</h2><span class="sub" id="tlSum"></span></div>
+      <!--TL_OLD-->
+      <svg id="tl" viewBox="0 0 520 210" width="100%" role="img" aria-label="Job timeline"></svg>
+      <div class="legend"><span><span class="sw" style="background:var(--ph-init)"></span>tests and start-up</span>
+        <span><span class="sw" style="background:var(--train)"></span>training steps (outlined: expected)</span>
+        <span><span class="sw" style="background:var(--ph-save)"></span>async save: GPU pause, then CPU writes to Lustre</span><span><span class="sw" style="background:var(--ph-col)"></span>conversion done</span><span><span class="sw" style="background:var(--worker)"></span>conversion running (dashed: expected)</span>
+        <span><span class="sw" style="background:var(--warn)"></span>corrected ECC count grew</span><span><span class="sw" style="background:var(--accent)"></span>now</span></div>
+      <!--/TL_OLD-->
+      <div><h3>Saves</h3><table class="t" id="saveTable"></table></div>
+      <dl class="kv" id="ckpt"></dl>
+      <details><summary>The heartbeat reader's last beat, verbatim</summary><pre class="beat" id="beat"></pre></details>
+    </section>
+  </div>
+  <section class="panel" aria-label="Pre-run gate">
+    <div class="phead"><h2>Pre-run gate</h2><span class="sub">before training: every node is tested; a node that fails is excluded and a spare takes its place</span></div>
+    <div><h3>The tests on <span id="gateN"></span> nodes</h3><div class="note" id="gateHow"></div><table class="t" id="gateTable"></table></div>
+    <div><h3>Where the nodes landed in the timed tests</h3><div class="gg" id="dists"></div><div class="note" id="distNote"></div></div>
+  </section>
+  <footer id="foot"></footer>
+</div>
+
+<script id="data" type="application/json">__DATA__</script>
+<script>
+(function(){
+const DATA=JSON.parse(document.getElementById('data').textContent);
+const PEAK=191.5;
+const STAGES=DATA.stage_labels||[['emb + L0–7','3 dense, 5 MoE'],['L8–15','8 MoE'],['L16–23','8 MoE'],['L24–31','8 MoE'],['L32–39','8 MoE'],['L40–46','7 MoE'],['L47–53','7 MoE'],['L54–60 + head','7 MoE + head']];
+const MODES=[['phase','Phase'],['hbm','VRAM'],['busy','Compute share'],['lag','Collective lag'],['age','Heartbeat age'],['gemm','Pre-run GEMM'],['health','Errors']];
+const METRICS=[['all','All four'],['loss','Loss'],['tflops','TFLOP/s per GCD'],['step_s','Step time'],['gnorm','Gradient norm'],['mem','Memory (VRAM)']];
+let NARROW=null,RUN=Object.keys(DATA.runs)[0],MODE='phase',METRIC='all',PIN=null,SEL=null;
+document.getElementById('title').textContent=DATA.title||'DeepSeek-V3 671B · 256k extension';
+const $=id=>document.getElementById(id);
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const pc=c=>({f:'--ph-fwd',b:'--ph-bwd',c:'--ph-col',s:'--ph-save',o:'--ph-other',i:'--ph-init','.':'--ph-other'})[c]||'--ph-other';
+const phaseCh=p=>{p=(p||'').toLowerCase();if(p.includes('forward'))return'f';if(p.includes('backward'))return'b';if(p.includes('save'))return's';if(/init|load|build|start/.test(p))return'i';if(/all_to_all|broadcast|reduce|barrier|p2p|send|recv|gather/.test(p))return'c';return'.'};
+const PHN={f:'forward',b:'backward',c:'collective',s:'save',i:'start-up','.':'other'};
+function hex(c){c=c.replace('#','');if(c.length===3)c=c.split('').map(x=>x+x).join('');return[0,2,4].map(i=>parseInt(c.substr(i,2),16))}
+function mix(a,b,t){const A=hex(a),B=hex(b);return`rgb(${A.map((v,i)=>Math.round(v+(B[i]-v)*t)).join(',')})`}
+function onColor(c){const m=/rgb\((\d+),(\d+),(\d+)\)/.exec(c),v=m?m.slice(1).map(Number):hex(c);const L=(.2126*v[0]+.7152*v[1]+.0722*v[2])/255;return L>.4?'#122130':'#ffffff'}
+function ramp(t){t=Math.max(0,Math.min(1,t));const ok=css('--ok'),w=css('--warn'),cr=css('--crit');return t<.5?mix(ok,w,t*2):mix(w,cr,(t-.5)*2)}
+const tparse=s=>new Date(s.replace(' ','T')).getTime();
+const dur=sec=>sec>=120?(sec/60).toFixed(1)+' min':sec.toFixed(2)+' s';
+const DONE=()=>/done|ended|finished/.test(R().layout.status||'');
+const NOW=(r,end)=>Math.min(end,tparse(DONE()?((r.steps[r.steps.length-1]||{}).time||r.taken):r.taken));   // a finished job: its last step
+const hm=ms=>{const d=new Date(ms);return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')};
+const R=()=>DATA.runs[RUN];
+const median=a=>{const b=[...a].sort((x,y)=>x-y);return b.length?b[Math.floor(b.length/2)]:0};
+const pct=(arr,v)=>Math.round(arr.filter(x=>x<=v).length/arr.length*100);
+
+/* ---------------- header, vitals ---------------- */
+function header(){
+  $('tabs').innerHTML=Object.entries(DATA.runs).map(([k,r])=>`<button class="tab" role="tab" id="tab-${k}" aria-selected="${k===RUN}">${r.label} · job ${r.job}</button>`).join('');
+  Object.keys(DATA.runs).forEach(k=>$('tab-'+k).onclick=()=>{RUN=k;PIN=null;SEL=null;render()});
+  const r=R(),L=r.layout;
+  $('subtitle').innerHTML=`${L.world.toLocaleString()} GCDs on ${L.world/8} training nodes · PP ${L.pp} × TP ${L.tp} × Ulysses ${L.u} × EP ${L.ep||64} · DP ${L.dp}${L.seq?' · '+L.seq.toLocaleString()+'-token sequences':''} · ${DATA.live?'updated':'snapshot'} <span class="mono">${r.taken}</span>, read from the job's own files`;
+  const s=r.steps[r.steps.length-1]||{},end=tparse(r.timeline.end),start=r.timeline.start?tparse(r.timeline.start):end-12*3600e3,now=NOW(r,end);
+  const stepS=s.step_s||2600,left=Math.max(0,Math.floor((end-now)/1000/stepS)),pred=r.stage[0].pred||{};
+  const v=[['Step',s.step??'–',`attempt ${L.attempt} · ${L.status}`],['Loss',s.loss!=null?s.loss.toFixed(4):'–',`step ${s.step} of the stream`],
+    ['TFLOP/s per GCD',s.tflops??'–',s.tflops?`${(s.tflops/PEAK*100).toFixed(1)}% of the 191.5 bf16 peak`:''],
+    ['Step time',s.step_s?dur(s.step_s):'–',[L.gbs?L.gbs+' sequences':'',L.seq?L.seq.toLocaleString()+' tokens':''].filter(Boolean).join(' × ')],
+    (r.vram&&r.vram.peak!=null)?['Device memory (VRAM)',r.vram.peak.toFixed(1)+' GiB',`peak HBM used on the fullest GCD this attempt, ${(r.vram.peak/r.vram.dev*100).toFixed(0)}% of its ${r.vram.dev} GiB; PyTorch allocated ${s.alloc!=null?s.alloc.toFixed(1):'–'} GiB`]
+      :['Device memory (VRAM)','–',`no monitor sample yet; PyTorch allocated ${s.alloc!=null?s.alloc.toFixed(1)+' GiB':'–'}`],
+    ['Alarms',r.alarms.length,r.alarms.length?'listed in Health and gates, newest first':'none raised']];
+  $('vitals').innerHTML=v.map(([k,val,n])=>`<div class="vital"><div class="k">${k}</div><div class="v">${val}</div><div class="n">${esc(n)}</div></div>`).join('')+
+   `<div class="vital wallbar"><div class="k">Wall clock</div><div class="v">${hm(now)} <span class="sub">of ${hm(start)}–${hm(end)}</span></div><div class="bar"><i style="width:${Math.max(0,Math.min(100,(now-start)/(end-start)*100)).toFixed(1)}%"></i></div>
+    <div class="n">${DONE()?`the run is done: ${s.step??0} steps; the job's wall was ${hm(end)}`:`about ${left} more step${left===1?'':'s'} fit before ${hm(end)}; the trainer stops itself after the last one that fits`}</div></div>`;
+}
+
+/* ---------------- training chart ---------------- */
+const NICE=[1,2,5,10,20,25,50,100,200,250,500,1000];
+const nice=(span,n)=>NICE.find(k=>span/k<=n)||Math.ceil(span/n);
+const YL={loss:'loss',tflops:'TFLOP/s per GCD',step_s:'minutes per step',gnorm:'grad norm (log)'};
+const TT={loss:'Loss',tflops:'TFLOP/s per GCD',step_s:'Step time',gnorm:'Gradient norm before clipping'};
+function series(){const COLS=[css('--ph-fwd'),css('--ph-bwd'),css('--ph-col'),css('--ph-save')];let c=0;
+  return (DATA.series_meta||[{k:'p128k',name:'128k parent run (previous stage)',dash:'4 3'},{k:'y64',name:'YaRN 64 at 256k'},{k:'y40',name:'YaRN 40 at 256k'}]).filter(m=>DATA.series[m.k]).map(m=>({...m,col:m.dash?css('--muted'):COLS[c++%COLS.length]}))}
+function memPanel(ox,oy,W,H){   // [2026-10-13, the user] device memory per step: VRAM solid, PyTorch's allocated dashed, the 64-GiB limit red
+  const SER=series(),ml=66,mr=10,mt=12,mb=30,pw=W-ml-mr,ph=H-mt-mb;
+  const pts=SER.flatMap(s=>DATA.series[s.k].filter(p=>p.vram!=null||p.alloc!=null));
+  if(!pts.length)return `<text x="${ox+W/2}" y="${oy+H/2}" text-anchor="middle">no memory sample yet</text>`;
+  const xmin=Math.min(...pts.map(p=>p.step)),xmax=Math.max(...pts.map(p=>p.step)),y1=68;
+  const X=x=>ox+ml+(x-xmin)/Math.max(1,xmax-xmin)*pw,Y=y=>oy+mt+(1-y/y1)*ph;
+  let g=`<text transform="translate(${ox+12},${oy+mt+ph/2}) rotate(-90)" text-anchor="middle">GiB on the fullest GCD</text>`;
+  for(const t of [0,16,32,48,64])g+=`<line class="gridl" x1="${ox+ml}" x2="${ox+W-mr}" y1="${Y(t)}" y2="${Y(t)}"/><text x="${ox+ml-6}" y="${Y(t)+4}" text-anchor="end">${t}</text>`;
+  g+=`<line x1="${ox+ml}" x2="${ox+W-mr}" y1="${Y(64)}" y2="${Y(64)}" stroke="${css('--crit')}" stroke-width="1.5"/><text x="${ox+W-mr}" y="${Y(64)-5}" text-anchor="end">64 GiB: one GCD</text>`;
+  const xs=nice(xmax-xmin,Math.max(2,Math.floor(pw/34)));
+  for(let x=Math.ceil(xmin/xs)*xs;x<=xmax;x+=xs)g+=`<text x="${X(x)}" y="${oy+H-12}" text-anchor="middle">${x}</text>`;
+  g+=`<line class="axis" x1="${ox+ml}" x2="${ox+W-mr}" y1="${oy+H-mb}" y2="${oy+H-mb}"/><text x="${ox+W-mr}" y="${oy+H-mb-6}" text-anchor="end">step</text>`;
+  SER.forEach(s=>{const P=DATA.series[s.k],v=P.filter(q=>q.vram!=null),a=P.filter(q=>q.alloc!=null);
+    if(a.length)g+=`<polyline fill="none" stroke="${s.col}" stroke-width="1.6" stroke-dasharray="5 4" points="${a.map(q=>X(q.step)+','+Y(q.alloc)).join(' ')}"/>`;
+    if(v.length)g+=`<polyline fill="none" stroke="${s.col}" stroke-width="2.6" points="${v.map(q=>X(q.step)+','+Y(q.vram)).join(' ')}"/>`;
+    if(v.length<=80)v.forEach(q=>g+=`<circle cx="${X(q.step)}" cy="${Y(q.vram)}" r="3.4" fill="${s.col}"><title>${esc(s.name)} · step ${q.step} · job ${q.job}
+VRAM ${q.vram} GiB (device memory used, fullest GCD) · allocated ${q.alloc??'–'} GiB</title></circle>`)});
+  return g;
+}
+function panel(M,ox,oy,W,H,small){
+  if(M==='mem')return memPanel(ox,oy,W,H);
+  const SER=series(),ml=small?60:66,mr=10,mt=small?24:12,mb=small?30:30,pw=W-ml-mr,ph=H-mt-mb;
+  const secs=M==='step_s'&&Math.max(0,...SER.flatMap(s=>DATA.series[s.k].map(p=>p.step_s||0)))<120;
+  const val=p=>M==='step_s'?(secs?p.step_s:p.step_s/60):p[M];
+  const pts=SER.flatMap(s=>DATA.series[s.k].filter(p=>val(p)!=null&&val(p)>0));
+  let g=small?`<text x="${ox+ml}" y="${oy+14}" class="pt">${TT[M]}</text>`:'';
+  if(!pts.length)return g+`<text x="${ox+W/2}" y="${oy+H/2}" text-anchor="middle">no values yet</text>`;
+  const logy=M==='gnorm',tf=v=>logy?Math.log10(v):v;
+  const xmin=Math.min(...pts.map(p=>p.step)),xmax=Math.max(...pts.map(p=>p.step));
+  let y0=Math.min(...pts.map(p=>tf(val(p)))),y1=Math.max(...pts.map(p=>tf(val(p))));const pad=(y1-y0)*.08||.05;y0-=pad;y1+=pad;
+  const X=x=>ox+ml+(x-xmin)/Math.max(1,xmax-xmin)*pw,Y=y=>oy+mt+(1-(tf(y)-y0)/(y1-y0))*ph,YT=t=>oy+mt+(1-(t-y0)/(y1-y0))*ph;
+  g+=`<text transform="translate(${ox+12},${oy+mt+ph/2}) rotate(-90)" text-anchor="middle">${secs?'seconds per step':YL[M]}</text>`;
+  const fmt=v=>Math.abs(v)<1?v.toFixed(3):Math.abs(v)<10?v.toFixed(2):Math.abs(v)<100?v.toFixed(1):v.toFixed(0);
+  if(logy){const ticks=[];for(let e=Math.floor(y0);e<=Math.ceil(y1);e++)for(const m of [1,2,5]){const t=e+Math.log10(m);if(t>=y0&&t<=y1)ticks.push([t,m*Math.pow(10,e)])}
+    const gap=ph/Math.max(1,ticks.length-1);ticks.forEach(([t,v],i)=>{if(gap<14&&String(v)[0]!=='1')return;g+=`<line class="gridl" x1="${ox+ml}" x2="${ox+W-mr}" y1="${YT(t)}" y2="${YT(t)}"/><text x="${ox+ml-6}" y="${YT(t)+4}" text-anchor="end">${v>=1?v:v.toPrecision(1)}</text>`})}
+  else{const n=small?3:4;for(let i=0;i<=n;i++){const t=y0+(y1-y0)*i/n;g+=`<line class="gridl" x1="${ox+ml}" x2="${ox+W-mr}" y1="${YT(t)}" y2="${YT(t)}"/><text x="${ox+ml-6}" y="${YT(t)+4}" text-anchor="end">${fmt(t)}</text>`}}
+  const xs=nice(xmax-xmin,Math.max(2,Math.floor(pw/34)));
+  for(let x=Math.ceil(xmin/xs)*xs;x<=xmax;x+=xs)g+=`<text x="${X(x)}" y="${oy+H-12}" text-anchor="middle">${x}</text>`;
+  g+=`<line class="axis" x1="${ox+ml}" x2="${ox+W-mr}" y1="${oy+H-mb}" y2="${oy+H-mb}"/>`;
+  if(!small)g+=`<text x="${ox+W-mr}" y="${oy+H-mb-6}" text-anchor="end">step</text>`;
+  const cur=R().job;
+  SER.forEach(s=>{const p=DATA.series[s.k].filter(q=>val(q)!=null&&val(q)>0);if(!p.length)return;
+    g+=`<polyline fill="none" stroke="${s.col}" stroke-width="${s.k===RUN?2.4:1.5}" ${s.dash?`stroke-dasharray="${s.dash}"`:''} points="${p.map(q=>X(q.step)+','+Y(val(q))).join(' ')}"/>`;
+    if(p.length<=80)p.forEach(q=>{const now=q.job===cur;g+=`<circle cx="${X(q.step)}" cy="${Y(val(q))}" r="${now?(small?3.6:5):(small?2.4:3.2)}" fill="${now?css('--panel'):s.col}" stroke="${s.col}" stroke-width="${now?2:1}"><title>${esc(s.name)} · step ${q.step} · job ${q.job}
+loss ${q.loss.toFixed(4)} · ${q.tflops??'–'} TFLOP/s (${q.tflops?(q.tflops/PEAK*100).toFixed(1):'–'}% of peak) · ${(q.step_s/60).toFixed(1)} min · grad norm ${q.gnorm??'–'}</title></circle>`})});
+  return g;
+}
+function chart(){
+  $('metricTabs').innerHTML=METRICS.map(([k,l])=>`<button class="mode" id="mt-${k}" aria-pressed="${k===METRIC}">${l}</button>`).join('');
+  METRICS.forEach(([k])=>$('mt-'+k).onclick=()=>{METRIC=k;chart()});
+  const svg=$('chart');let g='';
+  const narrow=(svg.parentElement.clientWidth||860)<600;NARROW=narrow;   // a phone: one column, so the text keeps its size
+  if(METRIC==='all'&&!narrow){const W=860,H=540,w=W/2,h=H/2;['loss','tflops','step_s','gnorm'].forEach((m,i)=>g+=panel(m,(i%2)*w,Math.floor(i/2)*h,w,h,true));svg.setAttribute('viewBox',`0 0 ${W} ${H}`)}
+  else if(METRIC==='all'){const W=430,h=250;['loss','tflops','step_s','gnorm'].forEach((m,i)=>g+=panel(m,0,i*h,W,h,true));svg.setAttribute('viewBox',`0 0 ${W} ${4*h}`)}
+  else{const W=narrow?430:860,H=narrow?300:480;g=panel(METRIC,0,0,W,H,false);if(METRIC==='tflops')g+=`<text x="${66+4}" y="${12+12}">peak 191.5 per GCD; the share is shown on hover</text>`;svg.setAttribute('viewBox',`0 0 ${W} ${H}`)}
+  svg.innerHTML=g;
+  $('chartLegend').innerHTML=series().map(s=>`<span><span class="sw" style="background:${s.col}"></span>${esc(s.name)}</span>`).join('')+'<span>hollow point = logged by the job in the tab; x axis = step</span>';
+  const notes={all:'The same steps in four views. Loss and gradient norm say whether it learns; TFLOP/s and step time say whether the machine keeps up. Hover a point for its job; pick one view to enlarge it.',
+    loss:'Every step since the start of each stream, gathered from the rank logs of all its jobs. Hover a point for its job.',
+    tflops:'Model TFLOP/s per GCD as the trainer reports it; the first step of a job includes its warm-up.',
+    step_s:'Minutes per step; the first step of a job includes its warm-up.',
+    gnorm:'Gradient norm before clipping, on a log scale.',
+    mem:'Solid = device memory used (VRAM) on the fullest GCD, from rocm-smi: the job\'s monitor samples every GCD every 1-3 minutes, and each step takes the newest sample at or before its end. Dashed = the most memory PyTorch had allocated on any GCD in that step, a part of the VRAM; the rest is the allocator\'s cache, the communication buffers and the runtime.'};
+  $('chartNote').textContent=notes[METRIC];
+}
+
+/* ---------------- health and gates ---------------- */
+function health(){
+  const r=R();
+  const swOpen=r.save_window_beats>0;
+  $('healthPill').innerHTML=r.alarms.length?`<span class="pill crit">${r.alarms.length} alarms</span>`:`<span class="pill ok">no alarms</span>`;
+  { const AL=(r.alarm_log||[]).slice().reverse(),nC=AL.filter(l=>/^\S+ \S+ cleared /.test(l)).length;
+    $('alarmCount').textContent=r.alarms.length?`${r.alarms.length} raised · ${nC} cleared · newest first`:`none raised over ${r.beats} heartbeat beats`;
+    $('alarmList').innerHTML=AL.length?AL.map(l=>{const m=/^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) (.*)$/.exec(l)||[null,'',l];
+      const k=/^ALARM /.test(m[2])?'al':/^cleared /.test(m[2])?'cl':'ot';return `<div class="${k}"><span class="at">${esc(m[1].slice(5))}</span>${esc(m[2])}</div>`}).join('')
+      :`<div class="none">No alarm: the heartbeat reader checked ${r.beats} beats and alarms.log holds no alarm line.</div>`; }
+  $('alarmsBox').innerHTML=`<div class="insight"><ul style="margin:0;padding-left:18px">
+    ${swOpen?`<li><b>Save window:</b> ${r.save_window_beats} of ${r.beats} beats had every group inside a save window, so the stillness and minority rules ran at 120 s instead of 30 s: the save flag clears only at the next step end (a known defect; the fix waits for the end of the 12-hour jobs).</li>`:''}
+    <li><b>Corrected ECC errors:</b> ${eccText(r)}</li>
+    <li><b>Memory gate:</b> ${esc(r.memgate)}</li></ul></div>`;
+  const E=(r.ecc||[]).slice().sort((a,b)=>b.grow-a.grow||b.now-a.now),eg=E.filter(e=>e.grow>0),eh=E.filter(e=>!e.grow);
+  $('eccBox').innerHTML=E.length?`<table class="t"><tr><th>node</th><th>GCD</th><th class="opt">rank · stage</th><th>count at job start</th><th>count now</th><th>grew in this job</th><th class="opt">first growth</th></tr>`+
+    E.map(e=>`<tr><td class="mono">frontier${e.node}</td><td class="num">${e.gcd}</td><td class="num opt">${e.rank} · ${e.stage}</td><td class="num">${e.start}</td><td class="num">${e.now}</td><td class="num">${e.grow?'<span class="pill warn">+'+e.grow+'</span>':'0'}</td><td class="mono opt">${e.first_growth?e.first_growth.slice(11,16):'–'}</td></tr>`).join('')+
+'</table>':'<div class="sub">every GCD reads zero</div>';
+  $('gateN').textContent=r.nodes.length+r.spares.length+r.degraded.length;
+  // [2026-10-13, the user: "the page did not do a good job"] the gate table explains itself from gate.log alone (any run): what each
+  // test checks, its pass line and yardstick, its time allowance, the full verdict, and every node that did not pass with its reason
+  const GT=r.gate_tests||{};
+  const G=r.gsum.filter(x=>!['counters_before','gpu_direct_env','dmesg'].includes(x[0])),okR=G.filter(x=>/^ok/.test(x[5])),bad=G.filter(x=>!/^ok/.test(x[5]));
+  const cal=x=>{const d=GT[x[0]]||{};const m=/calibrated by job (\d+) on (\S+) over (\d+) node/.exec(d.budget||'');const bl=/baseline (.*)$/.exec(d.budget||'');
+    return (d.rule&&d.rule!=='-'?'passes if '+esc(d.rule):'')+(bl?'<br><span class="sub">yardstick '+esc(bl[1])+'</span>':'')+(m?'<br><span class="sub">measured by job '+m[1]+' on '+m[3]+' node(s), '+m[2]+'</span>':'');};
+  const badNodes=x=>{const d=GT[x[0]];if(!d||!d.bad||!d.bad.length)return '';
+    return '<div class="sub" style="margin-top:4px">'+d.bad.map(b=>'<span class="mono">'+esc(b[0])+'</span> '+esc(b[1])+' &mdash; '+esc(b[2])+(b[3]&&b[3]!=='-'?': '+esc(b[3]):'')+(b[4]?' ('+esc(b[4])+' s)':'')).join('<br>')+(d.bad_more?'<br>&hellip; '+d.bad_more+' more in data/gate_report.tsv':'')+'</div>';};
+  const excl=v=>/excluded/.test(v)&&!/excludes nobody|not applied|nobody/.test(v);
+  $('gateTable').innerHTML='<tr><th>test</th><th>what it checks</th><th>pass line</th><th class="opt">time allowed (s)</th><th>passed</th><th>failed</th><th>what happened</th></tr>'+
+    bad.map(x=>'<tr><td class="mono">'+x[0]+'</td><td class="wcell">'+esc((GT[x[0]]||{}).desc||'')+'</td><td class="wcell">'+cal(x)+'</td><td class="num opt">'+x[2]+'</td><td class="num">'+x[3]+'</td><td class="num">'+x[4]+'</td><td class="wcell">'+
+      (excl(x[5])?'<span class="pill warn">nodes excluded</span> ':'<span class="pill mute">nobody excluded</span> ')+esc(x[5])+badNodes(x)+'</td></tr>').join('')+
+    '<tr><td colspan="7"><span class="pill ok">ok</span> '+okR.length+' tests passed on every node they ran on: <span class="mono">'+okR.map(x=>x[0]).join(', ')+'</span>'+
+    '<details><summary>what each passing test checks, and its pass line</summary>'+okR.map(x=>{const d=GT[x[0]]||{};return '<div class="sub"><span class="mono">'+x[0]+'</span>: '+esc(d.desc||'')+(d.rule?' &mdash; passes if '+esc(d.rule):'')+'</div>'}).join('')+'</details></td></tr>';
+  $('gateHow').innerHTML='How to read this table. Every test runs on every node before training starts. <b>Pass line</b>: the value a node must reach; a speed test\'s line comes from a yardstick that an earlier calibration job measured (its job and node count are shown). <b>Time allowed</b>: the test\'s budget; a node that has not finished by then counts as timed out. A node can fail in three ways: <b>below the pass line</b> (it works but is slow: set aside as a last-resort spare), <b>error</b> (the test broke on that node: excluded) or <b>timed out</b> (excluded). When the yardstick was measured on fewer nodes than this job has, the pass line is <b>not applied</b>: the result is recorded and nobody is excluded. <b>Not run</b>: skipped by design at this node count; the reason is in its row.';
+  $('distNote').textContent=`Each panel is the ${r.dist.gemm?r.dist.gemm.values.length:''} tested nodes' values; the red line is the pass threshold; the outlined bar holds the node in the inspector.`;
+  dists();
+}
+function eccText(r){
+  const E=r.ecc||[],eg=E.filter(e=>e.grow>0).sort((a,b)=>b.grow-a.grow);
+  return `each rank reads its GCD's corrected-error counter with <span class="mono">rocm-smi --showrasinfo all</span> once a minute and writes it into its heartbeat line. `+
+    `The counter counts from the moment the GPU driver loaded, so a value at job start is history. `+
+    (eg.length?`It grew during this job on ${eg.map(e=>`frontier${e.node} GCD ${e.gcd} (+${e.grow} since ${e.first_growth.slice(11,16)})`).join(', ')}. `:'No counter grew during this job. ')+
+    `Corrected errors are logged, not alarmed; one uncorrectable error would exclude the node.`;
+}
+function dists(){
+  const r=R(),W=400;const tests=[['gemm','bf16 GEMM, slowest GCD of each node (TFLOP/s)'],['xgmi_a2a','in-node xGMI all-to-all (GB/s)'],['pair','pair all-reduce to a partner node, slowest GCD (GB/s)']];
+  const sel=SEL!=null?r.nodes[SEL]:null;
+  $('dists').innerHTML=tests.map(([t,lab])=>{const d=r.dist[t];if(!d||!d.values.length)return'';const vals=d.values,thr=parseFloat((d.thr||'').replace(/[^\d.]/g,''));
+    const lo=Math.min(...vals),hi=Math.max(...vals),bins=24,bw=(hi-lo)/bins||1,cnt=Array(bins).fill(0);vals.forEach(v=>cnt[Math.min(bins-1,Math.floor((v-lo)/bw))]++);
+    const mx=Math.max(...cnt),X=v=>8+(v-lo)/(hi-lo||1)*(W-16),h=46,yb=32;let g=`<text x="8" y="12">${lab}</text>`;
+    cnt.forEach((c,i)=>{const sv=sel?parseFloat(sel[t]):NaN,inb=!isNaN(sv)&&sv>=lo+i*bw&&(sv<lo+(i+1)*bw||i===bins-1&&sv<=hi);
+      g+=`<rect x="${X(lo+i*bw)+.5}" y="${yb+h-c/mx*h}" width="${Math.max(1,(W-16)/bins-1)}" height="${c/mx*h}" fill="${css('--accent')}" opacity="${inb?1:.45}" ${inb?`stroke="${css('--ink')}" stroke-width="1.5"`:''}/>`});
+    if(thr&&thr>=lo)g+=`<line x1="${X(thr)}" x2="${X(thr)}" y1="18" y2="${yb+h}" stroke="${css('--crit')}" stroke-width="2"/><text x="${Math.min(W-80,X(thr)+4)}" y="28" fill="${css('--crit')}">pass ≥ ${thr}</text>`;
+    else if(thr)g+=`<text x="8" y="28" fill="${css('--crit')}">pass ≥ ${thr}, left of every node: all ${vals.length} passed</text>`;
+    g+=`<text x="8" y="${yb+h+14}">${lo.toFixed(1)}</text><text x="${W-8}" y="${yb+h+14}" text-anchor="end">${hi.toFixed(1)}</text>`;
+    return `<svg viewBox="0 0 ${W} ${yb+h+18}" width="100%" role="img" aria-label="${esc(lab)}">${g}</svg>`}).join('');
+}
+/* ---------------- machine map ---------------- */
+function colorOf(n){
+  if(MODE==='phase'){const cs=n.gcd.map(x=>phaseCh(x[5]));const c=cs.sort((a,b)=>cs.filter(x=>x===b).length-cs.filter(x=>x===a).length)[0];return css(pc(c))}
+  if(MODE==='hbm')return n.vram!=null?ramp((n.vram-16)/(64-16)):css('--ph-other');
+  if(MODE==='busy'){const b=n.gcd.map(x=>x[8]).filter(x=>x!=null);return b.length?ramp((100-Math.min(...b))/30):css('--ph-other')}
+  if(MODE==='lag')return ramp(n.lag/60);
+  if(MODE==='age')return ramp((n.age-10)/50);
+  if(MODE==='gemm'){const v=parseFloat(n.gemm),t=parseFloat((n.gemm_thr||'').replace(/[^\d.]/g,''));return isNaN(v)?css('--ph-other'):ramp((t+12-v)/12)}
+  if(MODE==='health')return n.ue>0||n.xgmi>0?css('--crit'):(n.ce_grow||0)>0?css('--warn'):n.ce>0?mix(css('--ok'),css('--warn'),.35):css('--ok');
+}
+function mapLegend(){
+  const L=$('mapLegend'),g=`linear-gradient(90deg,${css('--ok')},${css('--warn')},${css('--crit')})`;
+  const t={hbm:['16 GiB','64 GiB','device memory used (VRAM, rocm-smi) on the node\'s fullest GCD at the newest monitor sample; grey = no sample yet'],busy:['100%','70%','the lowest compute share of the step among the 8 GCDs (the rest is waiting in collectives)'],
+    lag:['0','60','collectives the node is behind its stage\'s median rank'],age:['10 s','60 s','age of the newest heartbeat line'],gemm:['threshold + 12','threshold','the node\'s slowest GCD in the pre-run GEMM, against the pass threshold']};
+  if(MODE==='phase')L.innerHTML=Object.keys(PHN).map(k=>`<span><span class="sw" style="background:var(${pc(k)})"></span>${PHN[k]}</span>`).join('')+'<span>what most of the node\'s GCDs were doing at the last heartbeat</span>';
+  else if(MODE==='health')L.innerHTML=`<span><span class="sw" style="background:var(--ok)"></span>clean</span><span><span class="sw" style="background:${mix(css('--ok'),css('--warn'),.35)}"></span>old corrected ECC count, no growth</span><span><span class="sw" style="background:var(--warn)"></span>corrected ECC count grew in this job (logged)</span><span><span class="sw" style="background:var(--crit)"></span>ECC uncorrectable or xGMI error</span>`;
+  else L.innerHTML=`<span>${t[MODE][0]}<span class="ramp" style="background:${g}"></span>${t[MODE][1]}</span><span>${t[MODE][2]}</span>`;
+}
+function map(){
+  $('modes').innerHTML=MODES.map(([k,l])=>`<button class="mode" id="m-${k}" aria-pressed="${k===MODE}">${l}</button>`).join('');
+  MODES.forEach(([k])=>$('m-'+k).onclick=()=>{MODE=k;map()});
+  const r=R(),N=r.nodes;
+  const L=r.layout,G=L.groups||4,NG=L.nodes_per_group||8,GL=L.group_label||'replica';
+  // [2026-10-13] wrap: with many column groups (job 5662696: 72 one-node replicas) the 12-px gaps alone exceeded the panel and every
+  // column shrank to zero width, so the map looked empty; above 16 groups the replicas wrap into bands of 12 with 4-px gaps
+  const WR=G>16?12:G, BANDS=Math.ceil(G/WR), SUB=G>16?Math.max(NG,1):Math.max(NG,4);
+  $('map').style.gridTemplateColumns=`118px repeat(${WR},minmax(0,1fr))`;
+  $('map').style.columnGap=G>16?'4px':'';
+  let h='<div></div>'+[...Array(WR).keys()].map(i=>`<div class="colhead">${G>16?'+'+i:GL+' '+i}</div>`).join('');
+  for(let s=0;s<L.pp;s++){
+    const ph={};N.filter(n=>n.s===s).forEach(n=>n.gcd.forEach(x=>{const c=phaseCh(x[5]);ph[c]=(ph[c]||0)+1}));
+    const top=Object.entries(ph).sort((a,b)=>b[1]-a[1])[0];
+    for(let b=0;b<BANDS;b++){
+    const r0=b*WR, r1=Math.min(G,r0+WR)-1;
+    h+=b===0?`<div class="rowlab"><b>stage ${s}</b> ${(STAGES[s]||['',''])[0]}<span>${(STAGES[s]||['',''])[1]} · ${top?PHN[top[0]]+' '+top[1]:''}${G>16?` · ${GL}s ${r0}-${r1}`:''}</span></div>`
+            :`<div class="rowlab"><span>${GL}s ${r0}-${r1}</span></div>`;
+    for(let rep=r0;rep<r0+WR;rep++){if(rep>=G){h+='<div></div>';continue}h+=`<div class="rep" style="grid-template-columns:repeat(${SUB},minmax(0,1fr))">`;for(let sl=0;sl<NG;sl++){const i=N.findIndex(n=>n.s===s&&n.rep===rep&&n.slot===sl);
+      if(i<0){h+='<span></span>';continue}const n=N[i];h+=`<button class="blk${PIN===i?' pinned':''}" id="b${i}" aria-label="frontier${n.node}" style="background:${colorOf(n)}">${(n.ue>0||n.xgmi>0||n.age>60)?'<i class="dot"></i>':''}</button>`}h+='</div>'}
+    }
+  }
+  $('map').innerHTML=h;mapLegend();
+  const tu=L.tp*L.u,ng=NG*8;
+  $('mapNote').textContent=`One block is one node with 8 GCDs. Rows are pipeline stages; ${G>1?`the ${G} column groups are ${GL==='replica'?'data-parallel replicas':'expert-parallel groups'} of ${NG} node${NG>1?'s':''} each`:`the column is one ${GL==='replica'?'data-parallel replica':'expert-parallel group'} of ${NG} node${NG>1?'s':''}`}, and each group's ${ng} GCDs form one EP ${L.ep} group${tu>1?` and one TP ${L.tp} × Ulysses ${L.u} group`:''}.`;
+  $('relNote').textContent=`same ${GL} (${NG} node${NG>1?'s':''}, ${ng} GCDs): its EP ${L.ep} group, the all-to-all of every MoE layer${tu>1?`, and its TP ${L.tp} × Ulysses ${L.u} group, the all-to-all around attention${tu===ng?`; in this layout both groups cover the same ${ng} GCDs`:''}${L.tp>1?', and the TP pairs stay inside one node':''}`:''}`;
+  $('stGcds').textContent=L.world/L.pp;
+  N.forEach((n,i)=>{const b=$('b'+i);
+    b.onmouseenter=()=>{relate(i);if(PIN==null){SEL=i;inspector();dists()}};
+    b.onmouseleave=()=>{relate(null)};
+    b.onfocus=()=>{relate(i);if(PIN==null){SEL=i;inspector();dists()}};b.onblur=()=>relate(null);
+    b.onclick=()=>{PIN=PIN===i?null:i;SEL=i;map();inspector();dists()}});
+  stages();
+}
+function relate(i){
+  const m=$('map'),N=R().nodes;m.classList.toggle('focus',i!=null);
+  N.forEach((n,j)=>{const b=$('b'+j);if(!b)return;b.classList.remove('self','rel-rep','rel-dp','rel-pp');if(i==null)return;const a=N[i];
+    if(j===i)b.classList.add('self');else if(n.s===a.s&&n.rep===a.rep)b.classList.add('rel-rep');else if(n.s===a.s&&n.slot===a.slot)b.classList.add('rel-dp');
+    else if(Math.abs(n.s-a.s)===1&&n.rep===a.rep&&n.slot===a.slot)b.classList.add('rel-pp')});
+}
+function stages(){
+  const r=R(),svg=$('stages'),W=860,H=150,ml=60,mr=10,cw=(W-ml-mr)/Math.max(1,r.stage.length);let g='';
+  g+=`<text x="4" y="34">compute %</text><text x="4" y="104">VRAM</text><text x="4" y="118">GiB</text>`;
+  r.stage.forEach((st,s)=>{const x=ml+s*cw;
+    g+=`<rect x="${x+6}" y="10" width="${cw-12}" height="34" fill="${css('--soft')}"/><rect x="${x+6}" y="10" width="${(cw-12)*st.busy/100}" height="34" fill="${ramp((100-st.busy)/30)}"/><text x="${x+cw/2}" y="31" text-anchor="middle" style="font-weight:600" fill="${onColor(st.busy>(cw-12)/(cw-12)*50?ramp((100-st.busy)/30):css('--soft'))}">${st.busy}%</text>`;
+    const p=st.pred||{},sc=v=>(cw-12)*Math.min(v,64)/64,vr=st.vram;
+    g+=`<rect x="${x+6}" y="76" width="${cw-12}" height="26" fill="${css('--soft')}"/>`;
+    if(vr!=null)g+=`<rect x="${x+6}" y="76" width="${sc(vr)}" height="26" fill="${css('--accent')}"><title>peak VRAM ${vr} GiB since the attempt started (now ${st.vram_now??'–'} GiB)</title></rect>`;
+    if(st.alloc)g+=`<line x1="${x+6+sc(st.alloc)}" x2="${x+6+sc(st.alloc)}" y1="70" y2="108" stroke="${css('--ink')}" stroke-width="2" stroke-dasharray="4 3"><title>peak allocated by PyTorch: ${st.alloc} GiB</title></line>`;
+    if(p.vram)g+=`<line x1="${x+6+sc(p.vram)}" x2="${x+6+sc(p.vram)}" y1="70" y2="108" stroke="${css('--muted')}" stroke-width="2"><title>the memory model's predicted VRAM: ${p.vram} GiB</title></line>`;
+    g+=`<line x1="${x+cw-6}" x2="${x+cw-6}" y1="72" y2="106" stroke="${css('--crit')}" stroke-width="2"><title>64 GiB: one GCD</title></line>`;
+    g+=`<text x="${x+cw/2}" y="122" text-anchor="middle">${vr!=null?vr.toFixed(1)+' GiB VRAM':'no VRAM sample yet'}${st.alloc?' · '+st.alloc.toFixed(1)+' allocated':''}</text><text x="${x+cw/2}" y="142" text-anchor="middle">stage ${s}</text>`});
+  svg.innerHTML=g+`<text x="${W-mr}" y="66" text-anchor="end">bar = peak VRAM (device memory used) · dashed = peak allocated by PyTorch · grey = predicted VRAM · red = 64 GiB</text>`;
+}
+
+/* ---------------- inspector ---------------- */
+function inspector(){
+  const r=R(),N=r.nodes,el=$('insp');
+  if(SEL==null){
+    const pick=N.reduce((a,n,i)=>(n.ce_grow||0)>(N[a].ce_grow||0)?i:a,0);SEL=pick;
+  }
+  const n=N[SEL],s=n.s,st=r.stage[s],stN=N.filter(x=>x.s===s);
+  const hbms=stN.map(x=>x.hbm),busy=n.gcd.map(x=>x[8]).filter(x=>x!=null),busyMin=Math.min(...busy),stBusy=median(stN.flatMap(x=>x.gcd.map(g=>g[8]).filter(v=>v!=null)));
+  const epr=r.layout.experts_per_rank||4,exLo=n.gcd[0][3]*epr,exHi=n.gcd[7][3]*epr+epr-1;
+  const thr=parseFloat((n.gemm_thr||'').replace(/[^\d.]/g,''));const gemmP=n.gemm?pct(r.dist.gemm.values,parseFloat(n.gemm)):null;
+  const strips=n.gcd.map(x=>x[9]);const same=strips.every(z=>z===strips[0]);
+  const ins=[];
+  if(n.vram_peak!=null)ins.push(`Its fullest GCD has used ${n.vram_peak.toFixed(1)} GiB of device memory (VRAM) at its peak this attempt, ${(64-n.vram_peak).toFixed(1)} GiB under the 64 GiB of a GCD; PyTorch's allocations are ${(n.hbm/1.0737).toFixed(1)} GiB of it at the last heartbeat${st.pred&&st.pred.vram?`; the memory model predicted ${st.pred.vram} GiB of VRAM for stage ${s}`:''}.`);
+  else ins.push(`No VRAM sample of this node yet (the job's monitor sweeps every 1-3 minutes); PyTorch's allocations on its fullest GCD are ${(n.hbm/1.0737).toFixed(1)} GiB.`);
+  ins.push(`Its GCDs compute ${busyMin.toFixed(1)}–${Math.max(...busy).toFixed(1)}% of the step; the stage median is ${stBusy.toFixed(1)}%.${busyMin<stBusy-3?' One GCD waits noticeably longer in collectives.':''}`);
+  ins.push(same?'All 8 GCDs show the same phase sequence over the last 5 minutes: they move in lockstep.':'The GCDs\' phase sequences differ over the last 5 minutes (see the strips).');
+  if(n.gemm)ins.push(`In the pre-run test its slowest GCD did ${n.gemm} TFLOP/s against ${n.gemm_thr}: faster than ${gemmP}% of the ${r.dist.gemm.values.length} tested nodes.`);
+  const gg=n.gcd.filter(x=>x[11]!=null&&x[10]>x[11]);
+  if(gg.length)ins.push(`Its corrected ECC counter grew during this job on GCD ${gg.map(x=>`${n.gcd.indexOf(x)} (${x[11]} at job start, ${x[10]} now)`).join(', ')}: logged, not alarmed; one uncorrectable error would exclude the node.`);
+  else if(n.ce>0)ins.push(`Its GCDs carry ${n.ce} corrected ECC errors from before this job (the counter counts since the GPU driver loaded); none were added during this job.`);
+  ins.push(n.record.length?`The failure record holds ${n.record.length} earlier line${n.record.length>1?'s':''} for this node (last: ${n.record[n.record.length-1].join(', ')}).`:'The failure record holds nothing for this node, so it is not on the block list.');
+  const cmp=(lab,v,max,ref,line,txt,dash)=>`<span>${lab}</span><span class="track"><i style="width:${Math.min(100,v/max*100)}%"></i>${ref!=null?`<b style="left:${ref/max*100}%"></b>`:''}${line!=null?`<u style="left:${Math.min(99,line/max*100)}%"></u>`:''}${dash!=null?`<s style="left:${Math.min(99,dash/max*100)}%"></s>`:''}</span><span class="mono">${txt}</span>`;
+  el.innerHTML=`<div class="phead"><h2>Node inspector</h2>${PIN!=null?'<span class="pill warn">pinned · click it again to release</span>':'<span class="pill mute">hover a block, click to pin</span>'}</div>
+   <div><div class="title">frontier${n.node}</div><div class="sub">stage ${s} (${(STAGES[s]||[''])[0]}) · ${r.layout.group_label||'replica'} ${n.rep} · node ${n.slot+1} of ${r.layout.nodes_per_group||8} · ranks ${n.gcd[0][0]}–${n.gcd[7][0]}</div></div>
+   <div class="chips">${r.layout.tp>1?'<span class="chip">TP pairs on xGMI inside the node</span>':''}${r.layout.u>1?`<span class="chip">Ulysses ranks ${n.gcd[0][2]}–${n.gcd[7][2]} of ${r.layout.u}</span>`:''}<span class="chip">experts ${exLo}–${exHi} of ${r.layout.experts||256} per MoE layer</span></div>
+   <div class="insight"><ul style="margin:0;padding-left:18px">${ins.map(x=>`<li>${esc(x)}</li>`).join('')}</ul></div>
+   <div><h3>Now, against its stage</h3><div class="cmp" style="margin-top:6px">
+     ${cmp('VRAM (peak)',n.vram_peak??0,64,st.pred&&st.pred.vram?st.pred.vram:null,null,n.vram_peak!=null?n.vram_peak.toFixed(1)+' / 64 GiB':'no sample yet',n.hbm/1.0737)}
+     ${cmp('compute share',busyMin,100,stBusy,null,busyMin.toFixed(1)+'%')}
+     ${cmp('collective lag',n.lag,60,null,null,n.lag+' behind')}
+     ${cmp('heartbeat age',n.age,60,30,null,n.age+' s')}
+     ${cmp('host memory',n.host,100,null,97,n.host+'%')}</div>
+     <details class="note" style="margin-top:4px"><summary>what the bars and ticks mean</summary>Bars run to the limit: 64 GiB of device memory on a GCD, 100% of the step, 60 collectives, 60 s, 100% of host memory. VRAM = device memory used (rocm-smi), its peak this attempt; dashed tick = the memory PyTorch has allocated (a part of the VRAM). Black tick = the memory model's predicted VRAM, the stage median (compute share), or the 30-s alarm threshold; red tick = the 97% host-memory detector.</details></div>
+   <div><h3>Its 8 GCDs</h3>
+     <table class="t"><tr><th>GCD</th><th class="opt">rank</th><th class="opt">TP</th><th class="opt">Ulysses</th><th>EP rank · experts</th><th>VRAM GiB</th><th class="opt">alloc. GiB</th><th>busy</th><th>ECC start → now</th><th class="opt">GEMM</th><th style="width:24%">phases (5 min)</th></tr>
+     ${n.gcd.map((x,i)=>`<tr><td class="num">${i}</td><td class="num opt">${x[0]}</td><td class="num opt">${x[1]}</td><td class="num opt">${x[2]}</td><td class="mono">${x[3]} · ${x[4]}</td><td class="num">${x[12]!=null?x[12].toFixed(1):'–'}</td><td class="num opt">${x[7]!=null?(x[7]/1.0737).toFixed(1):'–'}</td><td class="num">${x[8]??'–'}%</td><td class="num">${x[11]??'–'} → ${x[10]>(x[11]??x[10])?'<b>'+x[10]+'</b>':x[10]}</td><td class="num opt"${n.gemm_gcd[i]!=null&&n.gemm_gcd[i]<thr?` style="color:var(--crit)"`:''}>${n.gemm_gcd[i]!=null?n.gemm_gcd[i].toFixed(0):'–'}</td><td>${strip1(x[9])}</td></tr>`).join('')}</table>
+     <div class="note" style="margin-top:4px">Pre-run network tests of this node: xGMI all-to-all ${n.xgmi_a2a??'–'} GB/s, pair all-reduce ${n.pair??'–'} GB/s (slowest of its 8 GCDs); uncorrectable ECC ${n.ue}, xGMI errors ${n.xgmi}.</div>
+     <details class="note" style="margin-top:2px"><summary>what the columns mean</summary>busy = the share of the last step this GCD spent outside collective calls (all-to-all, all-reduce, pipeline send and receive, timed by the heartbeat hooks). ECC = the corrected-error counter of this GCD, which counts since the GPU driver loaded: the value at job start, then now. GEMM = its bf16 GEMM rate in the pre-run gate, TFLOP/s; the pass threshold is ${n.gemm_thr||'–'}, 0.9 × the baseline a calibration job measured on known-good nodes. Phases: one cell = one heartbeat, 10 s, oldest left; colours as in the machine map legend.</details></div>
+   `;
+}
+
+function strip1(z){const st=[...(z||'')].slice(-30),cw=4;
+  return `<svg viewBox="0 0 ${30*cw} 10" width="100%" preserveAspectRatio="none" style="display:block;min-width:28px;height:10px">${st.map((c,k)=>`<rect x="${k*cw}" y="0" width="${cw-.6}" height="10" fill="${css(pc(c))}"><title>${PHN[c]||c}</title></rect>`).join('')}</svg>`}
+function phaseStrips(n){
+  const W=320,lw=44,cw=(W-lw)/30,P=16;let g='';
+  n.gcd.forEach((x,i)=>{const st=[...(x[9]||'')].slice(-30);g+=`<text x="0" y="${i*P+11}" style="font-size:10px">GCD ${i}</text>`;
+    st.forEach((c,k)=>g+=`<rect x="${lw+k*cw}" y="${i*P+2}" width="${Math.max(1,cw-1)}" height="12" rx="1" fill="${css(pc(c))}"><title>${PHN[c]||c}</title></rect>`)});
+  return `<svg viewBox="0 0 ${W} ${8*P+2}" width="100%" role="img" aria-label="phases per GCD">${g}</svg>`;
+}
+
+/* ---------------- checkpoints and evaluations ---------------- */
+const TASKS=[['niah_single_3','single 3'],['niah_multikey_3','multikey 3'],['niah_multiquery','multiquery'],['niah_multivalue','multivalue']];
+function scoreCell(v,o){const k=o?'sc opt':'sc';if(v==null)return`<td class="${k}">–</td>`;const c=v>=.8?css('--ok'):v>=.4?css('--warn'):css('--crit');return`<td class="${k}">${v.toFixed(2)}<i><b style="width:${Math.max(2,v*100)}%;background:${c}"></b></i></td>`}
+function ckpts(){
+  const runs=Object.entries(DATA.runs).filter(([k,r])=>r.ckpts);if(!runs.length){$('ckTables').innerHTML='<div class="sub">no checkpoint folder found</div>';return}
+  const B=DATA.eval_base;
+  $('ckNote').textContent=(DATA.eval_note||'')+' Trainable save = the ZeRO folder with weights and Adam moments, which a restart resumes from; universal = the fp32 weights in a layout-free form, which the evaluation and a re-layout read.';
+  $('ckTables').innerHTML=runs.map(([k,r])=>{const rows=r.ckpts.slice().reverse();
+    const head=`<tr><th>step</th><th>trainable save</th><th>universal</th>${TASKS.map(t=>`<th class="opt">${t[1]}</th>`).join('')}<th>mean</th><th>evaluation</th></tr>`;
+    const base=B?`<tr><td class="num">0</td><td colspan="2" class="sub">${esc(B.label)}</td>${TASKS.map(t=>scoreCell(B.ruler[t[0]],1)).join('')}${scoreCell(TASKS.every(t=>B.ruler[t[0]]!=null)?TASKS.reduce((a,t)=>a+B.ruler[t[0]],0)/4:null)}<td><span class="pill mute">reference</span></td></tr>`:'';
+    const body=rows.map(c=>{const ru=c.ruler||{},full=TASKS.every(t=>ru[t[0]]!=null);
+      const ev=c.eval==='done'?'<span class="pill ok">done</span>':c.eval==='running'?'<span class="pill warn">running</span>':c.eval==='queued'?'<span class="pill warn">queued</span>':c.eval?`<span class="pill mute">${esc(c.eval)}</span>`:
+        (c.universal==='complete'?'<span class="sub">not scheduled</span>':c.universal==='converting'?'<span class="sub">waits for its universal</span>':'<span class="sub">–</span>');
+      return `<tr><td class="num">${c.step}</td><td>${c.zero?'<span class="pill ok">on disk</span>':'<span class="sub">removed</span>'}</td><td>${c.universal==='complete'?'<span class="pill ok">complete</span>':c.universal==='converting'?'<span class="pill warn">converting</span>':'<span class="sub">–</span>'}</td>${TASKS.map(t=>scoreCell(ru[t[0]],1)).join('')}${scoreCell(full?TASKS.reduce((a,t)=>a+ru[t[0]],0)/4:null)}<td>${ev}</td></tr>`}).join('');
+    return `<div><h3>${esc(r.label)} · job ${r.job} · ${esc((r.layout.save||'').split('/').pop())}</h3><table class="t">${head}${body}${base}</table></div>`}).join('');
+  const nd=runs.reduce((a,[k,r])=>a+r.ckpts.filter(c=>c.eval==='done').length,0);
+  $('ckSum').textContent=`${nd} evaluated checkpoint${nd===1?'':'s'}`;
+}
+
+/* ---------------- fleet ---------------- */
+function fleet(){
+  const r=R();const nT=r.layout.world/8,nS=r.spares.length,nD=r.degraded.length,nW=r.ucp_workers.length,tot=nT+nS+nD+nW;
+  let a='';for(let i=0;i<nT;i++)a+=`<i style="background:var(--train)"></i>`;
+  r.spares.forEach(s=>a+=`<i class="${s===r.duty?'duty':''}" style="background:var(--spare)" title="frontier${s}${s===r.duty?' (duty)':''}"></i>`);
+  r.degraded.forEach(([n])=>a+=`<i style="background:var(--resort)" title="frontier${n}"></i>`);
+  r.ucp_workers.forEach(w=>a+=`<i style="background:var(--worker)" title="frontier${w}"></i>`);
+  $('alloc').innerHTML=a;
+  $('allocLegend').innerHTML=`<span><span class="sw" style="background:var(--train)"></span>${nT} training</span><span><span class="sw" style="background:var(--spare)"></span>${nS} healthy spare${nS===1?'':'s'} (ringed: duty node)</span>
+    <span><span class="sw" style="background:var(--resort)"></span>${nD} last resort</span><span><span class="sw" style="background:var(--worker)"></span>${nW} UCP workers</span><span>= ${tot} nodes in the allocation</span>`;
+  $('fleetSum').textContent=`${tot} nodes · ${nS} spare · ${nD} last resort`;
+  $('spareTable').innerHTML='<tr><th>node</th><th>role</th></tr>'+(r.spares.map(s=>`<tr><td class="mono">frontier${s}</td><td>${s===r.duty?'<span class="pill ok">duty</span> runs the heartbeat reader; replaces a failed node first':'ready; joins after a quick re-test'}</td></tr>`).join('')||'<tr><td colspan="2" class="sub">none left</td></tr>');
+  if(nD){const vals=r.degraded.map(([n,w])=>[n,parseFloat((/([\d.]+) against/.exec(w)||[])[1]),parseFloat((/threshold ([\d.]+)/.exec(w)||[])[1])]).sort((x,y)=>y[1]-x[1]);
+    $('resortTable').innerHTML='<tr><th>order</th><th>node</th><th>GEMM</th><th>needed</th><th>short by</th></tr>'+vals.map(([n,v,t],i)=>`<tr><td class="num">${i+1}</td><td class="mono">frontier${n}</td><td class="num">${v}</td><td class="num">${t}</td><td class="num">${((1-v/t)*100).toFixed(1)}%</td></tr>`).join('');}
+  else $('resortTable').innerHTML='<tr><td class="sub">none: every tested node passed the GEMM test</td></tr>';
+  const conv=[],open={},now=tparse(r.taken);r.ucp.forEach(u=>{if(u.what==='start')open[u.step]=u.time;else{conv.push([u.step,open[u.step],u.seconds,'done']);delete open[u.step]}});
+  Object.entries(open).forEach(([s,t])=>conv.push([+s,t,Math.round((now-tparse(t))/1000),'running']));
+  const doneS=conv.filter(c=>c[3]==='done').map(c=>c[2]),expS=doneS.length?median(doneS):1100;
+  $('ucpTable').innerHTML='<tr><th>step</th><th class="opt">started</th><th>progress</th><th>minutes</th><th>state</th></tr>'+conv.map(c=>{const run=c[3]!=='done',p=run?Math.min(.99,c[2]/expS):1,eta=tparse(c[1])+expS*1e3;
+    return `<tr><td class="num">${c[0]}</td><td class="mono opt">${(c[1]||'').slice(11,16)}</td><td style="width:38%"><div class="prog"><i style="width:${(p*100).toFixed(0)}%;background:${run?'var(--worker)':'var(--ph-col)'}"></i></div></td>
+    <td class="num">${Math.round(c[2]/60)}${run?' of ~'+Math.round(expS/60):''}</td><td>${run?`<span class="pill warn">converting · done ~${hm(eta)}</span>`:'<span class="pill ok">universal complete</span>'}</td></tr>`}).join('');
+  conv.sort((a,b)=>a[1]<b[1]?-1:1);
+  if(!nW&&!conv.length){$('ucpTable').innerHTML='<tr><td class="sub">no UCP worker nodes in this job (AUTORUN_UCP_WORKERS=0): saves stay in the ZeRO form until converted elsewhere</td></tr>';$('ucpNote').textContent=''}
+  else $('ucpNote').textContent=`Expected completion = start + the median of this job's finished conversions (${Math.round(expS/60)} min). The ${nW} workers (${r.ucp_workers.map(w=>'frontier'+w).join(', ')}) never train. They convert each complete save into a layout-independent universal checkpoint, newest first, and catch up older saves afterwards; the bar is the time each conversion took.`;
+  $('saveTable').innerHTML='<tr><th>step</th><th>finished</th><th>training paused</th><th>all files on Lustre after</th></tr>'+r.saves.map(s=>{const a=r.async_saves.find(x=>x[0]==='global_step'+s[0]);return`<tr><td class="num">${s[0]}</td><td class="mono">${s[2].slice(11,16)}</td><td class="num">${s[1]} s</td><td class="num">${a?a[1]+' s':'–'}</td></tr>`}).join('');
+}
+
+/* ---------------- timeline ---------------- */
+function timeline(){
+  const r=R(),svg=$('tl'),W=520,ml=92,mr=8;
+  if(!svg){const d=($('tlServer')||{dataset:{}}).dataset;if(d.title)$('tlTitle').textContent=d.title;if(d.sum)$('tlSum').textContent=d.sum;   // [2026-10-11] drawn by dashboard_html.py with the failures and recoveries
+    $('ckpt').innerHTML=`<dt>latest (trainable)</dt><dd>${r.latest&&r.latest!=='-'?'global_step'+r.latest:'none yet'}</dd><dt>latest_universal</dt><dd>${r.latest_universal&&r.latest_universal!=='-'?'global_step'+r.latest_universal:'none yet'}</dd>`;
+    $('beat').textContent=r.lastbeat;return}
+  const end=tparse(r.timeline.end),start=r.timeline.start?tparse(r.timeline.start):end-12*3600e3,now=NOW(r,end),X=t=>ml+(t-start)/(end-start)*(W-ml-mr);
+  const att=tparse(r.timeline.attempts[0][0]),s0=r.steps[0],last=r.steps[r.steps.length-1],stepMs=(last.step_s||2600)*1e3,first=tparse(s0.time);
+  const lane=(y,lab)=>`<text x="4" y="${y+10}">${lab}</text><line class="gridl" x1="${ml}" x2="${W-mr}" y1="${y+16}" y2="${y+16}"/>`;
+  let g=lane(6,'GPU training')+lane(34,'CPU async save')+lane(62,'UCP workers')+lane(90,'ECC corrected');
+  g+=`<rect x="${X(start)}" y="6" width="${X(att)-X(start)}" height="14" fill="${css('--ph-init')}"><title>pre-run tests ${r.timeline.gate[0]} s and start-up</title></rect>`;
+  g+=`<rect x="${X(att)}" y="6" width="${X(first)-X(att)}" height="14" fill="${css('--train')}" opacity=".45"><title>loading and the first step</title></rect>`;
+  const dense=(end-start)/stepMs>150;   // short steps (a sandbox test): one band instead of one bar per step
+  if(dense)g+=`<rect x="${X(first)}" y="6" width="${Math.max(1,X(tparse(last.time))-X(first))}" height="14" fill="${css('--train')}"><title>${r.steps.length} steps of about ${(stepMs/1e3).toFixed(1)} s</title></rect>`;
+  else r.steps.forEach((s,i)=>{if(!i)return;const t0=tparse(r.steps[i-1].time),t1=tparse(s.time);g+=`<rect x="${X(t0)}" y="6" width="${Math.max(.5,X(t1)-X(t0)-1)}" height="14" fill="${css('--train')}"><title>step ${s.step}: ${(s.step_s/60).toFixed(1)} min, loss ${s.loss}</title></rect>`});
+  let t=tparse(last.time);
+  if(DONE()){}else if(dense){if(end>t)g+=`<rect x="${X(t)}" y="6" width="${Math.max(0,X(end)-X(t))}" height="14" fill="${css('--train')}" fill-opacity=".1" stroke="${css('--train')}" stroke-dasharray="3 2"><title>expected steps until the end of the job</title></rect>`}
+  else if(!DONE())while(t+stepMs<=end){g+=`<rect x="${X(t)}" y="6" width="${Math.max(.5,X(t+stepMs)-X(t)-1.5)}" height="14" fill="${css('--train')}" fill-opacity=".1" stroke="${css('--train')}" stroke-dasharray="3 2"><title>expected step</title></rect>`;t+=stepMs}
+  // CPU async save: the GPU pauses for the host copy, then CPU threads write to Lustre until 'latest' names the save
+  r.saves.forEach(sv=>{const t0=tparse(sv[2].replace('T',' ')),a=r.async_saves.find(x=>x[0]==='global_step'+sv[0]);const t1=a?tparse(a[2].replace('T',' ')):t0+60e3;
+    g+=`<rect x="${X(t0)}" y="34" width="${Math.max(2,X(t1)-X(t0))}" height="14" fill="${css('--ph-save')}"><title>save of step ${sv[0]}: GPU paused ${sv[1]} s for the copy to pinned host memory; CPU threads wrote it to Lustre; latest named it ${a?a[1]+' s':'?'} after the step</title></rect>`});
+  // UCP workers: each conversion, the running one with its expected end
+  const conv=[],open={};r.ucp.forEach(u=>{if(u.what==='start')open[u.step]=tparse(u.time);else if(open[u.step]){conv.push([u.step,open[u.step],tparse(u.time),'done']);delete open[u.step]}});
+  const doneS=conv.map(c=>(c[2]-c[1])/1e3),expS=doneS.length?median(doneS):1100;
+  conv.forEach(c=>g+=`<rect x="${X(c[1])}" y="62" width="${Math.max(2,X(c[2])-X(c[1])-1)}" height="14" fill="${css('--ph-col')}"><title>step ${c[0]} converted in ${Math.round((c[2]-c[1])/60e3)} min</title></rect>`);
+  Object.entries(open).forEach(([st,t0])=>{const te=t0+expS*1e3;g+=`<rect x="${X(t0)}" y="62" width="${Math.max(2,X(now)-X(t0))}" height="14" fill="${css('--worker')}"/><rect x="${X(now)}" y="62" width="${Math.max(0,X(te)-X(now))}" height="14" fill="${css('--worker')}" fill-opacity=".15" stroke="${css('--worker')}" stroke-dasharray="3 2"><title>step ${st}: converting, expected done ~${hm(te)}</title></rect>`});
+  r.ce_events.forEach(e=>{const tt=tparse(r.taken.slice(0,10)+' '+e[0]);g+=`<circle cx="${X(tt)}" cy="97" r="3" fill="${css('--warn')}"><title>${e[0]}: +${e[1]} corrected ECC errors on ${e[2]}</title></circle>`});
+  g+=`<line x1="${X(now)}" x2="${X(now)}" y1="2" y2="112" stroke="${css('--accent')}" stroke-width="2"/><text x="${X(now)>W-90?X(now)-4:X(now)+4}" y="122" text-anchor="${X(now)>W-90?'end':'start'}" fill="${css('--accent')}">${DONE()?'ended':'now'} ${hm(now)}</text>`;
+  g+=`<line class="axis" x1="${ml}" x2="${W-mr}" y1="130" y2="130"/>`;{const span=(end-start)/60e3,iv=[5,10,15,30,60,120,180,240,360].find(m=>span/m<=6)||Math.ceil(span/6);   // minutes between ticks: at most 7 ticks
+    for(let m=0;m<=span+.01;m+=iv){const tt=start+m*60e3;g+=`<text x="${X(tt)}" y="144" text-anchor="${m===0?'start':m+iv>span+.01?'end':'middle'}">${hm(tt)}</text>`}}
+  const fit=Math.max(0,Math.floor((end-tparse(last.time))/stepMs));
+  g+=`<text x="4" y="166">gate ${r.timeline.gate[0]} s · first step ${hm(first)} · ${dur(stepMs/1e3)} per step · ${DONE()?`${r.steps.length} steps, done`:`about ${fit} more steps fit`}</text>`;
+  g+=`<text x="4" y="184">ECC corrected = memory bit errors the GPU fixed itself; logged, not alarmed</text>`;
+  svg.setAttribute('viewBox',`0 0 ${W} 192`);svg.innerHTML=g;$('tlTitle').textContent=`${Math.round((end-start)/3600e3*10)/10}-hour timeline`;$('tlSum').textContent=`${hm(start)} → ${hm(end)}`;
+  $('ckpt').innerHTML=`<dt>latest (trainable)</dt><dd>${r.latest&&r.latest!=='-'?'global_step'+r.latest:'none yet'}</dd><dt>latest_universal</dt><dd>${r.latest_universal&&r.latest_universal!=='-'?'global_step'+r.latest_universal:'none yet'}</dd>`;
+  $('beat').textContent=r.lastbeat;
+}
+
+function fitInspector(){const i=$('insp');if(i)i.style.maxHeight='none'}
+addEventListener('resize',()=>{const n=($('chart').parentElement.clientWidth||860)<600;if(n!==NARROW)chart()});
+function render(){for(const f of [header,chart,ckpts,health,map,inspector,fleet,timeline]){try{f()}catch(e){console.error(f.name,e)}}   // [2026-10-11] one panel's error never blanks the others
+  $('phaseNote').textContent=DATA.phase_note?' '+DATA.phase_note:'';   // set by the snapshot of jobs that ran without the pipeline-engine phase marks
+  requestAnimationFrame(fitInspector);
+  $('foot').innerHTML='Read only from files the job already writes: <span class="mono">data/hb/&lt;node&gt;.tsv</span>, <span class="mono">heartbeat.log</span>, <span class="mono">gate.log</span> and <span class="mono">data/gate_report.tsv</span>, <span class="mono">data/mem_gate.txt</span>, <span class="mono">STATUS.md</span>, <span class="mono">training.log</span>, <span class="mono">data/loop.log</span>, <span class="mono">data/save_times.tsv</span>, the checkpoint tags, the shared failure record, the rank logs of the earlier jobs, the checkpoint folders, and the <span class="mono">results.json</span> of the evaluation jobs. '+(DATA.live?'The heartbeat reader rewrites this page every 30 s; the browser reloads it.':'A static example; the live page is rewritten every 30 s.')}
+render();
+new MutationObserver(render).observe(document.documentElement,{attributes:true,attributeFilter:['data-theme']});
+matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change',render);
+})();
+</script>

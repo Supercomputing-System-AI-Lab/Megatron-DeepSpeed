@@ -1,0 +1,15 @@
+test	baseline	run_s	date	job	nodes	note
+switch	11.2	4.6	2026-10-10	5646729	3	median of 3 values (nodes), min 11.0, max 11.2
+answers_srun	yes	0.3	2026-10-17	5700876	262	fixed expectation of the test; run time measured
+rocm_smi_ids	8	1.5	2026-10-17	5700876	262	fixed expectation of the test; run time measured
+ras_ue	0	0.3	2026-10-17	5700876	262	fixed expectation of the test; run time measured
+xgmi_err	0	0.3	2026-10-17	5700876	262	fixed expectation of the test; run time measured
+rocm_version	6.4.1-83	0.0	2026-10-17	5700876	262	majority value (262 of 262 nodes)
+rccl_md5	5eb198b87e46:2157272953	2.4	2026-10-17	5700876	262	majority value (262 of 262 nodes)
+ofi_plugin_md5	b72efa9729d4:121552	0.4	2026-10-17	5700876	262	majority value (262 of 262 nodes)
+libfabric	fi_info: 2.3.1	0.4	2026-10-17	5700876	262	majority value (262 of 262 nodes)
+shm_free_gb	> 1	0.1	2026-10-17	5700876	262	fixed expectation of the test; run time measured
+gemm	114.1	98.0	2026-10-17	5700876	262	median of 2096 values (GCDs), min 88.0, max 120.5
+xgmi_a2a	65.8	33.5	2026-10-17	5700876	262	median of 262 values (nodes), min 65.4, max 66.2
+pair	11.2	79.8	2026-10-17	5700876	262	median of 2096 values (GCDs), min 8.5, max 17.0
+counters_after	same	0.1	2026-10-17	5700876	262	fixed expectation of the test; run time measured
