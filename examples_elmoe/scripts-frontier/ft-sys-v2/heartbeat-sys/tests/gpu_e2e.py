@@ -160,8 +160,8 @@ try:
     log(f'coordinator: {e.get("coordinator")[0]}')
     cases = a.cases.split(',')
     node_of = lambda r: TRAIN[r // 8]
-    for case, run, inject, rank, kind in (('hang', 'hang', 'hang:13:20', 13, 'hang'), ('kill', 'kill', 'kill:5:20', 5, 'crash'),
-                                          ('oom', 'oom', 'oom:21:20', 21, 'out of memory'), ('abort', 'abort', 'abort:9:20', 9, 'crash')):
+    for case, run, inject, rank, kind in (('hang', 'hang', 'hang:13:20', 13, 'hang'), ('kill', 'kill', 'kill:5:20', 5, 'killed'),
+                                          ('oom', 'oom', 'oom:21:20', 21, 'out of memory'), ('abort', 'abort', 'abort:9:20', 9, 'killed')):
         if case not in cases:
             continue
         p = start_run(run, inject)

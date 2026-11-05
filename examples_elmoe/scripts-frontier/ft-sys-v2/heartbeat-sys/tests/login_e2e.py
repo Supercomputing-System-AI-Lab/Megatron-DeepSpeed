@@ -186,7 +186,7 @@ try:
     if 'kill' in cases:
         ps = start_run('r2', 'kill:1:5')
         k, d, dt = wait_failed(e, 'r2', 90)
-        check('kill', bool(d) and d['kind'] == 'crash' and d['node'] == 'nA' and 1 in (d['suspect'] or []),
+        check('kill', bool(d) and d['kind'] == 'killed' and d['node'] == 'nA' and 1 in (d['suspect'] or []),
               f'{k} {d and {x: d[x] for x in ("kind", "node", "suspect", "why")}} after {dt} s')
         stop(ps)
 
@@ -214,7 +214,7 @@ try:
     # oomstuck: the process lives on after its exception, its exit blocked (HB3 5855079: PMPI_Finalize's barrier)
     for case, run, inject, node, rank, kind in (('oom', 'r7', 'oom:2:5', 'nB', 2, 'out of memory'),
                                                 ('oomstuck', 'r10', 'oomstuck:2:5', 'nB', 2, 'out of memory'),
-                                                ('abort', 'r8', 'abort:1:5', 'nA', 1, 'crash'),
+                                                ('abort', 'r8', 'abort:1:5', 'nA', 1, 'killed'),
                                                 ('exit', 'r11', 'exit:1:5', 'nA', 1, 'exception')):
         if case not in cases:
             continue

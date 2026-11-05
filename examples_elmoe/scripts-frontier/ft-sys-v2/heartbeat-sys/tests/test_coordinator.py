@@ -136,7 +136,7 @@ check('out of memory, re-configure off: stop', k == 'out of memory' and plan.sta
 k, plan = run_death('exception: RuntimeError: HIP error: uncorrectable ECC error encountered')
 check('a hardware fault: replace the node', k == 'hardware fault' and 'no standby free' in plan, (k, plan))
 k, plan = run_death('signal')
-check('a death by a signal: crash, replace the node', k == 'crash' and 'no standby free' in plan, (k, plan))
+check('a death by a signal: killed, replace the node', k == 'killed' and 'no standby free' in plan, (k, plan))
 
 
 def run_stuck():

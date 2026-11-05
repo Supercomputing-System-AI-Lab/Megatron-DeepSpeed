@@ -68,7 +68,7 @@ check('communication error is a consequence', R.death_cause('exception: RuntimeE
 check('NCCL error is a consequence', R.death_cause('exception: DistBackendError: NCCL error in: ...'), 'consequence')
 check('ValueError is a root', R.death_cause('exception: ValueError: bad shape'), 'root')
 check('OOM kind', R.death_kind('exception: OutOfMemoryError: HIP out of memory. Tried to allocate 2 TiB'), 'out of memory')
-check('crash kind', R.death_kind('signal'), 'crash')
+check('killed kind', R.death_kind('signal'), 'killed')
 check('a program error: kind exception (stop for debugging)', R.death_kind('exception: RuntimeError: ftv2 injected exit'), 'exception')
 check('a hardware fault raised as an exception: replace the node',
       R.death_kind('exception: RuntimeError: HIP error: uncorrectable ECC error encountered'), 'hardware fault')

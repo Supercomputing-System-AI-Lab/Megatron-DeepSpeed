@@ -3,7 +3,8 @@
 Two pieces (design map 1.1, 1.5):
   install_counter()  wraps the collective and point-to-point calls of torch.distributed once, so every call adds 1 to this rank's
                      call count first. DeepSpeed (deepspeed/comm/torch.py) and Megatron reach these calls as attributes of
-                     torch.distributed at call time, so one wrap counts both. Call it before the first communication call.
+                     torch.distributed or of torch.distributed.distributed_c10d at call time; both are wrapped. Call it before the
+                     first communication call.
   start()            the monitor thread: every BEAT seconds it writes this rank's line to host memory (hb_beat.rank_path);
                      every 0.5 s it checks for the failure list the node's agent copies from etcd (hb_beat.failed_path).
 The rules of map node 1.5: no GPU call for the monitor (HBM comes from the allocator's own counters, which live in CPU memory, as
@@ -85,18 +86,23 @@ def install_counter():
     if S['installed']:
         return
     import torch.distributed as dist
+    import torch.distributed.distributed_c10d as c10d
     S['inject'] = _parse_inject()
-    for name in COLLECTIVES:
-        f = getattr(dist, name, None)
-        if f is None or getattr(f, '_ftv2_counted', False):
-            continue
+    # Both spellings are wrapped: torch.distributed.<name> (Megatron, most of DeepSpeed) and torch.distributed.distributed_c10d.<name>
+    # (DeepSpeed's all-gathers after the optimizer step, deepspeed/comm/torch.py:227, 243, 251, found 11-05). The same call counts once;
+    # a c10d function that calls another one by its module name counts twice, the same way on every rank, so counts stay comparable.
+    for mod in (dist, c10d):
+        for name in COLLECTIVES + ['_all_gather_base_coalesced']:
+            f = getattr(mod, name, None)
+            if f is None or getattr(f, '_ftv2_counted', False):
+                continue
 
-        def wrapped(*a, _f=f, **k):
-            _count()
-            return _f(*a, **k)
-        wrapped._ftv2_counted = True
-        wrapped.__name__, wrapped.__doc__, wrapped.__wrapped__ = f.__name__, f.__doc__, f
-        setattr(dist, name, wrapped)
+            def wrapped(*a, _f=f, **k):
+                _count()
+                return _f(*a, **k)
+            wrapped._ftv2_counted = True
+            wrapped.__name__, wrapped.__doc__, wrapped.__wrapped__ = f.__name__, f.__doc__, f
+            setattr(mod, name, wrapped)
     S['installed'] = True
 
 

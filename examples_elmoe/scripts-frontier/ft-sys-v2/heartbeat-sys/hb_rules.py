@@ -162,12 +162,12 @@ def death_kind(why):
     'out of memory'  OutOfMemoryError and the like (plan: the OOM ladder, design map 4.1, no node replaced)
     'hardware fault' an exception that names a GPU or link fault (plan: replace the node)
     'exception'      any other exception: an error in the program (plan: stop the training for debugging)
-    'crash'          a death by a signal, or any other reason (plan: replace the node)"""
+    'killed'         a death by a signal, or any other reason (plan: replace the node)"""
     if why and OOM.search(why):
         return 'out of memory'
     if why and str(why).startswith('exception'):
         return 'hardware fault' if HARDWARE.search(why) else 'exception'
-    return 'crash'
+    return 'killed'                     # was 'crash' until 11-05 (the user: one name for one thing, as Figure 16)
 
 
 def counts_differ(track):

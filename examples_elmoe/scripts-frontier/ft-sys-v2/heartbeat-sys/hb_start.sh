@@ -7,12 +7,15 @@
 # FTV2_PY: the Python for the agents (no torch needed); FTV2_ETCD_BIN: the etcd binary (get_etcd.sh fetches a checked one);
 # FTV2_OUT: the job folder on Lustre (the slow heartbeat goes to $FTV2_OUT/ft/). FTV2_ABORT_ON_FAILURE=<seconds> (tests only):
 # once a failure list exists, wait that long for the records, then end the job (no recovery yet).
+# FTV2_GATE=quick|full: first the pre-run gate (../gate/ftv2_gate.sh, ft-sys-v1's gate on the new stack) on every node; its result
+# goes to $FTV2_OUT/ft/gate/ and, once etcd is up, to the etcd key gate/result.
 HB_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 FTV2_PY=${FTV2_PY:-python3}
 FTV2_ETCD_BIN=${FTV2_ETCD_BIN:?set FTV2_ETCD_BIN to the etcd binary}
 FTV2_OUT=${FTV2_OUT:?set FTV2_OUT to the job folder}
 mkdir -p "$FTV2_OUT/ft"
 _hb_nodes=($(scontrol show hostnames "$SLURM_JOB_NODELIST"))
+[ -n "${FTV2_GATE:-}" ] && . "$HB_DIR/../gate/ftv2_gate.sh"
 _hb_ip() { srun --overlap -N1 -n1 -w "$1" bash -c "ip -4 addr show hsn0 | awk '/inet /{print \$2}' | cut -d/ -f1 | head -1"; }
 _hb_cluster=""; FTV2_ETCD=""
 for i in 0 1 2; do
@@ -48,6 +51,7 @@ for i in $(seq 0 $_hb_last); do
   srun --overlap -N1 -n1 -c2 -w ${_hb_nodes[$i]} "$FTV2_PY" -I -u "$HB_DIR/hb_agent.py" --etcd "$FTV2_ETCD" --job-dir "$FTV2_OUT" \
     --role $role --gpus 8 > "$FTV2_OUT/ft/agent_${_hb_nodes[$i]}.log" 2>&1 &
 done
+[ -f "$FTV2_OUT/ft/gate/result.json" ] && "$FTV2_PY" -I -c "import sys; sys.path.insert(0, '$HB_DIR'); from hb_etcd import Etcd; Etcd('$FTV2_ETCD'.split(',')).put('gate/result', open('$FTV2_OUT/ft/gate/result.json').read())" 2>/dev/null
 echo "[hb_start] etcd $FTV2_ETCD; agents on ${_hb_nodes[*]}; records in $FTV2_OUT/ft"
 if [ -n "${FTV2_ABORT_ON_FAILURE:-}" ]; then
   ( while ! "$FTV2_PY" -I -c "import sys; sys.path.insert(0, '$HB_DIR'); from hb_etcd import Etcd; sys.exit(0 if Etcd('$FTV2_ETCD'.split(',')).range('failed/')[0] else 1)" 2>/dev/null; do sleep 5; done
