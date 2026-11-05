@@ -51,5 +51,10 @@ check('dead, finished record: not gone', gone(5, dead, {'pid': dead, 'reason': '
 for f in os.listdir(d):
     os.remove(os.path.join(d, f))
 os.rmdir(d)
+# an exception that ended a non-main thread is evidence, not a death (the user, 11-05: decision 6)
+from hb_beat import thread_path
+os.makedirs(d, exist_ok=True)
+write_json(thread_path(d, 7), {'pid': live, 'thread': 'uploader', 'reason': 'ConnectionError: timed out'})
+check('a thread exception alone: not gone', hb_agent.Agent.gone(me, [{'rank': 7, 'pid': live}]), {})
 print(f'\n{len(fails)} failed' if fails else '\nall passed')
 sys.exit(1 if fails else 0)

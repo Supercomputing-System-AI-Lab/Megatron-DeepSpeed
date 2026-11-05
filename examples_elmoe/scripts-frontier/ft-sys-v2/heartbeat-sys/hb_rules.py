@@ -6,9 +6,12 @@ on the design map (11-04):
                  signal 2: the suspect's stack is outside any communication wait while the others wait (hb_stacks.verdict).
   2.4 node lost  signal 1: its lease ended (etcd deleted its beat); signal 2: the other nodes stopped progressing.
                  If they still progress, the node is alive in training: a warning, not a replacement (2.5).
-  crash          the node's agent saw the process gone on two beats in a row, or found its exit record.
-  pause          every rank still with equal counts (an optimizer step, a save): nothing; after LONG seconds an alarm only
-                 (the open "equal counts" case, design map 2.1).
+  crash          the node's agent saw the process gone, or found its exit record. Its kind decides the plan (the user, 11-05 11:50):
+                 out of memory -> the OOM ladder; a hardware fault reported as an exception -> replace the node; any other
+                 exception -> stop the training for debugging; a death by a signal -> replace the node.
+  pause          every rank still with equal counts (an optimizer step, a save): nothing for LONG seconds; then, once training is
+                 past its first steps, kind "stuck" (the user, 11-05 12:0x: "for a stuck over the nccl or anything, I will give it
+                 3 mins"): every node's stacks are saved and training stops; finding the node or link (gate checks) comes later.
 Times are the coordinator's own clock: it compares what it read at different moments, never times written on other nodes."""
 
 import os
@@ -19,7 +22,9 @@ STILL = float(os.environ.get('FTV2_HANG_STILL_S', '15'))       # seconds without
 STILL_SAVE = float(os.environ.get('FTV2_SAVE_STILL_S', '300'))  # the same while any rank reports the save phase (ft-sys-v1 lost a
                                                                 #   healthy spare to a slow save)
 CONFIRM = float(os.environ.get('FTV2_LOST_CONFIRM_S', '10'))    # seconds the other nodes must stay still after a lost lease
-LONG = float(os.environ.get('FTV2_EQUAL_STILL_S', '120'))      # everyone still with equal counts: an alarm after this long
+LONG = float(os.environ.get('FTV2_EQUAL_STILL_S', '180'))      # everyone still with equal counts: stuck after this long
+LONG_FROM_STEP = 2                                              # ... once every node is past its first steps (a long first-step
+                                                                #   compile or autotune is still, with equal counts, and healthy)
 SETTLE = float(os.environ.get('FTV2_CRASH_SETTLE_S', '25'))    # with only communication deaths, how long to wait for a lost node
 
 # A death whose exception names a communication failure is a consequence: a peer died and this rank's call failed with it.
@@ -98,7 +103,8 @@ def all_still_equal(track, now, long=LONG):
     last_move = max(s['changed'] for s in nodes.values())
     low = min(s['low'] for s in nodes.values())
     high = max(s['high'] for s in nodes.values())
-    return now - last_move >= long and low == high and not any('save' in s['beat'].get('phases', []) for s in nodes.values())
+    return (now - last_move >= long and low == high and not any('save' in s['beat'].get('phases', []) for s in nodes.values())
+            and min(s['beat'].get('step', -1) for s in nodes.values()) >= LONG_FROM_STEP)
 
 
 def lost_node_verdict(track, node, now, confirm=CONFIRM, confirm_save=STILL_SAVE):
@@ -138,15 +144,30 @@ def death_cause(why):
     exception that names a communication failure (a peer was gone first)."""
     if not why or why == 'signal':
         return 'root'
+    if OOM.search(why):
+        return 'root'                  # an out-of-memory error inside the communication library (a buffer it could not get) is the
+                                       #   rank's own memory, not a peer that went away (the user, 11-05)
     return 'consequence' if COMM_ERROR.search(why) else 'root'
 
 
-OOM = re.compile(r'OutOfMemoryError|out of memory|HIP out of memory|CUDA out of memory', re.I)
+OOM = re.compile(r'OutOfMemoryError|out of memory|HIP out of memory|CUDA out of memory|hipErrorOutOfMemory', re.I)
+# a fault of the GPU or its links that the runtime reports as an exception: the node is the cause, not the program (the user, 11-05).
+# "illegal memory access" is left out on purpose: it is most often a kernel bug, which a new node would hit again.
+HARDWARE = re.compile(r'\bECC\b|uncorrectable|xGMI|HW_EXCEPTION|hardware exception|GPU (?:is )?lost|device (?:is )?lost|'
+                      r'hipErrorECCNotCorrectable', re.I)
 
 
 def death_kind(why):
-    """The failure kind of a root death: 'out of memory' (the plan is the OOM ladder, design map 4.1, no node replaced) or 'crash'."""
-    return 'out of memory' if why and OOM.search(why) else 'crash'
+    """The failure kind of a root death:
+    'out of memory'  OutOfMemoryError and the like (plan: the OOM ladder, design map 4.1, no node replaced)
+    'hardware fault' an exception that names a GPU or link fault (plan: replace the node)
+    'exception'      any other exception: an error in the program (plan: stop the training for debugging)
+    'crash'          a death by a signal, or any other reason (plan: replace the node)"""
+    if why and OOM.search(why):
+        return 'out of memory'
+    if why and str(why).startswith('exception'):
+        return 'hardware fault' if HARDWARE.search(why) else 'exception'
+    return 'crash'
 
 
 def counts_differ(track):

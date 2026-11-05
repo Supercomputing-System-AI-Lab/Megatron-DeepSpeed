@@ -22,7 +22,7 @@ import sys
 import threading
 import time
 
-from hb_beat import exit_path, failed_path, node_name, rank_path, read_json, shm_dir, write_json
+from hb_beat import exit_path, failed_path, node_name, rank_path, read_json, shm_dir, thread_path, write_json
 
 BEAT = float(os.environ.get('FTV2_RANK_BEAT_S', '5'))
 CHECK = 0.5
@@ -149,6 +149,19 @@ def _write_exit(reason, code):
         pass
 
 
+def _write_thread_error(args):
+    """An uncaught exception that ended a thread other than the main thread. The process goes on (a failed upload thread of a
+    logger is one such case), so this is not a death: it is kept as evidence, which the failure list quotes if the rank later
+    hangs (the user, 11-05: decision 6)."""
+    try:
+        name = args.thread.name if args.thread is not None else '?'
+        write_json(thread_path(S['dir'], S['rank']), {'t': round(time.time(), 3), 'rank': S['rank'], 'pid': os.getpid(),
+                                                      'thread': name, 'reason': f'{args.exc_type.__name__}: {str(args.exc_value)[:200]}'})
+        _log(f'exception in thread {name}: {args.exc_type.__name__}: {str(args.exc_value)[:160]}')
+    except Exception:
+        pass
+
+
 def _find_card(local_rank):
     """The sysfs folder of this rank's GPU, so the agent can read its xGMI error count (ft-sys-v1 hb.py _find_card). One device
     property query at start, not per beat."""
@@ -211,6 +224,13 @@ def start(rank, local_rank, role='train', on_failure=None):
         _write_exit(f'exception: {t.__name__}: {str(v)[:200]}', 1)
         prev(t, v, tb)
     sys.excepthook = hook
+    prev_t = threading.excepthook
+
+    def thook(args):
+        if args.exc_type is not SystemExit:
+            _write_thread_error(args)
+        prev_t(args)
+    threading.excepthook = thook
     atexit.register(lambda: _write_exit('finished', 0))
     threading.Thread(target=_loop, name='ftv2-monitor', daemon=True).start()
     _log(f'monitor on: {rank_path(S["dir"], S["rank"])} every {BEAT:.0f} s; counter installed: {S["installed"]}')

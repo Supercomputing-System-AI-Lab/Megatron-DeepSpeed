@@ -6,7 +6,8 @@ Started by its own srun step, so a crashing training process cannot take it down
                      small beat to etcd (node/<node>, tied to the lease)                                   the fast heartbeat
   every SLOW (60 s)  append every rank's full line, plus the node's host memory, ECC and xGMI counts, to
                      <job>/ft/nodes/<node>.log on Lustre                                                    the slow heartbeat
-  on sample/<g>      if the request names this node: py-spy on its ranks, the stacks to Lustre, the verdict to stacks/<g>/<node>
+  on sample/<g>      if the request names this node (or every node, '*'): py-spy on its ranks twice, STACK_GAP apart, the stacks
+                     to Lustre, the verdict to stacks/<g>/<node>
   on failed/<g>      copy the failure list into host memory (failed.json) for its ranks' monitor threads, and to Lustre
   on coordinator     when the key is deleted (the coordinator's node died), try to take the role (create-if-absent)
 Slow work (rocm-smi for ECC, py-spy) runs in threads of its own so the beat is never late. The ECC and xGMI readers follow
@@ -25,9 +26,11 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hb_stacks
-from hb_beat import exit_path, failed_path, node_beat, node_name, read_json, shm_dir, write_json
+from hb_beat import exit_path, failed_path, node_beat, node_name, read_json, shm_dir, thread_path, write_json
 from hb_coordinator import Coordinator
 from hb_etcd import Etcd, EtcdError
+
+STACK_GAP = float(os.environ.get('FTV2_STACK_GAP_S', '5'))   # seconds between the two py-spy dumps of a hang (the user, 11-05 11:50)
 
 
 def host_mem_pct():
@@ -162,13 +165,31 @@ class Agent:
             req = json.loads(value)
         except ValueError:
             return
-        if req.get('node') == self.node:
+        if req.get('node') in (self.node, '*'):
             threading.Thread(target=self.sample, args=(key.split('/')[1], req), daemon=True).start()
 
     def sample(self, g, req):
-        """Signal 2's evidence: py-spy on this node's ranks, the dumps and the last full lines to Lustre, the verdict to etcd."""
+        """Signal 2's evidence: py-spy on this node's ranks twice, STACK_GAP seconds apart; the dumps and the last full lines to
+        Lustre; the verdict to etcd (confirmed only if both dumps confirm and the suspect has not moved, hb_stacks.verdict_twice)."""
         lines = self.read_lines()
         pyspy = self.a.pyspy or shutil.which('py-spy') or os.path.expanduser('~/.local/bin/py-spy')
+        first = self.dump_all(lines, pyspy)
+        time.sleep(STACK_GAP)
+        second = self.dump_all(lines, pyspy)
+        decision, detail = hb_stacks.verdict_twice(first, second, req.get('rank'))
+        d = os.path.join(self.rec, 'failures', g)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, f'stacks_{self.node}.txt'), 'w') as fh:
+            for k, dumps in (('dump 1', first), (f'dump 2, {STACK_GAP:.0f} s later', second)):
+                for r in sorted(dumps):
+                    fh.write(f'=== rank {r}, {k} ===\n{dumps[r]}\n')
+        with open(os.path.join(d, f'lines_{self.node}.json'), 'w') as fh:
+            json.dump(lines, fh, indent=1)
+        self.etcd.put(f'stacks/{g}/{self.node}', json.dumps({'decision': decision, 'detail': detail, 't': round(time.time(), 3)}))
+        self.log(f'stacks for {g}: {decision} {detail}')
+
+    def dump_all(self, lines, pyspy):
+        """One py-spy dump of each live rank of this node, all at once: {rank: text}."""
         dumps = {}
 
         def one(ln):
@@ -180,16 +201,7 @@ class Agent:
         ts = [threading.Thread(target=one, args=(ln,)) for ln in lines if alive(ln.get('pid', 0))]
         [t.start() for t in ts]
         [t.join() for t in ts]
-        decision, detail = hb_stacks.verdict(dumps, req.get('rank'))
-        d = os.path.join(self.rec, 'failures', g)
-        os.makedirs(d, exist_ok=True)
-        with open(os.path.join(d, f'stacks_{self.node}.txt'), 'w') as fh:
-            for r in sorted(dumps):
-                fh.write(f'=== rank {r} ===\n{dumps[r]}\n')
-        with open(os.path.join(d, f'lines_{self.node}.json'), 'w') as fh:
-            json.dump(lines, fh, indent=1)
-        self.etcd.put(f'stacks/{g}/{self.node}', json.dumps({'decision': decision, 'detail': detail, 't': round(time.time(), 3)}))
-        self.log(f'stacks for {g}: {decision} {detail}')
+        return dumps
 
     # the beats
     def read_lines(self):
@@ -232,7 +244,16 @@ class Agent:
                 self.log(f'rank {r} gone: {w[:160]}')
         finished = [ln['rank'] for ln in lines if not alive(ln.get('pid', 0)) and ln['rank'] not in why]
         lines_live = [ln for ln in lines if ln['rank'] not in finished]
-        beat = node_beat(self.node, lines_live, list(why), time.time(), role=self.a.role, dead_why={str(k): v for k, v in why.items()})
+        terr = {}
+        for ln in lines_live:                          # exceptions that ended a non-main thread: evidence, not deaths
+            te = read_json(thread_path(self.dir, ln['rank']))
+            if te and te.get('pid') == ln.get('pid'):
+                terr[str(ln['rank'])] = f"thread {te.get('thread')}: {te.get('reason', '?')}"[:200]
+                if (ln['rank'], te.get('t')) not in self.seen_gone:
+                    self.seen_gone.add((ln['rank'], te.get('t')))
+                    self.log(f"rank {ln['rank']}: exception in {terr[str(ln['rank'])]}")
+        beat = node_beat(self.node, lines_live, list(why), time.time(), role=self.a.role, dead_why={str(k): v for k, v in why.items()},
+                         thread_errors=terr)
         try:
             if self.etcd.keepalive(self.lease) <= 0:
                 self.log('my lease had ended: taking a new one (the coordinator may already have acted on my silence)')

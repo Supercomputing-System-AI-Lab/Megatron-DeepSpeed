@@ -109,5 +109,66 @@ def run_new_coordinator():
 f, t = run_new_coordinator()
 check('lost node held the role; survivors died of communication errors: n0, at once',
       bool(f) and f['kind'] == 'node lost' and f['node'] == 'n0' and t == 0, f and (f['kind'], f['node'], t))
+
+
+def run_death(why, reconfig=True):
+    """One rank of n1 gone with this reason: the kind and the plan of the failure list (the user's rules of 11-05 11:50)."""
+    import hb_coordinator as HC
+    HC.OOM_RECONFIG = reconfig
+    st = Store()
+    for n in ('n0', 'n1'):
+        st.kv[f'members/{n}'] = json.dumps({'role': 'train'})
+        beat(st, n, 100, 101)
+    b1 = json.loads(st.kv['node/n1']); b1.update(dead=[13], dead_why={'13': why}); st.kv['node/n1'] = json.dumps(b1)
+    c = Coordinator(st, 'nX', tempfile.mkdtemp(), lambda m: None)
+    c.step(0)
+    HC.OOM_RECONFIG = True
+    f = failed(st)
+    return (f[0]['kind'], f[0]['plan']) if f else (None, None)
+
+
+k, plan = run_death('exception: RuntimeError: ftv2 injected exit')
+check('a program error: kind exception, stop for debugging', k == 'exception' and plan.startswith('stop the training for debugging'), (k, plan))
+k, plan = run_death('exception: OutOfMemoryError: CUDA out of memory')
+check('out of memory: the OOM ladder', k == 'out of memory' and 'OOM ladder' in plan and 'no node replaced' in plan, (k, plan))
+k, plan = run_death('exception: OutOfMemoryError: CUDA out of memory', reconfig=False)
+check('out of memory, re-configure off: stop', k == 'out of memory' and plan.startswith('stop the training: out of memory'), (k, plan))
+k, plan = run_death('exception: RuntimeError: HIP error: uncorrectable ECC error encountered')
+check('a hardware fault: replace the node', k == 'hardware fault' and 'no standby free' in plan, (k, plan))
+k, plan = run_death('signal')
+check('a death by a signal: crash, replace the node', k == 'crash' and 'no standby free' in plan, (k, plan))
+
+
+def run_stuck():
+    """Every rank still with equal counts past the first steps: stacks from every node, then kind stuck."""
+    st = Store()
+    for n in ('n0', 'n1'):
+        st.kv[f'members/{n}'] = json.dumps({'role': 'train'})
+    def beat5(n, c):
+        st.kv[f'node/{n}'] = json.dumps({'node': n, 'run': 'r', 'low': c, 'low_rank': 0, 'high': c, 'rank_ids': list(range(8)),
+                                         'dead': [], 'dead_why': {}, 'phases': ['train'], 'role': 'train', 'step': 5})
+    c = Coordinator(st, 'nX', tempfile.mkdtemp(), lambda m: None)
+    for n in ('n0', 'n1'):
+        beat5(n, 100)
+    c.step(0)
+    for n in ('n0', 'n1'):
+        beat5(n, 150)
+    asked = None
+    for t in range(5, 300, 5):
+        c.step(t)
+        req = [json.loads(v) for k, v in st.kv.items() if k.startswith('sample/')]
+        if req and asked is None:
+            asked = (t, req[0]['node'])
+            for n in ('n0', 'n1'):                     # every node's agent answers
+                st.kv[f'stacks/{c.incident["gen"]}/{n}'] = json.dumps({'decision': 'ambiguous', 'detail': {}})
+        if failed(st):
+            return asked, failed(st)[0], t
+    return asked, None, None
+
+
+asked, f, t = run_stuck()
+check('stuck: stacks asked of every node after 180 s, then kind stuck',
+      asked is not None and asked[1] == '*' and asked[0] >= 185 and f is not None and f['kind'] == 'stuck' and f['plan'].startswith('stop the training'),
+      (asked, f and (f['kind'], f['plan'][:40]), t))
 print(f'\n{len(fails)} failed' if fails else '\nall passed')
 sys.exit(1 if fails else 0)

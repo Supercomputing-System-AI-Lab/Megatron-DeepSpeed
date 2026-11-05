@@ -60,3 +60,18 @@ def verdict(dumps, suspect):
     if outside == [suspect]:
         return 'confirmed', detail
     return 'ambiguous', detail
+
+
+def verdict_twice(first, second, suspect):
+    """Two dumps of the same ranks, taken some seconds apart (the user, 11-05 11:50: two py-spy dumps before a hang is confirmed).
+    'confirmed' only if both are confirmed AND the suspect is blocked at the same place in both: a stuck thread keeps its frames,
+    while a rank in a long stretch of CPU work moves on. Otherwise the second dump's decision ('moved' if only the place changed)."""
+    d1, x1 = verdict(first, suspect)
+    d2, x2 = verdict(second, suspect)
+    detail = dict(x2, first=x1)
+    if d1 == d2 == 'confirmed':
+        f1 = blocking_site(main_thread_frames(first.get(suspect) or '') or [])
+        f2 = blocking_site(main_thread_frames(second.get(suspect) or '') or [])
+        detail['same_place'] = f1 == f2
+        return ('confirmed' if f1 == f2 else 'moved'), detail
+    return d2, detail

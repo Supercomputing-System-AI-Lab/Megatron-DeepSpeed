@@ -11,7 +11,11 @@ Every 5 s (step()): read every node's beat in one read, then, for the current tr
              (the others still progress: a warning; the node is alive in training)
   hang       signal 1 (hb_rules.hang_suspect) -> ask the suspect node's agent for stacks (key sample/<g>);
              signal 2 (its answer stacks/<g>/<node>, hb_stacks.verdict) 'confirmed'      -> the failure list
-             'ambiguous' or no answer: an alarm on Lustre, no replacement
+             'ambiguous', 'moved' or no answer: an alarm on Lustre, no replacement
+  stuck      every rank still with equal counts for 3 minutes (hb_rules.all_still_equal): stacks from every node (sample/<g>
+             for node '*'), then the failure list "stuck"; the plan is to stop (the gate checks that find the node come later)
+The plan follows the kind (the user, 11-05 11:50): out of memory -> the OOM ladder (FTV2_OOM_RECONFIG=1, the default; 0 -> stop);
+another exception -> stop for debugging; a hang, a lost node, a death by a signal or a hardware fault -> replace the node.
 The failure list failed/<g> is written with create-if-absent fenced on "coordinator still names me", so an old coordinator that is
 cut off cannot write one. One failure per training run tonight (no recovery yet): later signals of that run are its consequences."""
 import json
@@ -23,6 +27,7 @@ import hb_rules
 STACK_WAIT = 90.0        # seconds to wait for the suspect node's stacks before an alarm
 HOLD = 60.0              # seconds before the same suspect is sampled again after an ambiguous answer
 SUMMARY = float(os.environ.get('FTV2_SLOW_BEAT_S', '60'))
+OOM_RECONFIG = os.environ.get('FTV2_OOM_RECONFIG', '1') == '1'   # out of memory: re-configure with the OOM ladder (on by default)
 
 
 def _g(n):
@@ -78,7 +83,13 @@ class Coordinator:
 
     def _plan(self, beats, node, kind=None):
         if kind == 'out of memory':
-            return 'change the parallelism with the OOM ladder (design map 4.1); no node replaced'
+            return ('change the parallelism with the OOM ladder (design map 4.1); no node replaced' if OOM_RECONFIG
+                    else 'stop the training: out of memory, and the OOM ladder is off (FTV2_OOM_RECONFIG=0)')
+        if kind == 'exception':
+            return 'stop the training for debugging: an error in the program; no node replaced'
+        if kind == 'stuck':
+            return ('stop the training: every rank is still and no node can be named; the stacks of every node are saved '
+                    '(the gate checks that find the node or link come later)')
         standbys = sorted(n for n, b in beats.items() if b.get('role') == 'standby' and n != node)
         return f'standby {standbys[0]} takes node {node}' if standbys else 'no standby free: stop, or a layout with fewer GPUs (config)'
 
@@ -199,11 +210,25 @@ class Coordinator:
                 self.log(f'signal 1: suspect rank {rank} on {node}; stacks requested as sample/{g}')
         elif hb_rules.all_still_equal(self.track, now) and ('equal', run) not in self.warned:
             self.warned.add(('equal', run))
-            self.record(f'ALARM: every rank still for {hb_rules.LONG:.0f} s with equal counts: no single suspect (open case)')
+            g = self._next_gen()
+            req = {'node': '*', 'rank': None, 'run': run, 'still_s': hb_rules.LONG, 't': round(now, 3), 'by': self.me}
+            if self.etcd.create_if_absent(f'sample/{g}', json.dumps(req), fence=('coordinator', self.me)):
+                self.incident = dict(req, gen=g, t_sample=now)
+                self.record(f'STUCK {g}: every rank still for {hb_rules.LONG:.0f} s with equal counts; stacks requested from '
+                            f'every node')
 
     def _progress(self, beats, run, now):
         inc = self.incident
         g, node, rank = inc['gen'], inc['node'], inc['rank']
+        if node == '*':                                # stuck: wait for every training node's stacks, then the list
+            got, _ = self.etcd.range(f'stacks/{g}/')
+            have = {k.split('/')[2] for k in got}
+            want = set(self.track.training())
+            if want <= have or now - inc['t_sample'] > STACK_WAIT:
+                self.declare(beats, run, 'stuck', 'every node', None,
+                             f'every rank still for {inc.get("still_s", hb_rules.LONG):.0f} s with equal counts; stacks of '
+                             f'{len(have & want)} of {len(want)} training nodes in ft/failures/{g}/', gen=g)
+            return
         if node in self.track.missing:                 # the suspect's node lost its lease meanwhile: the lost-node rule decides
             if hb_rules.lost_node_verdict(self.track, node, now) == 'lost':
                 self.declare(beats, run, 'node lost', node, rank, f'lease of {node} ended while its stacks were awaited', gen=g)
@@ -218,9 +243,11 @@ class Coordinator:
             return
         a = json.loads(ans)
         if a.get('decision') == 'confirmed':
+            te = (beats.get(node) or {}).get('thread_errors', {}).get(str(rank))
             self.declare(beats, run, 'hang', node, rank,
                          f'signal 1: counts still for {inc.get("still_s")} s and differ; signal 2: rank {rank} outside any '
-                         f'communication wait, {len(a.get("detail", {}).get("waiting", []))} others waiting', gen=g)
+                         f'communication wait in two dumps, {len(a.get("detail", {}).get("waiting", []))} others waiting'
+                         + (f'; earlier, an exception ended its {te}' if te else ''), gen=g)
         else:
             silent = [m for m in sorted(self.track.missing)
                       if hb_rules.lost_node_verdict(self.track, m, now) in ('lost', 'lost-stalled')]

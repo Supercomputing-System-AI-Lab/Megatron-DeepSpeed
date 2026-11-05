@@ -30,7 +30,7 @@ from hb_etcd import Etcd
 ap = argparse.ArgumentParser()
 ap.add_argument('--python', required=True)
 ap.add_argument('--etcd-bin', required=True)
-ap.add_argument('--cases', default='hang,kill,oom,oomstuck,abort,pause,slow,lost,takeover,silent')
+ap.add_argument('--cases', default='hang,kill,oom,oomstuck,abort,exit,stuck,pause,slow,lost,takeover,silent')
 ap.add_argument('--out', default=None)
 a = ap.parse_args()
 
@@ -202,10 +202,20 @@ try:
         ends = [p.wait(timeout=300) for p in ps]
         check('slow', d is None and ends == [0, 0, 0, 0], f'failure list {k}; exit codes {ends}')
 
+    # stuck: every rank still with equal counts past the first steps -> stacks of every node, then kind stuck (the user, 11-05:
+    # "for a stuck over the nccl or anything, I will give it 3 mins"; here FTV2_EQUAL_STILL_S of FAST)
+    if 'stuck' in cases:
+        ps = start_run('r12', 'pause:all:5:120')
+        k, d, dt = wait_failed(e, 'r12', 150)
+        check('stuck', bool(d) and d['kind'] == 'stuck' and d['plan'].startswith('stop the training'),
+              f'{k} {d and {x: d[x] for x in ("kind", "node", "why", "plan")}} after {dt} s')
+        stop(ps)
+
     # oomstuck: the process lives on after its exception, its exit blocked (HB3 5855079: PMPI_Finalize's barrier)
     for case, run, inject, node, rank, kind in (('oom', 'r7', 'oom:2:5', 'nB', 2, 'out of memory'),
                                                 ('oomstuck', 'r10', 'oomstuck:2:5', 'nB', 2, 'out of memory'),
-                                                ('abort', 'r8', 'abort:1:5', 'nA', 1, 'crash')):
+                                                ('abort', 'r8', 'abort:1:5', 'nA', 1, 'crash'),
+                                                ('exit', 'r11', 'exit:1:5', 'nA', 1, 'exception')):
         if case not in cases:
             continue
         ps = start_run(run, inject)

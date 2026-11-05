@@ -19,8 +19,8 @@ def check(name, got, want):
         fails.append(name)
 
 
-def beat(low, high, low_rank=0, run='r', phases=('forward',), role='train'):
-    return {'low': low, 'high': high, 'low_rank': low_rank, 'run': run, 'phases': list(phases), 'role': role}
+def beat(low, high, low_rank=0, run='r', phases=('forward',), role='train', step=5):
+    return {'low': low, 'high': high, 'low_rank': low_rank, 'run': run, 'phases': list(phases), 'role': role, 'step': step}
 
 
 def track(seq):
@@ -40,7 +40,10 @@ t = track([(0, {'n0': beat(100, 101), 'n1': beat(100, 101)}), (5, {'n0': beat(15
            (60, {'n0': beat(150, 150), 'n1': beat(150, 150)})])
 check('pause: no suspect', R.hang_suspect(t, 60), None)
 check('pause: no alarm before LONG', R.all_still_equal(t, 60), False)
-check('pause: alarm after LONG', R.all_still_equal(t, 5 + R.LONG), True)
+check('pause: stuck after LONG (3 min)', R.all_still_equal(t, 5 + R.LONG), True)
+check('stuck limit is 180 s', R.LONG, 180.0)
+t = track([(0, {'n0': beat(100, 101, step=1), 'n1': beat(100, 101, step=1)}), (5, {'n0': beat(150, 150, step=1), 'n1': beat(150, 150, step=1)})])
+check('still with equal counts in the first steps (a compile): not stuck', R.all_still_equal(t, 5 + R.LONG), False)
 # a slow rank: the counts differ but keep moving -> nothing
 t = track([(0, {'n0': beat(100, 101), 'n1': beat(99, 101)}), (5, {'n0': beat(180, 181), 'n1': beat(179, 181)}),
            (10, {'n0': beat(260, 261), 'n1': beat(259, 261)}), (15, {'n0': beat(340, 341), 'n1': beat(339, 341)})])
@@ -66,6 +69,12 @@ check('NCCL error is a consequence', R.death_cause('exception: DistBackendError:
 check('ValueError is a root', R.death_cause('exception: ValueError: bad shape'), 'root')
 check('OOM kind', R.death_kind('exception: OutOfMemoryError: HIP out of memory. Tried to allocate 2 TiB'), 'out of memory')
 check('crash kind', R.death_kind('signal'), 'crash')
+check('a program error: kind exception (stop for debugging)', R.death_kind('exception: RuntimeError: ftv2 injected exit'), 'exception')
+check('a hardware fault raised as an exception: replace the node',
+      R.death_kind('exception: RuntimeError: HIP error: uncorrectable ECC error encountered'), 'hardware fault')
+check('an illegal memory access stays a program error', R.death_kind('exception: RuntimeError: HIP error: an illegal memory access was encountered'), 'exception')
+check('OOM inside RCCL is the rank\'s own memory: a root', R.death_cause('exception: DistBackendError: NCCL error: hipErrorOutOfMemory'), 'root')
+check('OOM inside RCCL: kind out of memory', R.death_kind('exception: DistBackendError: NCCL error: hipErrorOutOfMemory'), 'out of memory')
 # signal 2, py-spy stacks
 hung = 'Thread 7 (idle): "MainThread"\n    _inject (hb_monitor.py:62)\n    wrapped (hb_monitor.py:91)\n    forward (moe.py:10)\n'
 wait = 'Thread 8 (active): "MainThread"\n    synchronize (torch/cuda/__init__.py:985)\n    all_to_all_single (c10d.py:4)\n'
@@ -85,5 +94,11 @@ wait_x = ('Thread 1916987 (active): "MainThread"\n    rocr::core::BusyWaitSignal
 check('X-MoE: asleep under broadcast_data is outside', K.is_waiting(K.main_thread_frames(hung_x)), False)
 check('X-MoE: HIP signal wait is waiting', K.is_waiting(K.main_thread_frames(wait_x)), True)
 check('X-MoE stacks: confirmed', K.verdict({12: wait_x, 13: hung_x, 14: wait_x}, 13)[0], 'confirmed')
+# two dumps a few seconds apart (the user, 11-05): confirmed only if the suspect is stuck at the same place in both
+busy = hung_x.replace('_inject (hb_monitor.py:59)', 'tokenize (data.py:120)').replace('clock_nanosleep@GLIBC_2.2.5 (libc.so.6)\n    time_sleep (python3.11)\n    ', '')
+d = {12: wait_x, 13: hung_x, 14: wait_x}
+check('two dumps, same place: confirmed', K.verdict_twice(d, dict(d), 13)[0], 'confirmed')
+check('two dumps, the suspect moved (busy, not stuck): moved', K.verdict_twice(d, {12: wait_x, 13: busy, 14: wait_x}, 13)[0], 'moved')
+check('two dumps, the second has every rank waiting: ambiguous', K.verdict_twice(d, {12: wait_x, 13: wait_x, 14: wait_x}, 13)[0], 'ambiguous')
 print(f'\n{len(fails)} failed' if fails else '\nall passed')
 sys.exit(1 if fails else 0)
