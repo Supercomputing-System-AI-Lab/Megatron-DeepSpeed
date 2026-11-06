@@ -117,6 +117,37 @@ class MegatronTrainer:
         gv._build_num_microbatches_calculator(a)
         os.environ['WORLD_SIZE'] = str(world)
 
+    def warm_step(self, model):
+        """One forward and backward of one micro-batch of synthetic tokens, no optimizer step: the kernels and libraries of the
+        model get loaded in this process (the standby's warm-up, FTV2_STANDBY_WARM=1)."""
+        from megatron import get_args, get_tokenizer
+        from megatron.core.pipeline_parallel import get_forward_backward_func
+        a = get_args()
+        g = torch.Generator().manual_seed(0)
+        batch = {'text': torch.randint(0, get_tokenizer().vocab_size - 1, (a.micro_batch_size, a.seq_length + 1), generator=g)}
+        get_forward_backward_func()(forward_step_func=self.forward_step, data_iterator=iter([batch]), model=model,
+                                    num_microbatches=1, seq_length=a.seq_length, micro_batch_size=a.micro_batch_size,
+                                    decoder_seq_length=a.decoder_seq_length, forward_only=False)
+        torch.cuda.synchronize()
+
+    def set_world_args(self, world, rank):
+        """Megatron's world in args and the environment (rank, world size, data-parallel size); returns the old values."""
+        from megatron import get_args
+        a = get_args()
+        old = (a.world_size, a.data_parallel_size, a.rank, os.environ.get('WORLD_SIZE'), os.environ.get('RANK'))
+        a.world_size, a.rank = int(world), int(rank)
+        a.data_parallel_size = a.world_size // (a.tensor_model_parallel_size * a.pipeline_model_parallel_size)
+        os.environ.update(WORLD_SIZE=str(world), RANK=str(rank))
+        return old
+
+    def restore_world_args(self, old):
+        from megatron import get_args
+        a = get_args()
+        a.world_size, a.data_parallel_size, a.rank = old[0], old[1], old[2]
+        for k, v in (('WORLD_SIZE', old[3]), ('RANK', old[4])):
+            if v is not None:
+                os.environ[k] = v
+
     # ------------------------------------------------------------------ RNG
     def rng_snapshot(self):
         from megatron.core import tensor_parallel

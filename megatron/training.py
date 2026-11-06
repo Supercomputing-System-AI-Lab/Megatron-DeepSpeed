@@ -579,6 +579,7 @@ def pretrain(train_valid_test_dataset_provider,
     if _rc is not None:
         from adapters.megatron_train import MegatronTrainer
         _rc.tr = MegatronTrainer(model_provider, model_type, train_valid_test_dataset_provider, data_post_process)
+        _rc.tr.forward_step = forward_step_func     # [ft-sys-v2 recovery] the standby's optional warm-up step
         _rc.split_mpi_world()    # [ft-sys-v2 recovery] the standby shares the Slurm step: MPI's world is split by role first
     # Initalize and get arguments, timers, and Tensorboard writer.
     if _rc_standby:

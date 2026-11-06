@@ -27,10 +27,10 @@ def node_address(ifname='hsn0'):
         return socket.gethostbyname(socket.gethostname())
 
 
-def make_world(etcd, g, rank, world_size, host_rank, timeout_s, log, backend='nccl', wait_s=300.0):
+def make_world(etcd, g, rank, world_size, host_rank, timeout_s, log, backend='nccl', wait_s=300.0, key=None, prefix=None):
     """Join generation g's world as `rank` of `world_size`. Returns (seconds to the store, seconds to init_process_group)."""
     t0 = time.time()
-    key = f'world/{g}'
+    key = key or f'world/{g}'
     if rank == host_rank:
         ip = node_address()
         store = dist.TCPStore(ip, 0, world_size, is_master=True, timeout=timedelta(seconds=timeout_s), wait_for_workers=False)
@@ -48,7 +48,7 @@ def make_world(etcd, g, rank, world_size, host_rank, timeout_s, log, backend='nc
         store = dist.TCPStore(ip, int(port), world_size, is_master=False, timeout=timedelta(seconds=timeout_s))
     _STORES.append(store)
     t1 = time.time()
-    dist.init_process_group(backend, store=dist.PrefixStore(f'ftv2/world{g}/', store), rank=rank, world_size=world_size,
+    dist.init_process_group(backend, store=dist.PrefixStore(prefix or f'ftv2/world{g}/', store), rank=rank, world_size=world_size,
                             timeout=timedelta(seconds=timeout_s))
     t2 = time.time()
     log(f'world {g}: rank {rank} of {world_size} joined (store {t1 - t0:.2f} s, init {t2 - t1:.2f} s)')

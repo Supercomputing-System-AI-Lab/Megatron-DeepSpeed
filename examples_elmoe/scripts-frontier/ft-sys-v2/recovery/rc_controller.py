@@ -354,6 +354,13 @@ class Recovery:
         me = os.environ.get('FTV2_NODE') or __import__('socket').gethostname().split('.')[0]
         self.log(f'standby on {me}: waiting for a failure list that names this node')
         self.prealloc = None
+        if os.environ.get('FTV2_STANDBY_WARM') == '1':
+            try:
+                self.warm_standby(me)
+            except Exception as ex:
+                self.log(f'standby warm-up failed (the standby still waits, cold): {ex!r}'[:300])
+                import traceback
+                traceback.print_exc()
         if os.environ.get('FTV2_SHADOW', 'cpu') == 'cpu' and os.environ.get('FTV2_CPU_ADAM', 'ds') == 'ds':
             from rc_keep import _ds_cpu_adam
             t0 = time.time()
@@ -375,6 +382,37 @@ class Recovery:
             if v:
                 self.log('the training finished without needing this standby: exiting')
                 self._exit(0, 'finished')
+
+    def warm_standby(self, node):
+        """The lead's option (11-06): the standby's first step after a join was 15 s against 6-7 s (first use of the kernels in a
+        fresh process). While it waits, the standby builds the model in a world of its own GPUs (EP 8 fits one node), runs one
+        forward and backward of synthetic tokens, frees everything and goes back to waiting; the kernels stay loaded."""
+        t0 = time.time()
+        n = int(os.environ.get('FTV2_GPUS_PER_NODE', '8'))
+        run = os.environ.get('FTV2_RUN', self.base_run)
+        rc_world.make_world(self.etcd(), f'sb-{node}', self.local, n, 0, 300, self.log, key=f'standby_world/{run}/{node}',
+                            prefix=f'ftv2/standby/{run}/{node}/')
+        rc_world.world_barrier(self.device)
+        old = self.tr.set_world_args(n, self.local)
+        try:
+            self.tr.reinit_parallel(ZeroAdapter)
+            model, optimizer, sched = self.tr.build_model()
+            t1 = time.time()
+            self.tr.warm_step(model)
+            t2 = time.time()
+            ZeroAdapter(model[0]).release()
+            del model, optimizer, sched
+        finally:
+            self.tr.restore_world_args(old)
+        gc.collect()
+        torch.cuda.empty_cache()
+        rc_world.world_barrier(self.device)
+        dist.destroy_process_group()
+        if dist.is_initialized():
+            rc_stop.forget_all()
+        self.warm_s = round(time.time() - t0, 1)
+        self.log(f'standby warmed in {self.warm_s} s (build {t1 - t0:.1f} s, forward+backward {t2 - t1:.1f} s); '
+                 f'{torch.cuda.memory_allocated(self.device) / 1e9:.2f} GB still allocated')
 
     def _prealloc_shadow(self):
         """The standby's pinned host buffers for the shadow it will keep, made while it waits (the lead, 11-06: the first
