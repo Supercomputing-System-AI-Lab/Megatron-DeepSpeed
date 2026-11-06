@@ -67,6 +67,14 @@ check('signal is a root', R.death_cause('signal'), 'root')
 check('communication error is a consequence', R.death_cause('exception: RuntimeError: Connection reset by peer'), 'consequence')
 check('NCCL error is a consequence', R.death_cause('exception: DistBackendError: NCCL error in: ...'), 'consequence')
 check('ValueError is a root', R.death_cause('exception: ValueError: bad shape'), 'root')
+check('TypeError is a root ("peer" inside "TypeError", E5c 5862600)',
+      R.death_cause('exception: TypeError: slice indices must be integers or None or have an __index__ method'), 'root')
+check('ProcessGroupNCCL text is a consequence', R.death_cause('exception: RuntimeError: ProcessGroupNCCL is aborted'), 'consequence')
+check('a socket timeout is a consequence', R.death_cause('exception: RuntimeError: socket timed out after 600 s'), 'consequence')
+check('gloo connection closed is a consequence',
+      R.death_cause('exception: RuntimeError: [../third_party/gloo/gloo/transport/tcp/pair.cc:534] Connection closed by peer'),
+      'consequence')
+check('DistNetworkError is a consequence', R.death_cause('exception: DistNetworkError: failed to recv'), 'consequence')
 check('OOM kind', R.death_kind('exception: OutOfMemoryError: HIP out of memory. Tried to allocate 2 TiB'), 'out of memory')
 check('killed kind', R.death_kind('signal'), 'killed')
 check('a program error: kind exception (stop for debugging)', R.death_kind('exception: RuntimeError: ftv2 injected exit'), 'exception')

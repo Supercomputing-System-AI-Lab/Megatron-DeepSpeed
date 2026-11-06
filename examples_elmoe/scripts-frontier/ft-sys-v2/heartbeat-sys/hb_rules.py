@@ -28,8 +28,10 @@ LONG_FROM_STEP = 2                                              # ... once every
 SETTLE = float(os.environ.get('FTV2_CRASH_SETTLE_S', '25'))    # with only communication deaths, how long to wait for a lost node
 
 # A death whose exception names a communication failure is a consequence: a peer died and this rank's call failed with it.
-COMM_ERROR = re.compile(r'DistBackendError|DistNetworkError|NCCL|RCCL|Gloo|gloo|Connection (closed|reset)|connection reset|'
-                        r'remote process|peer|Socket|socket|timed out|Timeout|ProcessGroup', re.I)
+# Whole words only: case-insensitive "peer" matched inside "TyPEError", so every TypeError counted as a communication error
+# (E5c 5862600: 24 ranks gone with a TypeError, read as "communication errors only", no list for 10 minutes).
+COMM_ERROR = re.compile(r'\b(?:DistBackendError|DistNetworkError|NCCL|RCCL|Gloo|Connection (?:closed|reset)|remote process|'
+                        r'peer|Socket|timed out|Timeout|ProcessGroup\w*)\b', re.I)
 
 
 class Track:
