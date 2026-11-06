@@ -288,13 +288,6 @@ class Recovery:
         self.hb.S['stop'] = True
         lost = set(int(r) for r in f.get('ranks', []))
         info = self.stop_info.setdefault(g, {})
-        if self.device.type == 'cuda':
-            # HIP's current device is per thread; _comm_ptr() looks up the communicator of the CURRENT device, and this monitor
-            # thread's device was 0, so only GPU 0 of each node found its communicators (E2 5861942: 6 on ranks 0, 8, 16, none on
-            # the other survivors, whose stop was the abort alone)
-            torch.cuda.set_device(self.device)
-        info['revoke'] = rc_stop.revoke_all(self.device, self.log)
-        self.mark(g, 'revoke_done')
         if not f.get('replace'):
             # the plan stops the run (an exception, out of memory, stuck, no standby free): every training rank ends with 76, and
             # the run is marked done so that the standby stops waiting (E3b: without it the standby waited for ever)
@@ -306,11 +299,18 @@ class Recovery:
             except Exception:
                 pass
             self._exit(EXIT_NO_PLAN, f'recovery: {why}')
-        if self.rank in lost:
+        if self.rank in lost:                 # before any revoke: this process leaves (its GPU may be the faulty one)
             why = 'my node is replaced'
             self.log(f'list {g}: {why}; exiting')
             self.write_times(g, {'exit': why})
             self._exit(0, f'recovery: {why}')
+        if self.device.type == 'cuda':
+            # HIP's current device is per thread; _comm_ptr() looks up the communicator of the CURRENT device, and this monitor
+            # thread's device was 0, so only GPU 0 of each node found its communicators (E2 5861942: 6 on ranks 0, 8, 16, none on
+            # the other survivors, whose stop was the abort alone)
+            torch.cuda.set_device(self.device)
+        info['revoke'] = rc_stop.revoke_all(self.device, self.log)
+        self.mark(g, 'revoke_done')
         survivors = [r for r in range(self.world) if r not in lost]
         info['barrier'] = rc_stop.etcd_barrier(self.etcd(), g, self.rank, survivors, self.log)
         self.mark(g, 'barrier_done')
@@ -339,13 +339,20 @@ class Recovery:
                 if not waits_for_stop(e, bool(self.hb.S.get('stop'))):
                     if isinstance(e, (SystemExit, KeyboardInterrupt)):
                         raise
-                    # the process ends here, with the exit record the heartbeat's excepthook would write: a normal exit would
-                    # hang in MPI's finalize, which is collective over the step's first world (the standby tasks never call it)
-                    self.log(f'the main thread raised {name}: not a stop and not a communication error: this process ends now '
-                             f'and the heartbeat classifies it: {text}')
+                    # the exit record the heartbeat's excepthook would write, then this process waits for the failure list,
+                    # which ends it (0 when its node is replaced, 76 when the plan stops the run). It does not exit by itself:
+                    # a normal exit hangs in MPI's finalize (collective over the step's first world; the standby tasks never
+                    # call it), and a non-zero exit ends every task of the Slurm step on Frontier, the survivors included.
                     import traceback
                     traceback.print_exc()
-                    self._exit(1, f'exception: {name}: {str(e)[:200]}')
+                    self.hb._write_exit(f'exception: {name}: {str(e)[:200]}', 1)
+                    self.log(f'the main thread raised {name}: not a stop and not a communication error: exit record written; '
+                             f'waiting for the failure list (the heartbeat classifies it): {text}')
+                    limit = float(os.environ.get('FTV2_EXCEPTION_WAIT_S', '600'))
+                    t0 = time.time()
+                    while time.time() - t0 < limit:
+                        time.sleep(1.0)
+                    self._exit(1, f'exception: {name}: {str(e)[:200]} (no failure list after {limit:.0f} s)')
                 if not self.wait_stop(90):
                     raise
                 self.log(f'the main thread left the step: {name}: {text}')
