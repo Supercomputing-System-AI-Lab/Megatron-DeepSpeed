@@ -25,4 +25,5 @@ open(f, 'w').write(s.replace(a, b))
 PY
 grep -qF "\$(( NODES + $extra ))" "$out" || { echo "FATAL [ftv2_sbatch]: the geometry guard did not change in $out"; exit 1; }
 echo "[ftv2_sbatch] $out: nodes $n -> $((n + extra)) (standby $extra), --no-kill"
+if [ "${FTV2_SBATCH_DRY:-0}" = 1 ]; then echo "[ftv2_sbatch] render only (FTV2_SBATCH_DRY=1): not submitted"; exit 0; fi
 sbatch "$out"

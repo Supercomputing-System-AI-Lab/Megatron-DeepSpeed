@@ -32,7 +32,7 @@ srun() {
   fi
   local tw sw aw
   tw=$(IFS=,; echo "${nodes[*]:0:$nt}"); sw=$(IFS=,; echo "${nodes[*]:$nt}"); aw=$(IFS=,; echo "${nodes[*]}")
-  if [ -n "${PERSISTENT_TRITON_CACHE:-}" ] && [ -n "${TMP_TRITON_DIR:-}" ] && [ "${PROFILING_SKIP_CACHE_WARM:-}" != 1 ]; then
+  if [ "$ns" -gt 0 ] && [ -n "${PERSISTENT_TRITON_CACHE:-}" ] && [ -n "${TMP_TRITON_DIR:-}" ] && [ "${PROFILING_SKIP_CACHE_WARM:-}" != 1 ]; then
     # the template warmed the Triton cache on the training nodes before this file was sourced; the standby gets the same
     echo "[ftv2 srun] $(date '+%T') Triton cache warm-up on the standby node(s) $sw" >&2
     command srun -N "$ns" -n "$ns" --ntasks-per-node=1 -w "$sw" bash cache_setup.sh "$PERSISTENT_TRITON_CACHE" "$TMP_TRITON_DIR"
@@ -50,7 +50,7 @@ srun() {
       # a failure arm records the optimizer state's fingerprint at the step ends around the failure (M1-B's restore check)
       fs=""; [ -n "${FTV2_INJECT:-}" ] && fs=${FTV2_INJECT##*:}; [ -n "${FTV2_LOSE_NODE:-}" ] && fs=${FTV2_LOSE_NODE##*:}
       if [ -n "$fs" ] && [ -z "${FTV2_STEP_SUMS_FROM:-}" ]; then export FTV2_STEP_SUMS_FROM=$((fs - 1)) FTV2_STEP_SUMS_TO=$((fs + 1)); fi
-      if [ "${FTV2_NO_STANDBY:-0}" = 1 ]; then nodes_n=$nt; w=$tw; else nodes_n=$nn; w=$aw; fi
+      if [ "${FTV2_NO_STANDBY:-0}" = 1 ] || [ "$ns" = 0 ]; then nodes_n=$nt; w=$tw; else nodes_n=$nn; w=$aw; fi
       ta=()
       for ((i = 0; i < ${#args[@]}; i++)); do
         x=${args[$i]}

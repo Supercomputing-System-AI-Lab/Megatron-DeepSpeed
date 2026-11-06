@@ -102,6 +102,21 @@ class MegatronTrainer:
             if getattr(timer, '_started', False):
                 timer.reset()
 
+    def set_world_size(self, world):
+        """The extension point of a plan that changes the world size (the OOM ladder, a shrink without a standby): Megatron's own
+        notion of the world before the rebuild calls initialize_model_parallel and setup_model_and_optimizer for the new layout.
+        Sets args.world_size and args.data_parallel_size and builds the micro-batch calculator again (global_vars.py: it asserts
+        it is built once, so the global is reset first). NOT TESTED (no plan uses it yet): the restore must then re-split the
+        optimizer state instead of copying it (see recovery/README.md, 'A new recovery plan')."""
+        from megatron import get_args
+        from megatron import global_vars as gv
+        a = get_args()
+        a.world_size = int(world)
+        a.data_parallel_size = a.world_size // (a.tensor_model_parallel_size * a.pipeline_model_parallel_size)
+        gv._GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
+        gv._build_num_microbatches_calculator(a)
+        os.environ['WORLD_SIZE'] = str(world)
+
     # ------------------------------------------------------------------ RNG
     def rng_snapshot(self):
         from megatron.core import tensor_parallel
