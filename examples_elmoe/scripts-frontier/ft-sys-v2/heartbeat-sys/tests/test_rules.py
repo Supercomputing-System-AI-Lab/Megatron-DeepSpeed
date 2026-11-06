@@ -53,6 +53,12 @@ t = track([(0, {'a0': sbeat(100, 101, 0), 'b0': sbeat(100, 101, 0), 'a1': sbeat(
 check('pipeline: a node behind inside its stage is the suspect, not the stage with fewer calls', R.hang_suspect(t, 25),
       ('b1', 21, 20.0))
 check('pipeline: counts differ inside a stage: no stuck alarm', R.all_still_equal(t, 5 + R.LONG), False)
+check('pipeline: counts differ inside a stage: a silent node is deferred to the stacks', R.counts_differ(t), True)
+# M3A3 5867318 arm lost: a stage-1 node is gone; the beating nodes are equal inside each stage (stage 0 ahead of stage 1 by
+# design): the silent node is the cause, not deferred
+t = track([(0, {'a0': sbeat(100, 101, 0), 'b0': sbeat(100, 101, 0), 'a1': sbeat(60, 61, 1)}),
+           (5, {'a0': sbeat(158, 158, 0), 'b0': sbeat(158, 158, 0), 'a1': sbeat(90, 90, 1)})])
+check('pipeline: equal inside each stage, different across stages: counts do not differ', R.counts_differ(t), False)
 # a pause: everyone still with equal counts -> no suspect; an alarm only after LONG
 t = track([(0, {'n0': beat(100, 101), 'n1': beat(100, 101)}), (5, {'n0': beat(150, 150), 'n1': beat(150, 150)}),
            (60, {'n0': beat(150, 150), 'n1': beat(150, 150)})])

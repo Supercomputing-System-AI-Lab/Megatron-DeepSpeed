@@ -222,8 +222,11 @@ def death_kind(why):
 
 def counts_differ(track):
     """Among the nodes that still beat, is some rank behind the others? Then a silent node is not yet proven to be the cause:
-    a hang on a beating node stalls everyone too (found on GPUs, job 5854211: an agent killed while another node's rank hung)."""
+    a hang on a beating node stalls everyone too (found on GPUs, job 5854211: an agent killed while another node's rank hung).
+    Compared inside each pipeline stage, as hang_suspect does (milestone 3, M3A3 5867318 arm lost: compared across stages the
+    counts always differ, so the silent node was deferred to a hang path whose per-stage signal 1 never named anyone, and the
+    stuck rule stopped the run after 180 s)."""
     nodes = track.training()
     if not nodes:
         return False
-    return min(s['low'] for s in nodes.values()) < max(s['high'] for s in nodes.values())
+    return any(min(s['low'] for s in g.values()) < max(s['high'] for s in g.values()) for g in by_stage(nodes).values())
