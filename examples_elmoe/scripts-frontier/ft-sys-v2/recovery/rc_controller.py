@@ -337,9 +337,15 @@ class Recovery:
             except BaseException as e:
                 name, text = type(e).__name__, str(e)[:240]
                 if not waits_for_stop(e, bool(self.hb.S.get('stop'))):
-                    self.log(f'the main thread raised {name}: not a stop and not a communication error: it goes up at once '
-                             f'(the heartbeat classifies it): {text}')
-                    raise
+                    if isinstance(e, (SystemExit, KeyboardInterrupt)):
+                        raise
+                    # the process ends here, with the exit record the heartbeat's excepthook would write: a normal exit would
+                    # hang in MPI's finalize, which is collective over the step's first world (the standby tasks never call it)
+                    self.log(f'the main thread raised {name}: not a stop and not a communication error: this process ends now '
+                             f'and the heartbeat classifies it: {text}')
+                    import traceback
+                    traceback.print_exc()
+                    self._exit(1, f'exception: {name}: {str(e)[:200]}')
                 if not self.wait_stop(90):
                     raise
                 self.log(f'the main thread left the step: {name}: {text}')
