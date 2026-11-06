@@ -100,6 +100,34 @@ def worker(rank, endpoints):
     print(f'[rank {rank}] both generations ok', flush=True)
 
 
+def pg_timeout_cases():
+    """Recovery.pg_timeouts: every group gets at least FTV2_PG_TIMEOUT_S (V3-2L 5863006: Megatron's and DeepSpeed's groups took
+    torch's 10-minute default and the watchdog ended the survivors before any decision). torch's own functions are replaced by
+    recorders first, so no group is made."""
+    import torch.distributed as dist
+    import torch.distributed.distributed_c10d as c10d
+    from datetime import timedelta
+    from rc_controller import Recovery
+    seen = []
+    keep = (dist.new_group, dist.init_process_group, c10d.new_group)
+    dist.new_group = lambda *a, **k: seen.append(('new_group', a, k))
+    dist.init_process_group = lambda *a, **k: seen.append(('init', a, k))
+    try:
+        os.environ['FTV2_PG_TIMEOUT_S'] = '1800'
+        Recovery.pg_timeouts()
+        dist.new_group([0, 1])
+        dist.new_group([0, 1], backend='gloo')
+        dist.new_group([0, 1], timedelta(seconds=60))
+        dist.new_group([0, 1], timeout=timedelta(hours=2))
+        dist.init_process_group('nccl', timeout=timedelta(minutes=15))
+        dist.init_process_group('nccl')
+        got = [(k.get('timeout') if len(a) < 2 else a[1]).total_seconds() for _, a, k in seen]
+        check('group timeouts raised to the floor, a longer one kept', got, [1800.0, 1800.0, 1800.0, 7200.0, 1800.0, 1800.0])
+        check('c10d.new_group is the wrapped one', c10d.new_group is dist.new_group, True)
+    finally:
+        dist.new_group, dist.init_process_group, c10d.new_group = keep
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--etcd-bin', default='/lustre/orion/world-shared/gen150/zixianw4/tools/etcd-v3.5.17/etcd-v3.5.17-linux-amd64/etcd')
@@ -110,6 +138,7 @@ def main():
         return
     decide_cases()
     wrapper_cases()
+    pg_timeout_cases()
     tmp = os.path.join(os.environ.get('TMPDIR', '/tmp'), f'cpu_world_{os.getpid()}')
     c, p = 24700 + os.getpid() % 200, 24900 + os.getpid() % 200
     env = {k: v for k, v in os.environ.items() if 'proxy' not in k.lower()}

@@ -104,6 +104,41 @@ class Recovery:
         self.commit_on = os.environ.get('FTV2_COMMIT') == '1'   # milestone 2: commits inside the step (ZeRO stage 2)
         if os.environ.get('FTV2_DETERMINISTIC') == '1':
             self.deterministic_mode()
+        self.pg_timeouts()
+
+    @staticmethod
+    def pg_timeouts():
+        """Every process group of a run with the recovery gets a timeout of at least FTV2_PG_TIMEOUT_S (default 1800 s), so that
+        PyTorch's watchdog cannot end the survivors before the heartbeat's decision and the recovery have run (the stuck rule
+        alone takes 3 minutes plus the node checks). Megatron's model-parallel groups and DeepSpeed's groups are made with
+        torch.distributed.new_group(ranks) and no timeout, which took torch's 10-minute default: V3-2L 5863006's survivors were
+        ended by the watchdog 600 s + 480 s after a stall the heartbeat had seen in 15 s. Wrapped on the module, before
+        Megatron's initialization; an explicit longer timeout is kept."""
+        import torch.distributed as dist
+        from datetime import timedelta
+        floor = timedelta(seconds=float(os.environ.get('FTV2_PG_TIMEOUT_S', '1800')))
+        if getattr(dist.new_group, '_ftv2_wrapped', False):
+            return
+
+        def raised(t):
+            return floor if t is None or t < floor else t
+        orig_new, orig_init = dist.new_group, dist.init_process_group
+
+        def new_group(*a, **k):
+            if len(a) >= 2:
+                a = (a[0], raised(a[1])) + tuple(a[2:])
+            else:
+                k['timeout'] = raised(k.get('timeout'))
+            return orig_new(*a, **k)
+
+        def init_process_group(*a, **k):
+            k['timeout'] = raised(k.get('timeout'))
+            return orig_init(*a, **k)
+        new_group._ftv2_wrapped = init_process_group._ftv2_wrapped = True
+        dist.new_group = new_group
+        dist.init_process_group = init_process_group
+        import torch.distributed.distributed_c10d as c10d
+        c10d.new_group = new_group
 
     @staticmethod
     def deterministic_mode():
@@ -310,6 +345,10 @@ class Recovery:
             except Exception:
                 pass
             self._exit(EXIT_NO_PLAN, f'recovery: {why}')
+        if self.rank in lost and self.hb.S.get('test_kill_noop'):
+            # the RF2 test: this stuck process ignores the list (synthetic: a process inside a stuck driver call cannot act on it)
+            self.log(f'list {g}: my node is replaced; test_kill_noop: this process stays (synthetic leftover)')
+            return
         if self.rank in lost:                 # before any revoke: this process leaves (its GPU may be the faulty one)
             why = 'my node is replaced'
             self.log(f'list {g}: {why}; exiting')
