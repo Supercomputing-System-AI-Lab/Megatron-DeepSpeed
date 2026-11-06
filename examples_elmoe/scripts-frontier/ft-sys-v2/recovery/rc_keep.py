@@ -96,6 +96,10 @@ class Keep:
         if out_dir:
             os.makedirs(os.path.join(out_dir, 'keep'), exist_ok=True)
             self.out = os.path.join(out_dir, 'keep', f'rank_{rank}.jsonl')
+        # FTV2_KEEP_ASYNC=1 (the lead, 11-06): the exchange runs on a communicator of its own and the training stream does not
+        # wait for it; the receiving side waits for it on its side stream, before its shadow update
+        self.asyn = _env('FTV2_KEEP_ASYNC', '0') == '1' and not self.check
+        self.pg = None
         self.q = queue.Queue()
         self.worker = None
         self.installed = False
@@ -109,14 +113,18 @@ class Keep:
         self._sums_done = None
 
     # ------------------------------------------------------------------ point-to-point helpers
-    def _exchange(self, send, recv, send_to=None, recv_from=None):
-        """One batched send/receive round: send[k] -> send_to, recv[k] <- recv_from (lists may be empty)."""
-        ops = [dist.P2POp(dist.isend, t, self.partner if send_to is None else send_to) for t in send]
-        ops += [dist.P2POp(dist.irecv, t, self.owner if recv_from is None else recv_from) for t in recv]
+    def _exchange(self, send, recv, send_to=None, recv_from=None, group=None, wait=True):
+        """One batched send/receive round: send[k] -> send_to, recv[k] <- recv_from (lists may be empty). wait=False returns the
+        works without making the current stream wait for them (the asynchronous Keep)."""
+        ops = [dist.P2POp(dist.isend, t, self.partner if send_to is None else send_to, group=group) for t in send]
+        ops += [dist.P2POp(dist.irecv, t, self.owner if recv_from is None else recv_from, group=group) for t in recv]
         if not ops:
-            return
-        for w in dist.batch_isend_irecv(ops):
-            w.wait()
+            return []
+        works = dist.batch_isend_irecv(ops)
+        if wait:
+            for w in works:
+                w.wait()
+        return works
 
     # ------------------------------------------------------------------ seeding (after every build)
     def _alloc_shadow(self, k, numel):
@@ -138,9 +146,11 @@ class Keep:
         """Every owner sends its full state to its partner; every partner stores its owner's as the shadow. Collective over the
         world (every rank sends once and receives once). Returns seconds."""
         t0 = time.time()
+        if self.asyn and self.pg is None:
+            self.pg = dist.new_group(list(range(self.world)))     # every rank, same order (seed is collective)
         sizes = torch.tensor([t.numel() for _, t in self.slots], dtype=torch.int64, device=self.device)
         theirs = torch.empty_like(sizes)
-        self._exchange([sizes], [theirs])
+        self._exchange([sizes], [theirs], group=self.pg)            # also makes Keep's own communicator on every rank
         if not torch.equal(sizes, theirs):
             raise RuntimeError(f'Keep: my partition sizes {sizes.tolist()} differ from my owner {self.owner}: {theirs.tolist()}')
         # every buffer first (pinned host memory, GPU receive buffers), with no send or receive in flight: a pinned allocation
@@ -169,6 +179,7 @@ class Keep:
             self.shadow_step[k], self.shadow_v[k] = int(st[0]), int(st[1])
             del rp, rm, rv
         self._sync()
+        self.seed_v = list(self.shadow_v)      # versions the shadow got by seeding, not by a received token
         self._reuse = None
         self._make_optimizers()
         if self.mode == 'cpu' and self.worker is None:
@@ -238,29 +249,50 @@ class Keep:
                                                 float(h['bias_correction']), float(h['step'] + 1), float(v_next)], dtype=torch.float64))
             hy = self.hy_gpu[k]
             hy.copy_(self.hy_host[k], non_blocking=cuda)          # pinned buffer made at seeding: no host wait, no allocation
-            send, recv = [p.grad.detach(), hy], [self.gpu_recv[k], self.hyper_r[k]]
+            send, recv = [p.grad.detach()], [self.gpu_recv[k]]
             chk = None
             if self.check:
                 chk = torch.empty(p.numel(), dtype=torch.float32, device=self.device)
                 send.append(p.detach())
                 recv.append(chk)
             e0 = self._ev() if cuda else None
-            self._exchange(send, recv)
-            e1 = self._ev() if cuda else None
+            # the gradient first, then the token (the hyperparameters with the version) in a second round: one communicator runs
+            # them in order, so a token that arrived means its gradient arrived; a round cut by a failure leaves the old token,
+            # and the shadow update of that version is not counted (a failure inside the optimizer step -> the window, exit 75)
+            works = self._exchange(send, recv, group=self.pg, wait=not self.asyn)
+            works += self._exchange([hy], [self.hyper_r[k]], group=self.pg, wait=not self.asyn)
+            main = torch.cuda.current_stream() if cuda else None
+            if self.asyn and cuda:
+                with torch.cuda.stream(self.side):
+                    for w in works:
+                        w.wait()                                # the side stream, not the training stream, waits
+                    e1 = torch.cuda.Event(enable_timing=True); e1.record(self.side)
+                p.grad.record_stream(self.side)                 # the gradient is not reused before the send is done
+                self.inflight = works                           # the works live until the next exchange
+            else:
+                e1 = self._ev() if cuda else None
             g['ev_p2p'] = (e0, e1)
             if chk is not None:
                 g['check'] = self._compare(k, chk)
             if self.mode == 'gpu':
-                e2 = self._ev()
-                self._gpu_update(k, h)
-                g['ev_shadow'] = (e2, self._ev())
-                self.shadow_v[k], self.shadow_step[k] = v_next, h['step'] + 1
+                if self.asyn and cuda:
+                    with torch.cuda.stream(self.side):
+                        e2 = torch.cuda.Event(enable_timing=True); e2.record(self.side)
+                        self._gpu_update(k, h)
+                        e3 = torch.cuda.Event(enable_timing=True); e3.record(self.side)
+                    self.d2h_done[k] = e3                       # the next exchange into gpu_recv[k] waits for this update
+                    g['ev_shadow'] = (e2, e3)
+                else:
+                    e2 = self._ev()
+                    self._gpu_update(k, h)
+                    g['ev_shadow'] = (e2, self._ev())
+                self.shadow_v[k], self.shadow_step[k] = v_next, h['step'] + 1   # checked against the token at report()
             else:
                 self.idle[k].clear()
                 if cuda:
-                    main = torch.cuda.current_stream()          # the stream that waits for the receive (w.wait() above)
                     with torch.cuda.stream(self.side):
-                        self.side.wait_stream(main)
+                        if not self.asyn:
+                            self.side.wait_stream(main)         # the training stream waited for the receive (w.wait())
                         d0 = torch.cuda.Event(enable_timing=True); d0.record(self.side)
                         self.host_grad[k].copy_(self.gpu_recv[k], non_blocking=True)
                         self.host_hyper[k].copy_(self.hyper_r[k], non_blocking=True)
@@ -331,6 +363,9 @@ class Keep:
                 t1 = time.time()
                 hy = self.host_hyper[k].tolist()
                 lr, wd, b1, b2, eps, bc, step, ver = hy
+                if int(ver) != v_next:                 # the token of this version never arrived: the gradient may be partial
+                    g['error'] = f'stale token {int(ver)} for version {v_next}: shadow update skipped'
+                    continue
                 sp, sm, sv = self.shadow[k]
                 grad = self.host_grad[k]
                 if self.cpu_impl == 'torch':
@@ -441,4 +476,18 @@ class Keep:
             self.pending.pop(v, None)
 
     def report(self):
-        return {'own': list(self.own), 'shadow': list(self.shadow_v), 'owner': self.owner, 'partner': self.partner}
+        """Versions after a stop (the GPU idle). A GPU-shadow update counts only if its token arrived (the CPU worker checks it
+        before it updates); an update that ran on a receive cut by the failure is reported as version -1 (not restorable)."""
+        shadow = list(self.shadow_v)
+        if self.mode == 'gpu':
+            for k in range(len(shadow)):
+                try:
+                    tok = int(self.hyper_r[k][7].item())
+                except Exception:
+                    tok = None
+                if tok is not None and tok != shadow[k] and shadow[k] != self._seed_version_of(k):
+                    shadow[k] = -1
+        return {'own': list(self.own), 'shadow': shadow, 'owner': self.owner, 'partner': self.partner}
+
+    def _seed_version_of(self, k):
+        return getattr(self, 'seed_v', [None] * len(self.slots))[k]
