@@ -135,6 +135,12 @@ def recovery(arm):
             v = [r['times'][p] - t0 for r in recs if t0 and r['times'].get(p)]
             if v:
                 print(f'| {p} | {len(v)} | {statistics.median(v):.2f} | {max(v):.2f} |')
+        sent = {r['checksums']['sent_to']: r['checksums']['sent'] for r in recs if (r.get('checksums') or {}).get('sent')}
+        got = {r['rank']: r['checksums']['received'] for r in recs if (r.get('checksums') or {}).get('received')}
+        if sent or got:
+            same = [o for o in sent if got.get(o) == sent[o]]
+            print(f'shadow transfer: {len(same)} of {len(sent)} joiners received exactly what their shadow holder sent '
+                  f'(integer checksums of fp32, exp_avg, exp_avg_sq per group); joiners reporting: {len(got)}')
         st = [r.get('stop', {}) for r in recs if r.get('stop')]
         if st:
             rv = [s['revoke']['s'] for s in st if 'revoke' in s]

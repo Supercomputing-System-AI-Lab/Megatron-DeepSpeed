@@ -11,7 +11,8 @@
 #   environment (the arm's K=V list).
 # FTV2_ARMS="name1:K=V,K=V name2:K=V": the arms, one after another in the same allocation (default: one arm "main").
 # An arm with FTV2_NO_STANDBY=1 runs on the training nodes only (for an arm with the recovery off, XMOE_FT_V2=0);
-# FTV2_LOSE_NODE=<i>:<step> loses node i at that step (tests/lose_node.sh).
+# FTV2_LOSE_NODE=<i>:<step> loses node i at that step (tests/lose_node.sh); FTV2_DROP_ARGS="--a --b" removes those
+# arguments from the training command (the cold-restart arm drops the template's --finetune to resume fully).
 srun() {
   local x is_train=0 is_cache=0
   for x in "$@"; do
@@ -54,7 +55,11 @@ srun() {
           -n) ta+=(-n "$((nodes_n * g))"); i=$((i + 1)); continue ;;
           --kill-on-bad-exit=1) ta+=(--kill-on-bad-exit=0); continue ;;
         esac
-        if [[ "$x" == *ELMoE_launch.py* ]]; then ta+=("${x//\/rank_/\/$name\/rank_}"); else ta+=("$x"); fi
+        if [[ "$x" == *ELMoE_launch.py* ]]; then
+          x="${x//\/rank_/\/$name\/rank_}"
+          for d in ${FTV2_DROP_ARGS:-}; do x="${x// $d / }"; done     # test arms: e.g. --finetune off for a full resume
+          ta+=("$x")
+        else ta+=("$x"); fi
       done
       echo "[ftv2 srun] $(date '+%T') arm $name ($kv): one step on $w ($((nodes_n * g)) tasks): training tasks 0-$((nt * g - 1)) on $tw$([ "$nodes_n" -gt "$nt" ] && echo ", standby tasks $((nt * g))-$((nodes_n * g - 1)) on $sw"); run $FTV2_RUN" >&2
       if [ -n "${FTV2_LOSE_NODE:-}" ]; then      # test: a node lost at a step (tests/lose_node.sh <index> <step>)

@@ -56,6 +56,13 @@ class MegatronTrainer:
         from megatron.core import mpu, tensor_parallel
         from megatron.initialize import _set_random_seed, setup_deepspeed_random_and_activation_checkpointing
         a = get_args()
+        if a.deepspeed:
+            # Megatron's own path (initialize.py:299): DeepSpeed's communication backend over the world that exists; a survivor
+            # has it already (no-op), a standby joining needs it before DeepSpeed's checkpointing.configure (P2 5861808)
+            import deepspeed
+            from datetime import timedelta
+            deepspeed.init_distributed(dist_backend=a.distributed_backend, auto_mpi_discovery=False,
+                                       timeout=timedelta(minutes=a.distributed_timeout_minutes))
         mpu.destroy_model_parallel()
         mpu.initialize_model_parallel(a.tensor_model_parallel_size, a.pipeline_model_parallel_size, a.ds_sequence_parallel_size,
                                       a.virtual_pipeline_model_parallel_size, a.pipeline_model_parallel_split_rank,
@@ -72,6 +79,11 @@ class MegatronTrainer:
     def build_model(self):
         from megatron import get_args
         from megatron.training import setup_model_and_optimizer
+        # pretrain_gpt_deepspeed.model_provider re-reads the rank from MPI when args.using_mpi (an MPI allgather): after a failure
+        # MPI's world holds dead ranks and the standby is not in it (P2b 5861844: the survivors waited in that allgather and the
+        # joiners took MPI ranks 0-7). The environment already holds this process's rank, world size and local rank, so the
+        # rebuild reads them from there (the provider's own non-MPI branch, get_env_variables).
+        get_args().using_mpi = False
         model, optimizer, sched = setup_model_and_optimizer(
             self.model_provider, self.model_type, teacher=False, data_post_process=self.data_post_process,
             build_train_valid_test_datasets_provider=self.data_provider)

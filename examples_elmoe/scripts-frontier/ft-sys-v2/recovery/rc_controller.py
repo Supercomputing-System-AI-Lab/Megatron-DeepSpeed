@@ -301,6 +301,11 @@ class Recovery:
         me = os.environ.get('FTV2_NODE') or __import__('socket').gethostname().split('.')[0]
         self.log(f'standby on {me}: waiting for a failure list that names this node')
         self.prealloc = None
+        if os.environ.get('FTV2_SHADOW', 'cpu') == 'cpu' and os.environ.get('FTV2_CPU_ADAM', 'ds') == 'ds':
+            from rc_keep import _ds_cpu_adam
+            t0 = time.time()
+            _ds_cpu_adam(True)                 # DeepSpeed's CPU Adam op loaded while waiting (P2c: 4-5 s of the joiner's re-seed)
+            self.log(f'standby: DeepSpeed CPU Adam loaded while waiting ({time.time() - t0:.1f} s)')
         while True:
             if self.prealloc is None and os.environ.get('FTV2_SHADOW', 'cpu') == 'cpu':
                 self._prealloc_shadow()
@@ -387,6 +392,8 @@ class Recovery:
             self._exit(EXIT_FAILED, 'exception: recovery failed: resume step far from the report')
         rng_same = len({r.get('rng_md5') for r in reports.values()}) == 1
         timeout_s = float(os.environ.get('FTV2_WORLD_TIMEOUT_S', '600'))
+        done = threading.Event()
+        threading.Thread(target=self._join_watch, args=(g, done), daemon=True).start()
         try:
             rc_world.make_world(e, g, self.rank, world, host, timeout_s, self.log)
             rc_world.world_barrier(self.device)
@@ -397,14 +404,16 @@ class Recovery:
             self.mark(g, 'model_built')
             adapter = ZeroAdapter(model[0])
             # restore: own kept tensors, or the shadow from the rank that keeps it (point to point)
+            sums = None
             if role == 'joiner':
                 holder = (self.rank + stride) % world
                 states = Keep.recv_state(adapter.slots(), holder, self.device)
                 src = f'shadow of rank {holder}'
+                sums = {'received': [st['checksum'] for st in states]}
             else:
                 for o in lost:
                     if (o + stride) % world == self.rank:
-                        old_keep.send_shadow(o)
+                        sums = {'sent_to': o, 'sent': old_keep.send_shadow(o)}
                 states, src = kept, 'own'
             if self.device.type == 'cuda':
                 torch.cuda.synchronize(self.device)
@@ -436,10 +445,15 @@ class Recovery:
             raise
         except BaseException as ex:
             self.log(f'recovery {g} failed: {ex!r}'[:400])
+            try:
+                e.put(f'rc/{g}/failed/{self.rank}', json.dumps({'t': round(time.time(), 3), 'err': repr(ex)[:300]}))
+            except Exception:
+                pass
             import traceback
             traceback.print_exc()
             self.write_times(g, {'exit': repr(ex)[:300], 'code': EXIT_FAILED})
             self._exit(EXIT_FAILED, f'exception: recovery failed: {ex!r}'[:200])
+        done.set()
         self.adapter, self.keep = adapter, keep
         self.hb.S['on_step'] = self._on_step
         self.recovered += 1
@@ -450,10 +464,23 @@ class Recovery:
         mem = torch.cuda.memory_allocated(self.device) / 1e9 if self.device.type == 'cuda' else 0
         self.log(f'recovery {g} ready: resume at step {s} (samples {cnt["samples"]}), state from {src}, '
                  f'rng snapshots equal on every survivor: {rng_same}, re-seed {reseed_s} s, {mem:.2f} GB allocated')
-        self.write_times(g, {'resume_step': s, 'state_from': src, 'rng_same': rng_same, 'reseed_s': reseed_s,
+        self.write_times(g, {'resume_step': s, 'state_from': src, 'rng_same': rng_same, 'reseed_s': reseed_s, 'checksums': sums,
                              'counters': cnt, 'lost': lost, 'kind': f.get('kind'), 'node': f.get('node'),
                              'standby': f.get('standby')})
         return [model, optimizer, sched, train_it, valid_it]
+
+    def _join_watch(self, g, done):
+        """While this rank rebuilds: if another rank's rebuild failed (rc/<g>/failed/), this one is blocked in a collective with
+        it for good (async error handling is off); end it, so the arm ends instead of waiting for the wall (P2 5861808)."""
+        while not done.wait(2.0):
+            try:
+                got, _ = self.etcd().range(f'rc/{g}/failed/')
+            except Exception:
+                continue
+            if got:
+                self.log(f'recovery {g}: rank(s) {sorted(k.rsplit("/", 1)[1] for k in got)} failed their rebuild; ending')
+                self.write_times(g, {'exit': 'another rank failed its rebuild', 'code': EXIT_FAILED})
+                self._exit(EXIT_FAILED, 'exception: recovery failed on another rank')
 
     # ------------------------------------------------------------------ the end
     def final_fingerprint(self):
@@ -482,8 +509,10 @@ class Recovery:
                 self.etcd().put(f'run_done/{self.base_run}', json.dumps({'t': round(time.time(), 3)}))
             except Exception:
                 pass
-        if self.recovered:
-            self.log('training done after a recovery: exiting without MPI finalize (dead ranks of the first world)')
+        if self.recovered or os.environ.get('FTV2_ONE_STEP') == '1':
+            # MPI's finalize is collective over the step's first world: dead ranks after a recovery, and the standby tasks
+            # (which leave with os._exit) in every one-step run, would hold it forever (HB3 5855079 saw such a barrier)
+            self.log('training done: exiting without MPI finalize' + (' (after a recovery)' if self.recovered else ''))
             self._exit(0, 'finished')
 
     def _exit(self, code, reason):

@@ -28,7 +28,7 @@ nothing here is imported and training is unchanged.
 | `adapters/deepspeed_zero.py` | the optimizer adapter (DeepSpeed ZeRO stage 1 or 2) | DeepSpeed |
 | `adapters/megatron_train.py` | the trainer adapter (Megatron-DeepSpeed's training.py) | Megatron |
 | `launch/ftv2_sbatch.sh` | the 0623 launcher's `AUTORUN_SBATCH_CMD`: +1 node, `--no-kill` | Slurm |
-| `launch/ftv2_srun.sh` | sourced by `AUTORUN_PRE_CMD`: the training and standby steps of each arm (`FTV2_ARMS`) | Slurm |
+| `launch/ftv2_srun.sh` | sourced by `AUTORUN_PRE_CMD`: one Slurm step per arm (`FTV2_ARMS`) holding the training tasks and, after them, the standby's tasks | Slurm |
 | `tests/cpu_keep_test.py`, `tests/cpu_world_test.py`, `tests/cpu_adam_bench.py` | login-node checks (gloo) | |
 | `rc_report.py` | the summary of a job's recoveries and keep records | |
 
@@ -60,6 +60,19 @@ ranks, and the standby node that takes them" (fields `ranks`, `standby`, `replac
 the layout's world size and this process's rank in it and calls the same build. A plan with another world size (the OOM ladder:
 fewer or more GPUs, another TP or EP) adds (1) its layout fields in the list, (2) the rank map in `_join`, and (3) a restore that
 re-splits the state instead of copying it (`put_state` from gathered full tensors, as the toy's `re_split_state_after_shrink`).
+
+## Launch facts the code depends on (found on the GPUs, 2026-11-06)
+
+- **One Slurm step.** Frontier's Slurm gives each step its own Slingshot VNI (`SwitchParameters ... job_vni=user`), so processes
+  of two steps cannot reach each other over the network: a standby started as its own step failed the new world's first
+  collective (P1c 5861771). The standby's tasks are tasks `FTV2_WORLD ..` of the training's own step; every process splits MPI's
+  `COMM_WORLD` by role at start (`rc_controller.split_mpi_world`), because Megatron and DeepSpeed read their rank from it.
+- **No MPI after a failure.** MPI's world then holds dead ranks: the rebuild reads ranks from the environment
+  (`args.using_mpi = False`), and every rank of a one-step run leaves with `os._exit` after training (MPI's finalize would wait for
+  the dead ranks and for the standby's tasks). An exit record is written first, or the node's agent reads a kill.
+- **A non-zero exit ends the step.** In one step, a task that exits with a non-zero code makes Slurm end every task (SIGTERM);
+  a rank killed by a signal does not. So the recovery's own failure exits (74-77) end the arm at once, which is what they mean.
+- **No pinned allocation between batched sends** (P1b 5861716): Keep allocates every buffer before its first exchange.
 
 ## Settings
 

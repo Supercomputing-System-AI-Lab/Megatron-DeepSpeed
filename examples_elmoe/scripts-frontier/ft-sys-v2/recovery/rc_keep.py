@@ -33,6 +33,11 @@ MB = 1 << 20
 _DS_CPU_ADAM = {}
 
 
+def checksum(t):
+    """An exact fingerprint of a float32 tensor: the sum of its bit patterns as integers (on the tensor's device)."""
+    return int(t.detach().contiguous().view(torch.int32).to(torch.int64).sum().item())
+
+
 def _ds_cpu_adam(adamw):
     """DeepSpeed's CPU Adam kernel object, made once per process and mode (its construction loads the op, about 1.4 s)."""
     if adamw not in _DS_CPU_ADAM:
@@ -331,13 +336,17 @@ class Keep:
 
     # ------------------------------------------------------------------ restore helpers (a joiner's state from its shadow)
     def send_shadow(self, to_rank):
-        """Send the shadow I keep (of my owner) to `to_rank`, group by group: fp32, exp_avg, exp_avg_sq, [step, version]."""
+        """Send the shadow I keep (of my owner) to `to_rank`, group by group: fp32, exp_avg, exp_avg_sq, [step, version].
+        Returns the integer checksum of every tensor sent (the receiver computes the same on what it got)."""
+        sums = []
         for k, (gi, p) in enumerate(self.slots):
             parts = [t.to(self.device, non_blocking=False) if t.device != self.device else t for t in self.shadow[k]]
+            sums.append([checksum(t) for t in parts])
             meta = torch.tensor([float(self.shadow_step[k]), float(self.shadow_v[k])], dtype=torch.float64, device=self.device)
             self._exchange(parts + [meta], [], send_to=to_rank)
             self._sync()
             del parts
+        return sums
 
     @staticmethod
     def recv_state(slots, from_rank, device):
@@ -352,7 +361,8 @@ class Keep:
             if device.type == 'cuda':
                 torch.cuda.synchronize(device)
             st, ver = meta.tolist()
-            out.append({'fp32': parts[0], 'exp_avg': parts[1], 'exp_avg_sq': parts[2], 'step': int(st), 'version': int(ver)})
+            out.append({'fp32': parts[0], 'exp_avg': parts[1], 'exp_avg_sq': parts[2], 'step': int(st), 'version': int(ver),
+                        'checksum': [checksum(t) for t in parts]})
         return out
 
     # ------------------------------------------------------------------ records
