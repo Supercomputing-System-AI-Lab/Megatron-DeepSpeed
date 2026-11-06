@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""cpu_commit_test.py (ft-sys-v2 recovery tests, milestone 2, 2026-11-06): the commit protocol on the login node, CPU and gloo.
+
+Four processes (two "nodes" of two ranks, stride 2), two groups of partial sums each, a stand-in adapter that keeps the sums the way
+ZeRO stage 2 does (a list of tensors per group). One step of 6 micro-batches, commits every k (k = 1 and k = 2):
+  1. micro-batches 0..4 are summed and committed; then a stop arrives during micro-batch 5's epilogue on every rank: the piece just
+     added is dropped (rollback to the last commit);
+  2. decide_microbatch() from the survivors' reports with rank 3 lost: the resume point J;
+  3. rank 3 (the joiner) receives its sums at J from rank 1's copy; every other rank takes its own snapshot at J;
+  4. the sums at J are compared with the exact reference (the sum of the first J pieces), and the copies are re-seeded.
+Also decide_microbatch() cases: a rank one commit ahead (allowed), two ahead (window), a lost owner's copy at another position.
+    python tests/cpu_commit_test.py   (the venv's python)"""
+import json
+import os
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+RC = os.path.dirname(HERE)
+sys.path.insert(0, RC)
+SIZES = [50, 37]
+M = 6
+
+
+def piece(rank, mb, gi, n):
+    import torch
+    return torch.arange(n, dtype=torch.float32) * 0 + float(1000 * rank + 10 * mb + gi)     # integers: exact sums
+
+
+class FakeZero2Adapter:
+    """What the commit hook reads from DeepSpeed's ZeRO stage 2: per group a list of tensors (here one) holding the sum."""
+    def __init__(self):
+        self.avg = {}
+
+    def zero2_groups(self):
+        return list(range(len(SIZES)))
+
+    def zero2_partition_size(self, i):
+        return SIZES[i]
+
+    def zero2_dtype(self):
+        import torch
+        return torch.float32
+
+    def zero2_flat_partial(self, i):
+        import torch
+        return self.avg[i][0].clone() if self.avg.get(i) else torch.zeros(SIZES[i])
+
+    def zero2_set_partial(self, i, flat):
+        self.avg[i] = None if flat is None else [flat.clone()]
+
+    def add_piece(self, rank, mb):
+        for i in range(len(SIZES)):
+            p = piece(rank, mb, i, SIZES[i])
+            self.avg[i] = [p] if not self.avg.get(i) else [self.avg[i][0] + p]
+
+
+def worker(rank, port, k, out):
+    import torch
+    import torch.distributed as dist
+    os.environ['FTV2_PARTNER_STRIDE'] = '2'
+    os.environ['FTV2_COMMIT_K'] = str(k)
+    from rc_commit import Commit, decide_microbatch
+    store = dist.TCPStore('127.0.0.1', port, 4, is_master=(rank == 0))
+    dist.init_process_group('gloo', store=store, rank=rank, world_size=4)
+    dev = torch.device('cpu')
+    ad = FakeZero2Adapter()
+    c = Commit(ad, rank, 4, dev, lambda m: None)
+    c.set_position(7, 0, None)
+    c.seed(7, 0, None)
+    for mb in range(M - 1):
+        ad.add_piece(rank, mb)
+        c.after_epilogue(False, False)
+    ad.add_piece(rank, M - 1)                       # micro-batch 5: the stop arrives during its epilogue
+    c.after_epilogue(True, False)
+    reports = [None] * 4
+    dist.all_gather_object(reports, c.report())
+    lost = [3]
+    surv = {r: reports[r] for r in range(4) if r not in lost}
+    ok, J, why = decide_microbatch(surv, lost, 4, 2, 7)
+    res = {'rank': rank, 'k': k, 'decide': [ok, J, why], 'report': c.report()}
+    if rank == 3:                                   # the joiner: its sums at J from rank 1's copy
+        flats = [torch.empty(n) for n in SIZES]
+        for w in dist.batch_isend_irecv([dist.P2POp(dist.irecv, t, 1) for t in flats]):
+            w.wait()
+    else:
+        if rank == 1:
+            for w in dist.batch_isend_irecv([dist.P2POp(dist.isend, t, 3) for t in c.copy_of(7, J)]):
+                w.wait()
+        flats = c.target(J)
+    ref = [sum(piece(rank, mb, i, SIZES[i]) for mb in range(J)) if J > 0 else torch.zeros(SIZES[i]) for i in range(len(SIZES))]
+    got = flats if flats is not None else [torch.zeros(n) for n in SIZES]
+    res['exact'] = all(torch.equal(a, b) for a, b in zip(got, ref))
+    c2 = Commit(ad, rank, 4, dev, lambda m: None)
+    c2.set_position(7, J, flats)
+    c2.seed(7, J, flats)
+    res['reseeded_token'] = [int(x) for x in c2.tok_cur.tolist()]
+    with open(f'{out}.{rank}', 'w') as fh:
+        json.dump(res, fh)
+    dist.destroy_process_group()
+
+
+def decide_cases():
+    from rc_commit import decide_microbatch
+    fails = []
+    rep = lambda c, cur, prv, k=1: {'commit_step': 7, 'commit_c': c, 'commit_k': k, 'copy_cur': cur, 'copy_prev': prv}
+    cases = [
+        ('all at 4, copy at 4', {0: rep(4, [7, 4], [7, 3]), 1: rep(4, [7, 4], [7, 3]), 2: rep(4, [7, 4], [7, 3])}, (True, 4)),
+        ('one rank one commit ahead', {0: rep(5, [7, 5], [7, 4]), 1: rep(4, [7, 4], [7, 3]), 2: rep(4, [7, 4], [7, 3])}, (True, 4)),
+        ('the copy one ahead (previous holds J)', {0: rep(4, [7, 4], [7, 3]), 1: rep(4, [7, 5], [7, 4]), 2: rep(4, [7, 4], [7, 3])}, (True, 4)),
+        ('two ahead: window', {0: rep(6, [7, 6], [7, 5]), 1: rep(4, [7, 4], [7, 3]), 2: rep(4, [7, 4], [7, 3])}, (False, None)),
+        ('copy cut (-1): window', {0: rep(4, [7, 4], [7, 3]), 1: rep(4, [-1, -1], [7, 2]), 2: rep(4, [7, 4], [7, 3])}, (False, None)),
+        ('no commit yet: step start', {0: rep(0, [7, 0], [-1, -1]), 1: rep(0, [7, 0], [-1, -1]), 2: rep(0, [7, 0], [-1, -1])}, (True, 0)),
+    ]
+    for name, reps, want in cases:
+        ok, J, why = decide_microbatch(reps, [3], 4, 2, 7)
+        good = (ok, J) == want
+        print(f'{"PASS" if good else "FAIL"}  decide: {name}: got {(ok, J)} ({why}), want {want}')
+        if not good:
+            fails.append(name)
+    return fails
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == '--worker':
+        worker(int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5])
+        return
+    fails = decide_cases()
+    env = {k: v for k, v in os.environ.items() if 'proxy' not in k.lower()}
+    for k in (1, 2):
+        out = os.path.join(os.environ.get('TMPDIR', '/tmp'), f'cpu_commit_{os.getpid()}_{k}')
+        port = 25300 + os.getpid() % 500 + k
+        ps = [subprocess.Popen([sys.executable, os.path.abspath(__file__), '--worker', str(r), str(port), str(k), out], env=env)
+              for r in range(4)]
+        codes = [p.wait(timeout=300) for p in ps]
+        rs = [json.load(open(f'{out}.{r}')) for r in range(4) if os.path.exists(f'{out}.{r}')]
+        if codes != [0] * 4 or len(rs) != 4:
+            print(f'FAIL  k={k}: exit codes {codes}')
+            fails.append(f'k={k}')
+            continue
+        J = rs[0]['decide'][1]
+        want_J = (M - 1) // k * k if (M - 1) // k * k < M else 0   # the last commit before the stop (micro-batches 0-4 done)
+        exact = all(r['exact'] for r in rs)
+        tok = {tuple(r['reseeded_token']) for r in rs}
+        good = rs[0]['decide'][0] and J == want_J and exact and tok == {(7, J)}
+        print(f'{"PASS" if good else "FAIL"}  k={k}: resume at micro-batch {J} (want {want_J}); sums at J exact on every rank '
+              f'(the joiner from its partner\'s copy): {exact}; re-seeded tokens {sorted(tok)}')
+        if not good:
+            fails.append(f'k={k}')
+    print(f'\n{len(fails)} failed' if fails else '\nall passed')
+    sys.exit(1 if fails else 0)
+
+
+if __name__ == '__main__':
+    main()

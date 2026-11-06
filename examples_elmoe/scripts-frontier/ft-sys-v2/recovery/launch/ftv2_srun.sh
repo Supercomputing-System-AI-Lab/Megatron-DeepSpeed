@@ -48,7 +48,7 @@ srun() {
       IFS=, read -ra kvs <<< "$kv"
       for e in "${kvs[@]}"; do [ -n "$e" ] && export "$e"; done
       # a failure arm records the optimizer state's fingerprint at the step ends around the failure (M1-B's restore check)
-      fs=""; [ -n "${FTV2_INJECT:-}" ] && fs=${FTV2_INJECT##*:}; [ -n "${FTV2_LOSE_NODE:-}" ] && fs=${FTV2_LOSE_NODE##*:}
+      fs=""; [ -n "${FTV2_INJECT:-}" ] && fs=$(echo "$FTV2_INJECT" | cut -d: -f3); [ -n "${FTV2_LOSE_NODE:-}" ] && fs=$(echo "$FTV2_LOSE_NODE" | cut -d: -f2)
       if [ -n "$fs" ] && [ -z "${FTV2_STEP_SUMS_FROM:-}" ]; then export FTV2_STEP_SUMS_FROM=$((fs - 1)) FTV2_STEP_SUMS_TO=$((fs + 1)); fi
       if [ "${FTV2_NO_STANDBY:-0}" = 1 ] || [ "$ns" = 0 ]; then nodes_n=$nt; w=$tw; else nodes_n=$nn; w=$aw; fi
       ta=()

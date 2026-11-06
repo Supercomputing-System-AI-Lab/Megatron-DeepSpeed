@@ -304,6 +304,11 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     return input_tensor_grad
 
 
+# [ft-sys-v2 2026-11-06] milestone 2's resume point inside a step: a recovery that resumes at micro-batch J sets this to J for the
+# next call only (examples_elmoe/scripts-frontier/ft-sys-v2/recovery/rc_commit.py); 0, the default, is the unchanged schedule.
+FTV2_START_MICROBATCH = 0
+
+
 def forward_backward_no_pipelining(*,
                                    forward_step_func,
                                    data_iterator: Union[Iterator, List[Iterator]],
@@ -349,8 +354,11 @@ def forward_backward_no_pipelining(*,
 
     forward_data_store = []
     input_tensor, output_tensor_grad = None, None
+    global FTV2_START_MICROBATCH
+    start, FTV2_START_MICROBATCH = FTV2_START_MICROBATCH, 0      # [ft-sys-v2] the micro-batches before it are in the sums already
+    assert 0 <= start <= num_microbatches - 1, f'resume micro-batch {start} of {num_microbatches}'
     with no_sync_func():
-        for i in range(num_microbatches - 1):
+        for i in range(start, num_microbatches - 1):
             output_tensor = forward_step(forward_step_func, data_iterator, model, num_microbatches,
                                          input_tensor, forward_data_store, config, collect_non_loss_data)
             if not forward_only:

@@ -15,7 +15,8 @@ ft-sys-v2/recovery/rc_stop.py, 2026-11-06). The recovery's one hook in the count
 raises StopForRecovery in the calling thread (the toy's before_communication_call, recovery_core.py:186-192).
 Fault injection for tests (FTV2_INJECT, comma-separated): hang:<rank>:<step>, kill:<rank>:<step>, exit:<rank>:<step>,
 oom:<rank>:<step>, oomstuck:<rank>:<step> (the same, then the exit blocks), abort:<rank>:<step>, hip:<rank>:<step> (a GPU
-memory access fault from a HIP kernel, FTV2_HIP_FAULT_SO), pause:all:<step>:<seconds>, slow:<rank>:<step>:<milliseconds>.
+memory access fault from a HIP kernel, FTV2_HIP_FAULT_SO), pause:all:<step>:<seconds>, slow:<rank>:<step>:<milliseconds>; kill, hang, hip, abort and exit take an optional 4th field, the
+micro-batch of the step to fire at (the micro-batches done, as the recovery's commit hook counts them; milestone 2).
 Each fires before a communication call of that step; an injection fires once per process (a rank that recovers does not fire it
 again)."""
 import atexit
@@ -57,6 +58,8 @@ def _inject():
         if j['done'] or S['step'] < j['step'] or (j['rank'] != 'all' and int(j['rank']) != S['rank']):
             continue
         k = j['kind']
+        if k in ('kill', 'hang', 'hip', 'abort', 'exit') and j['arg'] and S['step'] == j['step'] and S['micro_batch'] < j['arg']:
+            continue                                   # kind:<rank>:<step>:<micro-batch>: wait for that micro-batch of the step
         if k == 'slow':
             time.sleep(j['arg'] / 1000.0)              # every call from this step on: a slow rank, not a hang
             continue

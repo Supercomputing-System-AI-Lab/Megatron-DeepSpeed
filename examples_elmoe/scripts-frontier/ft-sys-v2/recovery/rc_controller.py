@@ -36,6 +36,7 @@ if HERE not in sys.path:
 import rc_stop
 import rc_world
 from rc_keep import Keep
+from rc_commit import Commit, decide_microbatch
 from adapters.deepspeed_zero import ZeroAdapter
 
 EXIT_NEIGHBOURS, EXIT_WINDOW, EXIT_NO_PLAN, EXIT_FAILED = 74, 75, 76, 77
@@ -82,6 +83,8 @@ class Recovery:
         self.standby_list = None
         self.standby_event = threading.Event()
         self._etcd = None
+        self.commit = None
+        self.commit_on = os.environ.get('FTV2_COMMIT') == '1'   # milestone 2: commits inside the step (ZeRO stage 2)
         if os.environ.get('FTV2_DETERMINISTIC') == '1':
             self.deterministic_mode()
 
@@ -180,6 +183,7 @@ class Recovery:
                          out_dir=os.path.join(self.out, 'ft') if self.out else None)
         self.keep.seed()
         self.keep.install()
+        self._start_commit(self.adapter, int(version), 0, None)
         stride = int(os.environ.get('FTV2_PARTNER_STRIDE', '8'))
         if self.rank < stride:                 # the sizes a standby needs to pre-allocate its shadow while it waits
             try:
@@ -187,8 +191,34 @@ class Recovery:
             except Exception as e:
                 self.log(f'keep sizes not published: {e!r}'[:200])
 
+    def _start_commit(self, adapter, step, J, flats):
+        """Milestone 2 on a (re)built engine: its own communicator (collective), the epilogue hook, the copies seeded at (step, J)."""
+        if not self.commit_on:
+            return
+        if not getattr(adapter.zero, 'partition_gradients', False):
+            self.log('FTV2_COMMIT=1 needs ZeRO stage 2 (per-micro-batch reduction): commits off')
+            self.commit_on = False
+            return
+        pg = dist.new_group(list(range(self.world)))
+        c = Commit(adapter, self.rank, self.world, self.device, self.log, group=pg)
+        c.set_position(step, J, flats)
+        c.seed(step, J, flats)
+        adapter.wrap_epilogue(self._commit_after)
+        self.commit = c
+        self.log(f'commits on: every {c.k} micro-batch(es), async {c.asyn}, position step {step} micro-batch {J}')
+
+    def _commit_after(self, last):
+        stopping = bool(self.hb.S.get('stop'))
+        self.commit.after_epilogue(stopping, last)
+        self.hb.S['micro_batch'] = self.commit.added           # the heartbeat line's micro-batch (and the tests' injection point)
+        if stopping:
+            raise self.hb.StopForRecovery('a stop began during a micro-batch epilogue')
+
     def _on_step(self, iteration):
         """The top of every training iteration (hb_monitor.set_step): counters and RNG as they are at this step's start."""
+        if self.commit is not None and self.commit.step != iteration:
+            self.commit.begin_step(iteration)
+            self.hb.S['micro_batch'] = 0
         try:
             self.step_snap = {'iteration': iteration, 'counters': self.tr.counters(), 'inc': self.tr.increments(),
                               'rng': self.tr.rng_snapshot()}
@@ -297,9 +327,12 @@ class Recovery:
         rep = dict(self.keep.report(), base=self.step_snap.get('counters'), inc=self.step_snap.get('inc'),
                    base_iteration=self.step_snap.get('iteration'), drained=ok,
                    rng_md5=hashlib.md5(pickle.dumps(self.step_snap.get('rng'))).hexdigest() if self.step_snap.get('rng') else None)
+        if self.commit is not None:
+            rep.update(self.commit.report())
         self.etcd().put(f'rc/{g}/report/{self.rank}', json.dumps(rep))
         self.mark(g, 'reported')
         kept = self.adapter.take_state()
+        self.old_commit, self.commit = self.commit, None
         old_keep = self.keep
         old_keep.gpu_recv = [None] * len(old_keep.gpu_recv)
         self.adapter.release()
@@ -410,6 +443,13 @@ class Recovery:
         else:
             self.write_times(g, {'exit': f'step {s} far from the host report {hrep["base_iteration"]}', 'code': EXIT_FAILED})
             self._exit(EXIT_FAILED, 'exception: recovery failed: resume step far from the report')
+        J = 0
+        if self.commit_on:
+            okc, J, whyc = decide_microbatch(reports, lost, world, stride, s)
+            self.log(f'commit decision: {whyc}')
+            if not okc:
+                self.write_times(g, {'exit': whyc, 'code': EXIT_WINDOW})
+                self._exit(EXIT_WINDOW, f'exception: recovery stopped (75): {whyc}')
         rng_same = len({r.get('rng_md5') for r in reports.values()}) == 1
         timeout_s = float(os.environ.get('FTV2_WORLD_TIMEOUT_S', '600'))
         done = threading.Event()
@@ -439,6 +479,26 @@ class Recovery:
                 torch.cuda.synchronize(self.device)
             self.mark(g, 'state_moved')
             adapter.put_state(states)
+            flats = None
+            if self.commit_on and J > 0:                     # milestone 2: the partial sums of the step at micro-batch J
+                old_c = getattr(self, 'old_commit', None)
+                if role == 'joiner':
+                    holder = (self.rank + stride) % world
+                    flats = [torch.empty(adapter.zero2_partition_size(i), dtype=adapter.zero2_dtype(), device=self.device)
+                             for i in adapter.zero2_groups()]
+                    for w in dist.batch_isend_irecv([dist.P2POp(dist.irecv, t, holder) for t in flats]):
+                        w.wait()
+                else:
+                    for o in lost:
+                        if (o + stride) % world == self.rank:
+                            cp = old_c.copy_of(s, J)
+                            for w in dist.batch_isend_irecv([dist.P2POp(dist.isend, t, o) for t in cp]):
+                                w.wait()
+                    flats = old_c.target(J)
+                if self.device.type == 'cuda':
+                    torch.cuda.synchronize(self.device)
+                for n, i in enumerate(adapter.zero2_groups()):
+                    adapter.zero2_set_partial(i, None if flats is None else flats[n])
             if os.environ.get('FTV2_STEP_SUMS_FROM') and self.out:
                 from rc_keep import state_fingerprint
                 sums_, samples_ = state_fingerprint(adapter)        # M1-B: the restored state, to compare with the step-end one
@@ -459,12 +519,18 @@ class Recovery:
                 self.tr.rng_restore(snap[0])
             self.mark(g, 'restore_done')
             train_it, valid_it, test_it = self.tr.build_data()
+            if J > 0:                                        # milestone 2: the step resumes at micro-batch J
+                for _ in range(J):
+                    next(train_it)
+                import megatron.core.pipeline_parallel.schedules as sch
+                sch.FTV2_START_MICROBATCH = J
             self.mark(g, 'data_built')
             keep = Keep(adapter, self.rank, world, self.device, self.log, s,
                         out_dir=os.path.join(self.out, 'ft') if self.out else None,
                         reuse=old_keep if role == 'survivor' else getattr(self, 'prealloc', None))
             reseed_s = keep.seed()
             keep.install()
+            self._start_commit(adapter, s, J, flats if self.commit_on else None)
             self.mark(g, 'reseed_done')
             rc_world.world_barrier(self.device)
             self.mark(g, 'ready')
@@ -491,7 +557,8 @@ class Recovery:
         mem = torch.cuda.memory_allocated(self.device) / 1e9 if self.device.type == 'cuda' else 0
         self.log(f'recovery {g} ready: resume at step {s} (samples {cnt["samples"]}), state from {src}, '
                  f'rng snapshots equal on every survivor: {rng_same}, re-seed {reseed_s} s, {mem:.2f} GB allocated')
-        self.write_times(g, {'resume_step': s, 'state_from': src, 'rng_same': rng_same, 'reseed_s': reseed_s, 'checksums': sums,
+        self.write_times(g, {'resume_step': s, 'resume_microbatch': J, 'state_from': src, 'rng_same': rng_same,
+                             'reseed_s': reseed_s, 'checksums': sums,
                              'counters': cnt, 'lost': lost, 'kind': f.get('kind'), 'node': f.get('node'),
                              'standby': f.get('standby')})
         return [model, optimizer, sched, train_it, valid_it]

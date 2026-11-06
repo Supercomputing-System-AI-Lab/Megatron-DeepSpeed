@@ -143,6 +143,59 @@ class ZeroAdapter:
         except Exception:
             pass
 
+    # ------------------------------------------------------------------ milestone 2: the partial sums of ZeRO stage 2
+    # (each owner's reduced partition summed over the micro-batches so far: zero.averaged_gradients[i], a list of tensors that
+    # get_flat_partition made, stage_1_and_2.py:785-803)
+    def zero2_groups(self):
+        return list(range(len(self.zero.bit16_groups)))
+
+    def zero2_partition_size(self, i):
+        return int(self.zero.partition_size[i])
+
+    def zero2_dtype(self):
+        return self.zero.gradient_accumulation_dtype
+
+    def zero2_flat_partial(self, i):
+        """A flat copy of group i's partial sum (zeros before the first micro-batch)."""
+        z = self.zero
+        lst = z.averaged_gradients.get(i) if isinstance(z.averaged_gradients, dict) else None
+        if not lst:
+            return torch.zeros(self.zero2_partition_size(i), dtype=self.zero2_dtype(), device=z.device)
+        return z.flatten(lst)
+
+    @torch.no_grad()
+    def zero2_set_partial(self, i, flat):
+        """Group i's partial sum := flat (None: no sum yet, so the next micro-batch starts it, as at a step's start)."""
+        z = self.zero
+        if flat is None:
+            z.averaged_gradients[i] = None
+            return
+        lst = z.averaged_gradients.get(i)
+        if not lst:
+            lst = z.get_flat_partition(z.params_in_partition[i], z.first_offset[i], z.partition_size[i],
+                                       dtype=self.zero2_dtype(), device=z.device, return_tensor_list=True)
+            lst = [t.clone() for t in lst]                 # own storage, never a view of a parameter's gradient
+        off = 0
+        for t in lst:
+            n = t.numel()
+            t.copy_(flat[off:off + n].view_as(t))
+            off += n
+        assert off == flat.numel(), f'group {i}: {off} != {flat.numel()}'
+        z.averaged_gradients[i] = lst
+
+    def wrap_epilogue(self, after):
+        """Milestone 2's hook: after ZeRO's per-micro-batch epilogue (stage 2: the micro-batch's reduced piece was just added to
+        the owner's sums), call after(last), last = the gradient-accumulation boundary. Wrapped on the object."""
+        z = self.zero
+        orig = z.overlapping_partition_gradients_reduce_epilogue
+
+        def epilogue(*a, **k):
+            out = orig(*a, **k)
+            after(bool(getattr(z, 'is_gradient_accumulation_boundary', False)))
+            return out
+        epilogue._ftv2_wrapped = True
+        z.overlapping_partition_gradients_reduce_epilogue = epilogue
+
     # ------------------------------------------------------------------ the GPU shadow (check mode)
     def gpu_shadow_optimizer(self, params):
         cls = type(self.inner)
