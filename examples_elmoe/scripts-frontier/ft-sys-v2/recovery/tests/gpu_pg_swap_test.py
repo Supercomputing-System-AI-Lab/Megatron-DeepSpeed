@@ -133,12 +133,13 @@ def launch():
     out = os.path.join(os.environ.get('TMPDIR', '/tmp'), f'gpu_pg_swap_{os.environ.get("SLURM_JOB_ID", os.getpid())}')
     me = os.path.abspath(__file__)
     base = ['srun', '--overlap', '-N1', '--gpus-per-node=8', '--cpus-per-task=7']
+    pre = f'LD_PRELOAD="{os.environ.get("FTV2_TEST_PRELOAD", "")}" '      # the training's preload (librccl first)
     w = subprocess.Popen(base + ['-n8', '--ntasks-per-node=8', 'bash', '-c',
-                                 f'exec {sys.executable} {me} --worker $SLURM_PROCID {host} {port} first {out}'])
+                                 f'{pre}exec {sys.executable} {me} --worker $SLURM_PROCID {host} {port} first {out}'])
     while not master.check(['lost/7']):
         time.sleep(0.5)
     j = subprocess.Popen(base + ['-n1', 'bash', '-c',
-                                 f'SLURM_LOCALID=7 exec {sys.executable} {me} --worker 7 {host} {port} joiner {out}'])
+                                 f'SLURM_LOCALID=7 {pre}exec {sys.executable} {me} --worker 7 {host} {port} joiner {out}'])
     codes = [w.wait(timeout=600), j.wait(timeout=600)]
     fails = 0
     for f in sorted(x for x in os.listdir(os.path.dirname(out)) if x.startswith(os.path.basename(out))):
