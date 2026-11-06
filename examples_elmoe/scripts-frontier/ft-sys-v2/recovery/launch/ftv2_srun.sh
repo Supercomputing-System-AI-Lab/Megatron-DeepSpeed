@@ -12,7 +12,8 @@
 # FTV2_ARMS="name1:K=V,K=V name2:K=V": the arms, one after another in the same allocation (default: one arm "main").
 # An arm with FTV2_NO_STANDBY=1 runs on the training nodes only (for an arm with the recovery off, XMOE_FT_V2=0);
 # FTV2_LOSE_NODE=<i>:<step> loses node i at that step (tests/lose_node.sh); FTV2_DROP_ARGS="--a --b" removes those
-# arguments from the training command (the cold-restart arm drops the template's --finetune to resume fully).
+# arguments from the training command (the cold-restart arm drops the template's --finetune to resume fully);
+# FTV2_SUB_ARGS="old|new" ('+' stands for a space) replaces one argument string (an arm with another EP on the same nodes).
 srun() {
   local x is_train=0 is_cache=0
   for x in "$@"; do
@@ -62,6 +63,9 @@ srun() {
         if [[ "$x" == *ELMoE_launch.py* ]]; then
           x="${x//\/rank_/\/$name\/rank_}"
           for d in ${FTV2_DROP_ARGS:-}; do x="${x// $d / }"; done     # test arms: e.g. --finetune off for a full resume
+          if [ -n "${FTV2_SUB_ARGS:-}" ]; then                         # test arms: "old|new" ('+' for a space), e.g. another EP
+            sub=${FTV2_SUB_ARGS//+/ }; old=${sub%%|*}; new=${sub#*|}; x="${x// $old / $new }"
+          fi
           ta+=("$x")
         else ta+=("$x"); fi
       done
