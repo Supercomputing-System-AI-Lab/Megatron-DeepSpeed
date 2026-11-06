@@ -2,7 +2,8 @@
 """cpu_commit_test.py (ft-sys-v2 recovery tests, milestone 2, 2026-11-06): the commit protocol on the login node, CPU and gloo.
 
 Four processes (two "nodes" of two ranks, stride 2), two groups of partial sums each, a stand-in adapter that keeps the sums the way
-ZeRO stage 2 does (a list of tensors per group). One step of 6 micro-batches, commits every k (k = 1 and k = 2):
+ZeRO stage 2 does (a list of tensors per group). One step of 6 micro-batches, commits every k (p2p with k = 1 and k = 2; keep with k = 1, where the stand-in all-reduce hands
+each rank its owner's piece of every micro-batch, as adapters/deepspeed_zero.py wrap_reduce_keep does on the GPUs):
   1. micro-batches 0..4 are summed and committed; then a stop arrives during micro-batch 5's epilogue on every rank: the piece just
      added is dropped (rollback to the last commit);
   2. decide_microbatch() from the survivors' reports with rank 3 lost: the resume point J;
@@ -32,6 +33,10 @@ class FakeZero2Adapter:
     """What the commit hook reads from DeepSpeed's ZeRO stage 2: per group a list of tensors (here one) holding the sum."""
     def __init__(self):
         self.avg = {}
+        self.keep = None                                    # keep mode: (owner, pieces), as wrap_reduce_keep receives them
+
+    def wrap_reduce_keep(self, owner, pieces):
+        self.keep = (owner, pieces)
 
     def zero2_groups(self):
         return list(range(len(SIZES)))
@@ -54,13 +59,16 @@ class FakeZero2Adapter:
         for i in range(len(SIZES)):
             p = piece(rank, mb, i, SIZES[i])
             self.avg[i] = [p] if not self.avg.get(i) else [self.avg[i][0] + p]
+            if self.keep is not None:                       # the all-reduce hands this rank its owner's piece as well
+                self.keep[1][i].copy_(piece(self.keep[0], mb, i, SIZES[i]))
 
 
-def worker(rank, port, k, out):
+def worker(rank, port, k, out, mode='p2p'):
     import torch
     import torch.distributed as dist
     os.environ['FTV2_PARTNER_STRIDE'] = '2'
     os.environ['FTV2_COMMIT_K'] = str(k)
+    os.environ['FTV2_COMMIT_MODE'] = mode
     from rc_commit import Commit, decide_microbatch
     store = dist.TCPStore('127.0.0.1', port, 4, is_master=(rank == 0))
     dist.init_process_group('gloo', store=store, rank=rank, world_size=4)
@@ -79,7 +87,7 @@ def worker(rank, port, k, out):
     lost = [3]
     surv = {r: reports[r] for r in range(4) if r not in lost}
     ok, J, why = decide_microbatch(surv, lost, 4, 2, 7)
-    res = {'rank': rank, 'k': k, 'decide': [ok, J, why], 'report': c.report()}
+    res = {'rank': rank, 'k': k, 'mode': mode, 'decide': [ok, J, why], 'report': c.report()}
     if rank == 3:                                   # the joiner: its sums at J from rank 1's copy
         flats = [torch.empty(n) for n in SIZES]
         for w in dist.batch_isend_irecv([dist.P2POp(dist.irecv, t, 1) for t in flats]):
@@ -92,6 +100,11 @@ def worker(rank, port, k, out):
     ref = [sum(piece(rank, mb, i, SIZES[i]) for mb in range(J)) if J > 0 else torch.zeros(SIZES[i]) for i in range(len(SIZES))]
     got = flats if flats is not None else [torch.zeros(n) for n in SIZES]
     res['exact'] = all(torch.equal(a, b) for a, b in zip(got, ref))
+    if rank == 1:                                   # the copy rank 1 holds of its owner (rank 3) at J, against the exact sums
+        cp = c.copy_of(7, J)
+        res['copy_exact'] = cp is not None and all(
+            torch.equal(a, sum(piece(3, mb, i, SIZES[i]) for mb in range(J)) if J > 0 else torch.zeros(SIZES[i]))
+            for i, a in enumerate(cp))
     c2 = Commit(ad, rank, 4, dev, lambda m: None)
     c2.set_position(7, J, flats)
     c2.seed(7, J, flats)
@@ -124,30 +137,32 @@ def decide_cases():
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == '--worker':
-        worker(int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5])
+        worker(int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6])
         return
     fails = decide_cases()
     env = {k: v for k, v in os.environ.items() if 'proxy' not in k.lower()}
-    for k in (1, 2):
-        out = os.path.join(os.environ.get('TMPDIR', '/tmp'), f'cpu_commit_{os.getpid()}_{k}')
-        port = 25300 + os.getpid() % 500 + k
-        ps = [subprocess.Popen([sys.executable, os.path.abspath(__file__), '--worker', str(r), str(port), str(k), out], env=env)
-              for r in range(4)]
+    for n, (mode, k) in enumerate((('p2p', 1), ('p2p', 2), ('keep', 1))):
+        out = os.path.join(os.environ.get('TMPDIR', '/tmp'), f'cpu_commit_{os.getpid()}_{mode}{k}')
+        port = 25300 + os.getpid() % 500 + 3 * n
+        ps = [subprocess.Popen([sys.executable, os.path.abspath(__file__), '--worker', str(r), str(port), str(k), out, mode],
+                               env=env) for r in range(4)]
         codes = [p.wait(timeout=300) for p in ps]
         rs = [json.load(open(f'{out}.{r}')) for r in range(4) if os.path.exists(f'{out}.{r}')]
         if codes != [0] * 4 or len(rs) != 4:
-            print(f'FAIL  k={k}: exit codes {codes}')
-            fails.append(f'k={k}')
+            print(f'FAIL  {mode} k={k}: exit codes {codes}')
+            fails.append(f'{mode} k={k}')
             continue
         J = rs[0]['decide'][1]
         want_J = (M - 1) // k * k if (M - 1) // k * k < M else 0   # the last commit before the stop (micro-batches 0-4 done)
         exact = all(r['exact'] for r in rs)
         tok = {tuple(r['reseeded_token']) for r in rs}
-        good = rs[0]['decide'][0] and J == want_J and exact and tok == {(7, J)}
-        print(f'{"PASS" if good else "FAIL"}  k={k}: resume at micro-batch {J} (want {want_J}); sums at J exact on every rank '
-              f'(the joiner from its partner\'s copy): {exact}; re-seeded tokens {sorted(tok)}')
+        cex = [r.get('copy_exact') for r in rs if 'copy_exact' in r]
+        good = rs[0]['decide'][0] and J == want_J and exact and tok == {(7, J)} and cex == [True]
+        print(f'{"PASS" if good else "FAIL"}  {mode} k={k}: resume at micro-batch {J} (want {want_J}); sums at J exact on every '
+              f'rank (the joiner from its partner\'s copy): {exact}; rank 1\'s copy of rank 3 exact: {cex}; '
+              f're-seeded tokens {sorted(tok)}')
         if not good:
-            fails.append(f'k={k}')
+            fails.append(f'{mode} k={k}')
     print(f'\n{len(fails)} failed' if fails else '\nall passed')
     sys.exit(1 if fails else 0)
 

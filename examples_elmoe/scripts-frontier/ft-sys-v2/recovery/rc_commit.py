@@ -18,7 +18,16 @@ Positions after a stop: own = my last commit c (micro-batches), copy = my owner'
 computes the same resume point J = the lowest own position; a survivor at c = J + k goes back to S_{c-k}; a lost owner's copy must
 hold J (current or previous); otherwise the window (exit 75). J = 0 is the step start (milestone 1).
 Redo: the iterator rebuilt at the step's start skips J micro-batches; Megatron's schedule starts at J
-(megatron/core/pipeline_parallel/schedules.py, FTV2_START_MICROBATCH); the new engine's sums are S_J; every pair re-seeds its copy."""
+(megatron/core/pipeline_parallel/schedules.py, FTV2_START_MICROBATCH); the new engine's sums are S_J; every pair re-seeds its copy.
+
+Two transports for the copy (FTV2_COMMIT_MODE; the user's comparison, the lead 11-06 05:4x):
+  p2p   (default) the owner sends its sums to the partner after each commit (above). With ZeRO-2's all-reduce of every
+        micro-batch this adds the partition (bf16) to the inter-node traffic of every micro-batch: E5 5862320, +7.3% at k = 1.
+  keep  "all-reduce + keep": with use_multi_rank_bucket_allreduce, ZeRO-2 already all-reduces every bucket over the
+        data-parallel group, so the partner receives its owner's reduced slices and drops them. The adapter's
+        wrap_reduce_keep copies them into `piece` (the owner's partition layout) instead; after each micro-batch's epilogue the
+        partner adds the piece to its copy, as the owner adds it to its sums (the same bf16 additions, in the same order). No
+        network; k = 1 only (every micro-batch is folded in). After a rebuild the copy is seeded once by p2p, as in p2p mode."""
 import os
 import time
 
@@ -47,10 +56,22 @@ class Commit:
         self.tok_send = torch.zeros(2, dtype=torch.float64, device=device)
         self.done_ev, self.inflight = None, None
         self.ms = []                                         # host time of each commit's launch
+        self.mode = os.environ.get('FTV2_COMMIT_MODE', 'p2p')
+        self.piece = None
+        if self.mode == 'keep':
+            if self.k != 1:
+                raise ValueError('FTV2_COMMIT_MODE=keep folds in every micro-batch: FTV2_COMMIT_K must be 1')
+            self.piece = [torch.zeros_like(t) for t in self.copy_cur]
+            adapter.wrap_reduce_keep(self.owner, self.piece)
 
     def begin_step(self, step):
         """The top of an iteration: no micro-batch of this step is summed or committed yet."""
         self.step, self.added, self.c, self.snap_cur, self.snap_prev = int(step), 0, 0, None, None
+        if self.mode == 'keep':                              # the owner's sums at micro-batch 0 of this step are zeros
+            for t in self.copy_cur + self.copy_prev + self.piece:
+                t.zero_()
+            self.tok_cur[0].fill_(float(step)); self.tok_cur[1].fill_(0.0)
+            self.tok_prev.fill_(-1.0)
 
     def set_position(self, step, c, snap):
         """After a restore at (step, c): the sums are S_c."""
@@ -60,9 +81,18 @@ class Commit:
     def after_epilogue(self, stopping, last):
         if stopping:
             self.restore_own(self.c)                         # drop whatever came after the last commit
+            if self.piece is not None:
+                for t in self.piece:
+                    t.zero_()                                # a piece of a cut micro-batch is never folded in
             return
         self.added += 1
         if last or self.added % self.k != 0:
+            if self.piece is not None:
+                for t in self.piece:
+                    t.zero_()
+            return
+        if self.mode == 'keep':
+            self._keep_commit()
             return
         t0 = time.time()
         flats = [self.ad.zero2_flat_partial(i) for i in self.groups]         # fresh copies: the snapshot S_added
@@ -90,6 +120,23 @@ class Commit:
         else:
             for w in works:
                 w.wait()
+        self.snap_prev, self.snap_cur, self.c = self.snap_cur, flats, self.added
+        self.ms.append(round(1000 * (time.time() - t0), 2))
+
+    def _keep_commit(self):
+        """keep mode, after micro-batch `added`: my own snapshot (as in p2p mode), and my owner's sums folded in from the piece
+        this rank kept during the micro-batch's all-reduces. The previous copy and token move to prev first."""
+        t0 = time.time()
+        flats = [self.ad.zero2_flat_partial(i) for i in self.groups]
+        self.copy_prev, self.copy_cur = self.copy_cur, self.copy_prev
+        self.tok_prev, self.tok_cur = self.tok_cur, self.tok_prev
+        for cur, prv, pc in zip(self.copy_cur, self.copy_prev, self.piece):
+            if self.added == 1:
+                cur.copy_(pc)                                # the owner's first micro-batch: its sums ARE the piece
+            else:
+                torch.add(prv, pc, out=cur)                  # the owner's accumulated_grad.add_(new) (stage_1_and_2.py:802)
+            pc.zero_()
+        self.tok_cur[0].fill_(float(self.step)); self.tok_cur[1].fill_(float(self.added))
         self.snap_prev, self.snap_cur, self.c = self.snap_cur, flats, self.added
         self.ms.append(round(1000 * (time.time() - t0), 2))
 

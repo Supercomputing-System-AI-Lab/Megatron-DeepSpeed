@@ -196,6 +196,75 @@ class ZeroAdapter:
         epilogue._ftv2_wrapped = True
         z.overlapping_partition_gradients_reduce_epilogue = epilogue
 
+    def wrap_reduce_keep(self, owner_global, pieces):
+        """Milestone 2, "all-reduce + keep" (FTV2_COMMIT_MODE=keep; the user's comparison with "reduce + p2p"): with
+        use_multi_rank_bucket_allreduce, ZeRO stage 2 ALL-REDUCES every bucket of every micro-batch over the data-parallel group
+        and each rank then copies only the slices it owns (stage_1_and_2.py:1014-1024, 1129-1150). The partner (rank + stride)
+        is in its owner's data-parallel groups, so it already receives the owner's reduced slices and drops them. This hook
+        keeps them: each slice of a parameter owned by `owner_global` is copied into pieces[i] (group i, the owner's partition
+        layout) at DeepSpeed's own insertion offset (grad_partition_insertion_offset, stage_1_and_2.py:826-874). No network.
+        The walk over the bucket repeats DeepSpeed's own (average_tensor, stage_1_and_2.py:1075-1127), per parameter slice
+        and before DeepSpeed merges neighbouring slices of one owner (neighbours in the bucket need not be neighbours in the
+        partition). Both methods are wrapped on the object; DeepSpeed's source is unchanged."""
+        import torch.distributed as dist
+        from deepspeed.moe.utils import is_moe_param
+        z = self.zero
+        assert z.use_multi_rank_bucket_allreduce and z.reduce_scatter, \
+            'the keep path needs ZeRO stage 2 with use_multi_rank_bucket_allreduce (every rank receives every slice)'
+        orig_avg = z.average_tensor
+        orig_arc = z.allreduce_and_copy_with_multiple_ranks
+        owner_in = {}
+        ctx = {'base': None, 'slices': []}
+
+        def owner_rank(pg):
+            k = id(pg)
+            if k not in owner_in:
+                ranks = dist.get_process_group_ranks(pg)
+                owner_in[k] = ranks.index(owner_global) if owner_global in ranks else -1
+            return owner_in[k]
+
+        def average_tensor(tensor):
+            slices, curr = [], 0
+            for i, param, param_id in z.params_in_ipg_bucket:
+                pg = z.dp_process_group
+                if z.ipg_bucket_has_moe_params:
+                    pg = z.expert_dp_process_group[param.group_name] if is_moe_param(param) else z.dp_process_group
+                o = owner_rank(pg)
+                w = sorted(((p, z.grad_start_offset[i][p][param_id]) for p in z.param_to_partition_ids[i][param_id]),
+                           key=lambda t: t[1])
+                for idx, (p, off) in enumerate(w):
+                    n = (param.numel() - off) if idx == len(w) - 1 else (w[idx + 1][1] - off)
+                    if p == o:
+                        slices.append((curr, n, i, z.grad_partition_insertion_offset[i][p][param_id]))
+                    curr += n
+            ctx['base'], ctx['slices'] = tensor, slices
+            try:
+                return orig_avg(tensor)
+            finally:
+                ctx['base'], ctx['slices'] = None, []
+
+        def allreduce_and_copy_with_multiple_ranks(small_bucket, log=None, divide=True, process_group=None, bucket_ranks=None):
+            if not ctx['slices']:
+                return orig_arc(small_bucket, log=log, divide=divide, process_group=process_group, bucket_ranks=bucket_ranks)
+            # DeepSpeed's own body (stage_1_and_2.py:1020-1024), plus the partner's copy of its owner's slices
+            pg = z.dp_process_group if process_group is None else process_group
+            allreduced = z.allreduce_bucket(small_bucket, log=log, divide=divide, process_group=pg)
+            o = owner_rank(pg)
+            base, es = ctx['base'], ctx['base'].element_size()
+            for buf, synced, bucket_rank in zip(small_bucket, z.unflatten(allreduced, small_bucket), bucket_ranks):
+                if dist.get_rank(group=pg) == bucket_rank:
+                    buf.copy_(synced)
+                if bucket_rank == o:
+                    b0 = (buf.data_ptr() - base.data_ptr()) // es
+                    b1 = b0 + buf.numel()
+                    for (c, n, i, ins) in ctx['slices']:
+                        if b0 <= c and c + n <= b1:
+                            pieces[i][ins:ins + n].copy_(synced.view(-1)[c - b0:c - b0 + n])
+        average_tensor._ftv2_wrapped = True
+        allreduce_and_copy_with_multiple_ranks._ftv2_wrapped = True
+        z.average_tensor = average_tensor
+        z.allreduce_and_copy_with_multiple_ranks = allreduce_and_copy_with_multiple_ranks
+
     # ------------------------------------------------------------------ the GPU shadow (check mode)
     def gpu_shadow_optimizer(self, params):
         cls = type(self.inner)
