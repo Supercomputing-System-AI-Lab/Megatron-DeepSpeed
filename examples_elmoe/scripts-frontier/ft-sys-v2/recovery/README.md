@@ -87,9 +87,26 @@ re-splits the state instead of copying it (`put_state` from gathered full tensor
 | `FTV2_NULL_RECOVERY_STEP` | unset | test: at this iteration rank 0 writes a failure list that loses no rank |
 | `FTV2_WORLD`, `FTV2_ROLE`, `FTV2_RUN`, `FTV2_ARM` | set by `launch/ftv2_srun.sh` | training world size, train or standby, run id, arm name |
 | `FTV2_WORLD_TIMEOUT_S` | 600 | the new world's store and process-group timeout |
+| `FTV2_KEEP` | 1 | 0: no Keep (no shadow; a failure that needs a restore exits 77) |
+| `FTV2_KEEP_ASYNC` | 0 | 1: Keep's exchange on its own process group, waited on a side stream |
+| `FTV2_STANDBY_WARM` | 0 | 1: the standby builds the model on its own GPUs and runs one step while it waits (kernels loaded) |
+| `FTV2_DETERMINISTIC` | 0 | 1: test mode (torch deterministic algorithms, deterministic flash-attention backward) |
+| `FTV2_EXCEPTION_WAIT_S` | 600 | a rank whose exception does not wait for a stop writes its exit record and waits this long for the list, then exits 1 |
+| `FTV2_COMMIT` | 0 | milestone 2: 1 commits the partial sums inside the step (needs ZeRO stage 2) |
+| `FTV2_COMMIT_K` | 1 | commit every k micro-batches (the boundary is the step's Keep) |
+| `FTV2_COMMIT_ASYNC` | 1 | p2p transport: the copy waited on a side stream |
+| `FTV2_COMMIT_MODE` | p2p | `p2p` the owner sends its sums to the partner; `keep` the partner keeps its owner's slices from ZeRO-2's own all-reduce (needs `use_multi_rank_bucket_allreduce`, k = 1) |
+| `FTV2_DS_SET` | unset | test arms (launch/ftv2_srun.sh): DeepSpeed config keys set in a copy of the run's json, `a.b=v;c.d=w` |
 
 Exit codes of a recovery that cannot proceed: 74 a lost rank and the rank keeping its copy both lost; 75 a failure inside an
-optimizer step (the versions disagree); 76 the list replaces no node; 77 the recovery itself failed. ft-sys-v1's restart takes over
+optimizer step (the versions disagree), or with commits no common resume micro-batch (a rank more than one commit ahead, or a
+lost owner's copy cut at both J and J - k); 76 the list replaces no node (the plan stops the run: an exception, out of memory,
+stuck, no standby free); 77 the recovery itself failed.
+
+Exceptions in the main thread (`rc_controller.waits_for_stop`): only a stop already under way or a communication error waits for
+the failure list. Any other exception (out of memory, a GPU fault raised to Python, an error in the program) writes the
+heartbeat's exit record at once and the process waits for the list, which `heartbeat-sys/hb_rules.death_kind` decides: out of
+memory -> the OOM plan, a hardware fault -> the node replaced, any other exception -> the run stops (76). ft-sys-v1's restart takes over
 from these (not wired in milestone 1).
 
 ## What milestone 1 supports, and what another model needs
