@@ -96,8 +96,8 @@ class Coordinator:
         if kind == 'exception':
             return 'stop the training for debugging: an error in the program; no node replaced'
         if kind == 'stuck':
-            return ('stop the training: every rank is still and no node can be named; the stacks of every node are saved '
-                    '(the gate checks that find the node or link come later)')
+            return ('stop the training for debugging: a stall no evidence explains (every rank still with equal counts, or a '
+                    'suspect with no stack and no fault found, every node check passed); the stacks are saved')
         sb = self._standby(beats, node, kind)
         return f'standby {sb} takes node {node}' if sb else 'no standby free: stop, or a layout with fewer GPUs (config)'
 
