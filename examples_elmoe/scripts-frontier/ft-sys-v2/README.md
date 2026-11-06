@@ -73,7 +73,12 @@ seconds later; resubmit with the resume riders (`AUTORUN_LOAD_DIR`/`AUTORUN_SAVE
   commits at k = 1 add 7.3% (E5 5862320). `FTV2_COMMIT_K` spaces only the commits. A k that also spaces the reductions (stage 1,
   ZeRO's own reduction called every k micro-batches; its partition sums accumulate across reductions) is the way to lower the
   35%; it is described in `RESULTS_M1_M2.md` (M2-C, design note) and not built. Two copy transports: `FTV2_COMMIT_MODE=p2p`
-  (send the sums to the partner) and `keep` (the partner keeps its owner's slices from ZeRO's own all-reduce; no network).
+  (send the sums to the partner; +7.3% at k = 1, nothing measurable at k = 4) and `keep` (the partner keeps its owner's slices
+  from ZeRO's own all-reduce; no network, nothing measurable at k = 1; E5d 5862827). A kill in the middle of step 10 with
+  `keep` resumed at micro-batch 3 with the clean step's gradient norm (M2-A).
+- DeepSpeed fix applied on the object when ZeRO-2's reduce path is configured (`use_multi_rank_bucket_allreduce=false`): its
+  owner check compares ranks of two different groups, so expert gradients were kept by the wrong ranks (`RESULTS_M1_M2.md`,
+  DS-1; `FTV2_DS_REDUCE_FIX`).
 
 ## A new recovery plan: where it plugs in
 
