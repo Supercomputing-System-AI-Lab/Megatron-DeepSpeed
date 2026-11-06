@@ -9,12 +9,16 @@ G = [0..7], H = [6, 7], held by a stand-in engine. Checks:
   1. all-reduces on W, G, H; a point-to-point send 6 -> 7 on W (the pipeline's sends use the world group);
   2. rank 7 leaves (os._exit) while ranks 0-6 are inside an all-reduce on G (async, then waited in a thread): the survivors'
      old RCCL backends of W, G, H are aborted (Backend.abort(), one thread each, 30 s limit), which must end the cut all-reduce;
-  3. survivors: a new ProcessGroupNCCL per group (store prefix g1/<name>) swapped into the SAME object (CUSTOM, default);
-     the joiner makes the same backends;
+  3. survivors: rc_swap.swap_groups gives each held group object with the lost rank a new ProcessGroupNCCL (an unused backend
+     type, made the default); the joiner builds W, G, H with torch's fake backend (a build-time collective completes alone),
+     then rc_swap gives every group a real backend; both meet under <hash of the group's ranks>/<creation order>;
   4. all-reduces on W, G, H and the 6 -> 7 send again, the survivors through dist.all_reduce(t, group=<held object>).
 Launch (inside an allocation of one node; the store is hosted by the launcher on the batch node):
     python gpu_pg_swap_test.py --launch          (runs the srun steps itself)"""
 import datetime
+import sys as _sys
+import os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import json
 import os
 import subprocess
@@ -76,10 +80,7 @@ def worker(rank, host, port, role, out):
             check(f'{tag} {name} sum {want}', bool(torch.all(t == want).item()))
         if rank in (6, 7):                                # the pipeline's send: point to point on the world group
             t = torch.full((1 << 16,), 6.0 if rank == 6 else 0.0, device=dev)
-            if engine is not None:
-                (dist.send if rank == 6 else dist.recv)(t, 7 if rank == 6 else 6)
-            else:
-                jb['W'].recv([t], 6, 0).wait()
+            (dist.send if rank == 6 else dist.recv)(t, 7 if rank == 6 else 6)
             torch.cuda.synchronize(dev)
             if rank == 7:
                 check(f'{tag} send 6 -> 7', bool(torch.all(t == 6.0).item()))
@@ -111,16 +112,26 @@ def worker(rank, host, port, role, out):
         waited.join(timeout=10)
         check('the cut all-reduce is released after the abort', not waited.is_alive())
         t0 = time.time()
-        nb = new_backends(store, 'g1', rank, dev)
-        for name, b in nb.items():
-            swap(engine[name], b)
+        import rc_swap                                  # the real C mechanism (keys by group ranks and creation order)
+        res['swapped'] = rc_swap.swap_groups(dist.PrefixStore('g1', store), lost=[7], device=dev, backend='nccl', timeout=TO)
         res['t']['swap_s'] = round(time.time() - t0, 3)
-        res['names'] = {n: dist.get_backend(engine[n] if n != 'W' else None) for n in nb}
+        res['names'] = {n: dist.get_backend(engine[n] if n != 'W' else None) for n in GROUPS if rank in GROUPS[n]}
         allreduce_all(engine, None, 'after swap')
         json.dump(res, open(f'{out}.{rank}.first', 'w'))
     else:
-        jb = new_backends(store, 'g1', rank, dev)
-        allreduce_all(None, jb, 'joiner')
+        # the joiner: groups built with torch's fake backend (no partner needed), then real RCCL backends swapped in
+        from torch.testing._internal.distributed.fake_pg import FakeStore
+        import rc_swap
+        dist.init_process_group('fake', store=FakeStore(), rank=rank, world_size=8)
+        engine = {'G': dist.new_group(GROUPS['G']), 'H': dist.new_group(GROUPS['H'])}
+        engine['W'] = dist.distributed_c10d._get_default_group()
+        t = torch.ones(4, device=dev)
+        dist.all_reduce(t, group=engine['G'])           # a build-time collective completes alone
+        t0 = time.time()
+        res['swapped'] = rc_swap.swap_groups(dist.PrefixStore('g1', store), lost=[7], device=dev, backend='nccl', timeout=TO,
+                                             joiner=True)
+        res['t']['swap_s'] = round(time.time() - t0, 3)
+        allreduce_all(engine, None, 'joiner')
         json.dump(res, open(f'{out}.{rank}.joiner', 'w'))
     os._exit(0)
 
