@@ -361,12 +361,16 @@ class Recovery:
             # thread's device was 0, so only GPU 0 of each node found its communicators (E2 5861942: 6 on ranks 0, 8, 16, none on
             # the other survivors, whose stop was the abort alone)
             torch.cuda.set_device(self.device)
-        info['revoke'] = rc_stop.revoke_all(self.device, self.log)
+        # the waits (seconds): FTV2_REVOKE_WAIT_S (10) and FTV2_ABORT_WAIT_S (30). Under a pipeline the ranks in a point-to-point
+        # exchange with the lost node neither finish the revoke nor return from the abort (M3P1 5867020: ranks 24-31 waited
+        # 13 s + 30.9 s, the network plugin could not close its receive endpoints, 'Device or resource busy'); the recovery goes on
+        # after the limit (the registry is cleared by hand, rc_stop.forget_all) and the new world worked, so the limit is the cost.
+        info['revoke'] = rc_stop.revoke_all(self.device, self.log, limit_s=float(os.environ.get('FTV2_REVOKE_WAIT_S', '10')))
         self.mark(g, 'revoke_done')
         survivors = [r for r in range(self.world) if r not in lost]
         info['barrier'] = rc_stop.etcd_barrier(self.etcd(), g, self.rank, survivors, self.log)
         self.mark(g, 'barrier_done')
-        info['abort'] = rc_stop.abort_all(self.device, self.log)
+        info['abort'] = rc_stop.abort_all(self.device, self.log, limit_s=float(os.environ.get('FTV2_ABORT_WAIT_S', '30')))
         self.mark(g, 'abort_done')
         self.freed.set()
 
