@@ -122,8 +122,10 @@ class Recovery:
             return
         d = os.path.join(self.out, 'ft', 'recovery', str(g))
         os.makedirs(d, exist_ok=True)
+        self.extra = getattr(self, 'extra', {})
+        self.extra.setdefault(g, {}).update(extra or {})     # every later write keeps what earlier writes recorded
         rec = {'rank': self.rank, 'role': self.role, 'gen': g, 'times': self.T.get(g, {}), 'stop': self.stop_info.get(g, {})}
-        rec.update(extra or {})
+        rec.update(self.extra[g])
         with open(os.path.join(d, f'rank_{self.rank}.json'), 'w') as fh:
             json.dump(rec, fh, indent=1)
 

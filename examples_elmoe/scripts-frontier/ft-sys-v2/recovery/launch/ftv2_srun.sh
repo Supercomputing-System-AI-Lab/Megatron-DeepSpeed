@@ -44,6 +44,7 @@ srun() {
       name=${arm%%:*}; kv=${arm#*:}
       mkdir -p "$JOB_DIR/$name" "$FTV2_OUT/$name/ft"
       export FTV2_ARM=$name FTV2_ARM_OUT=$FTV2_OUT/$name FTV2_RUN=${SLURM_JOB_ID}.$name FTV2_WORLD=$((nt * g)) FTV2_ONE_STEP=1
+      export NCCL_DEBUG_TIMESTAMP_LEVELS=${NCCL_DEBUG_TIMESTAMP_LEVELS:-ALL}   # a time on every RCCL line (communicator setup times)
       IFS=, read -ra kvs <<< "$kv"
       for e in "${kvs[@]}"; do [ -n "$e" ] && export "$e"; done
       if [ "${FTV2_NO_STANDBY:-0}" = 1 ]; then nodes_n=$nt; w=$tw; else nodes_n=$nn; w=$aw; fi

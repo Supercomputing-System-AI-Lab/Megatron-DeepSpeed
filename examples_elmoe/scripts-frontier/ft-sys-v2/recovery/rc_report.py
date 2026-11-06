@@ -6,6 +6,7 @@
     python rc_report.py throughput <arm dir> [...]         TFLOP/s per GCD and ms per iteration after 8 warm-up iterations
     python rc_report.py keep <arm dir>                     Keep's per-step times (sums over the groups, the median over ranks)
     python rc_report.py final <arm dir A> <arm dir B>      the end-of-run fp32 masters rank by rank (md5, sampled difference)
+    python rc_report.py inits <arm dir> <rank log name>     RCCL communicator setups in one rank's log, with their times
     python rc_report.py recovery <arm dir>                 each recovery's phases, seconds after the failure list was written
                                                            (median and max over ranks), and each rank's outcome
 An arm dir is <job dir>/<arm> (it holds rank_<r>.log, standby_<l>.log and ft/). The iteration lines come from Megatron's last rank:
@@ -173,13 +174,33 @@ def final(arms):
     print(f'ranks with every md5 equal: {eq} of {len(files)}; largest sampled difference {worst:.3e}')
 
 
+def inits(arm, rank_file):
+    """RCCL communicator setups in one rank's log (needs NCCL_DEBUG=INFO, SUBSYS=INIT, timestamps on every level): for each
+    communicator its size, Init START and COMPLETE times; and per second, how many were set up."""
+    import datetime as dt
+    f = os.path.join(arm, rank_file)
+    pat = re.compile(r'^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)[^\]]*\].*comm (0x[0-9a-f]+) rank (\d+) nranks (\d+).* - Init (START|COMPLETE)')
+    rows = {}
+    for ln in open(f, errors='replace'):
+        m = pat.search(ln)
+        if m:
+            t = dt.datetime.strptime(m.group(1), '%Y-%m-%d %H:%M:%S')
+            r = rows.setdefault(m.group(2), {'nranks': int(m.group(4))})
+            r[m.group(5)] = t
+    print(f'| comm | nranks | START | COMPLETE | seconds |')
+    print('|---|---|---|---|---|')
+    for c, r in sorted(rows.items(), key=lambda kv: kv[1].get('START', dt.datetime.min)):
+        d = (r['COMPLETE'] - r['START']).total_seconds() if 'COMPLETE' in r and 'START' in r else None
+        print(f'| {c} | {r["nranks"]} | {r.get("START")} | {r.get("COMPLETE")} | {d} |')
+
+
 def main():
     if len(sys.argv) < 3:
         print(__doc__)
         sys.exit(2)
     cmd, args = sys.argv[1], sys.argv[2:]
     {'losses': lambda: losses(args), 'keep': lambda: keep(args[0]), 'recovery': lambda: recovery(args[0]),
-     'final': lambda: final(args), 'throughput': lambda: throughput(args)}[cmd]()
+     'final': lambda: final(args), 'throughput': lambda: throughput(args), 'inits': lambda: inits(args[0], args[1])}[cmd]()
 
 
 if __name__ == '__main__':
