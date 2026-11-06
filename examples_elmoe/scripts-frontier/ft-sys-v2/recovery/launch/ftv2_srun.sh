@@ -14,6 +14,34 @@
 # FTV2_LOSE_NODE=<i>:<step> loses node i at that step (tests/lose_node.sh); FTV2_DROP_ARGS="--a --b" removes those
 # arguments from the training command (the cold-restart arm drops the template's --finetune to resume fully);
 # FTV2_SUB_ARGS="old|new" ('+' stands for a space) replaces one argument string (an arm with another EP on the same nodes).
+# ftv2_ds_set <command string> <new json> <settings>: copy the run's DeepSpeed config (--deepspeed_config <path>) to <new json>
+# with the settings applied ("zero_optimization.use_multi_rank_bucket_allreduce=false;..."; values parsed as JSON, else strings)
+# and print the command string pointing at the copy. DeepSpeed's own config interface: nothing in DeepSpeed changes.
+ftv2_ds_set() {
+  local x=$1 nj=$2 set=$3 dj
+  dj=$(echo "$x" | grep -oE -- '--deepspeed_config [^ ]+' | awk '{print $2}')
+  [ -n "$dj" ] && [ -f "$dj" ] || { echo "FATAL [ftv2 srun] FTV2_DS_SET: no --deepspeed_config file in the command ($dj)" >&2; return 1; }
+  python3 - "$dj" "$nj" "$set" <<'PY' >&2 || return 1
+import json, sys
+src, dst, sets = sys.argv[1:4]
+cfg = json.load(open(src))
+for kv in filter(None, sets.split(';')):
+    key, val = kv.split('=', 1)
+    try:
+        val = json.loads(val)
+    except ValueError:
+        pass
+    d = cfg
+    *path, last = key.split('.')
+    for k in path:
+        d = d.setdefault(k, {})
+    d[last] = val
+    print(f'[ftv2 srun] FTV2_DS_SET: {key} = {val!r} in {dst}')
+json.dump(cfg, open(dst, 'w'), indent=1)
+PY
+  echo "${x// --deepspeed_config $dj / --deepspeed_config $nj }"
+}
+
 srun() {
   local x is_train=0 is_cache=0
   for x in "$@"; do
@@ -65,6 +93,9 @@ srun() {
           for d in ${FTV2_DROP_ARGS:-}; do x="${x// $d / }"; done     # test arms: e.g. --finetune off for a full resume
           if [ -n "${FTV2_SUB_ARGS:-}" ]; then                         # test arms: "old|new" ('+' for a space), e.g. another EP
             sub=${FTV2_SUB_ARGS//+/ }; old=${sub%%|*}; new=${sub#*|}; x="${x// $old / $new }"
+          fi
+          if [ -n "${FTV2_DS_SET:-}" ]; then                           # test arms: DeepSpeed config keys, "a.b=v;c.d=w"
+            x=$(ftv2_ds_set "$x" "$JOB_DIR/$name/ds_config.json" "$FTV2_DS_SET") || exit 77
           fi
           ta+=("$x")
         else ta+=("$x"); fi
