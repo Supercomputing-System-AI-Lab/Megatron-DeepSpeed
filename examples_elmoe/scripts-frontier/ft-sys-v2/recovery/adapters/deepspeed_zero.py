@@ -196,6 +196,36 @@ class ZeroAdapter:
         epilogue._ftv2_wrapped = True
         z.overlapping_partition_gradients_reduce_epilogue = epilogue
 
+    def fix_reduce_owner_check(self):
+        """A DeepSpeed defect found by E5c 5862600, fixed on the object (DeepSpeed's source unchanged). With ZeRO stage 2 and
+        use_multi_rank_bucket_allreduce=false, each bucket slice is REDUCED to its owner (dist.reduce), and the owner then
+        copies the result back into its gradient. allreduce_and_copy decides who copies with
+            if rank is None or rank == dist.get_rank(group=self.dp_process_group):      (stage_1_and_2.py:1548)
+        where `rank` is the owner's rank in the bucket's own process group: for an expert bucket, the expert data-parallel
+        group (3 ranks on X-MoE 10B), not the dense group (24). The wrong ranks copy, and the real owners keep their local,
+        unreduced gradient (E5c: grad norm 14.817 against 15.815 at step 1). The all-reduce path compares in the bucket's
+        own group (stage_1_and_2.py:1023). This wrapper is DeepSpeed's body (stage_1_and_2.py:1529-1550) with that one test
+        made in the bucket's own group: `dist.get_rank(group=process_group)`."""
+        from deepspeed.runtime.zero import stage_1_and_2 as s12
+        z = self.zero
+
+        def allreduce_and_copy(small_bucket, rank=None, log=None, divide=True, process_group=None):
+            process_group = z.dp_process_group if process_group is None else process_group
+            if z.overlap_comm:
+                if not s12.get_accelerator().resolves_data_dependency():
+                    s12.get_accelerator().synchronize()
+                z._clear_previous_reduced_grads()
+                stream = z.reduction_stream
+            else:
+                stream = s12.get_accelerator().current_stream()
+            with s12.get_accelerator().stream(stream):
+                allreduced = z.allreduce_bucket(small_bucket, rank=rank, log=log, divide=divide, process_group=process_group)
+                if rank is None or rank == s12.dist.get_rank(group=process_group):
+                    for buf, synced in zip(small_bucket, z.unflatten(allreduced, small_bucket)):
+                        buf.copy_(synced)
+        allreduce_and_copy._ftv2_wrapped = True
+        z.allreduce_and_copy = allreduce_and_copy
+
     def wrap_reduce_keep(self, owner_global, pieces):
         """Milestone 2, "all-reduce + keep" (FTV2_COMMIT_MODE=keep; the user's comparison with "reduce + p2p"): with
         use_multi_rank_bucket_allreduce, ZeRO stage 2 ALL-REDUCES every bucket of every micro-batch over the data-parallel group

@@ -190,9 +190,20 @@ class Recovery:
         torch.ones(1 << 20, device=self.device).sum().item()
         self.log(f'standby ready in {time.time() - t0:.1f} s (keeper {s} s): world {world} when it joins')
 
+    def _ds_fixes(self, adapter):
+        """DeepSpeed defects fixed on the object for this run (FTV2_DS_REDUCE_FIX, default 1): the owner check of ZeRO-2's
+        reduce path (adapters/deepspeed_zero.py fix_reduce_owner_check; E5c 5862600), when that path is configured."""
+        z = adapter.zero
+        if os.environ.get('FTV2_DS_REDUCE_FIX', '1') == '1' and getattr(z, 'partition_gradients', False) and \
+                getattr(z, 'use_multi_rank_bucket_allreduce', True) is False:
+            adapter.fix_reduce_owner_check()
+            self.log('DeepSpeed fix on the object: ZeRO-2 reduce path, the owner check in the bucket\'s own group '
+                     '(stage_1_and_2.py:1548)')
+
     def after_build(self, model, optimizer, sched, version):
         """The first build: install Keep and seed every partner's shadow (collective)."""
         self.adapter = ZeroAdapter(model[0])
+        self._ds_fixes(self.adapter)
         if os.environ.get('FTV2_KEEP', '1') == '0':        # test arms that measure training without Keep
             self.log('Keep off (FTV2_KEEP=0): no shadows; a lost rank cannot be restored')
             return
@@ -552,6 +563,7 @@ class Recovery:
             model, optimizer, sched = self.tr.build_model()
             self.mark(g, 'model_built')
             adapter = ZeroAdapter(model[0])
+            self._ds_fixes(adapter)
             # restore: own kept tensors, or the shadow from the rank that keeps it (point to point)
             sums = None
             if role == 'joiner':
