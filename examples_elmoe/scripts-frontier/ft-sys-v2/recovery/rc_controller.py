@@ -295,7 +295,14 @@ class Recovery:
             # Wait for the stream here; a reduction that ended because of the stop finds the stop flag set (it is set before the
             # revoke, _on_failure), and one that ended on a network error leaves an error on its communicator.
             torch.cuda.current_stream(self.device).synchronize()
-        stopping = bool(self.hb.S.get('stop')) or (not last and self._reduce_comm_error())
+        flag = bool(self.hb.S.get('stop'))
+        stopping = flag or (not last and self._reduce_comm_error())
+        if stopping:
+            # a counter for the tests: this micro-batch's sums are not committed (back to the last commit)
+            self.refused = getattr(self, 'refused', 0) + 1
+            self.log(f'commit refused: step {self.commit.step} micro-batch {st["pos"] if st is not None else self.commit.added + 1}'
+                     f' ({"the stop flag was set" if flag else "a reduction communicator reports an error"}); back to commit '
+                     f'{self.commit.c}; refused so far {self.refused}')
         self.commit.after_epilogue(stopping, last, pos=st['pos'] if st is not None else None)
         self.hb.S['micro_batch'] = self.commit.added           # the heartbeat line's micro-batch (and the tests' injection point)
         if stopping:
