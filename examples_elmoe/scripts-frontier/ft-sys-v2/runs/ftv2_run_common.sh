@@ -5,7 +5,7 @@
 #   MODE=heartbeat  heartbeat only (models with a pipeline, milestone 3 not built): the failure list is written and the job ends
 #                   FTV2_ABORT_ON_FAILURE seconds later; restart by resubmitting with the resume riders (ft-sys-v1's path:
 #                   AUTORUN_LOAD_DIR/AUTORUN_SAVE_DIR with AUTORUN_NATIVE_RESUME=1 or AUTORUN_UCP_RESUME=1).
-# The model's run file sets: EX_LABEL, EX_EP_KEY ("nodes:EP:TP"), EX_EP_CMD (" mbs:nbs:iters:X-MOE:<model>:ckpt:1:<zero>"),
+# The model's run file sets: EX_LABEL, EX_EP_LAYOUT ("nodes:EP:TP"), EX_EP_CMD (" mbs:nbs:iters:X-MOE:<model>:ckpt:1:<zero>"),
 # optional EX_PP_SIZE, EX_SEQ_LEN, EX_MEGATRON_SP, EX_STRIDE (partner stride = ranks per data-parallel replica), EX_WALL, EX_QOS,
 # EX_MODE. RENDER_ONLY=1 renders the job script (and the standby hook's copy) without submitting.
 # Paths: FTV2_TREE (this worktree: megatron and ft-sys-v2), FTV2_SF (the scripts-frontier folder that holds the data, the DeepSpeed
@@ -22,7 +22,7 @@ export PYTHONPATH=$FTV2_TREE:${PYTHONPATH:-}
 python -I -B -c "import sys; sys.path.insert(0, '$FTV2_TREE'); import megatron; assert megatron.__file__.startswith('$FTV2_TREE'), megatron.__file__" \
   || { echo "FATAL: megatron does not import from $FTV2_TREE"; exit 1; }
 export FTV2_PY=$(command -v python) FTV2_ETCD_BIN=${FTV2_ETCD_BIN:-/lustre/orion/world-shared/gen150/zixianw4/tools/etcd-v3.5.17/etcd-v3.5.17-linux-amd64/etcd}
-export AUTORUN_EP_KEY="$EX_EP_KEY" AUTORUN_EP_CMD="$EX_EP_CMD"
+export AUTORUN_EP_KEY="$EX_EP_LAYOUT" AUTORUN_EP_CMD="$EX_EP_CMD"
 [ -n "${EX_PP_SIZE:-}" ] && export AUTORUN_PP_SIZE=$EX_PP_SIZE
 [ -n "${EX_SEQ_LEN:-}" ] && export AUTORUN_SEQ_LEN=$EX_SEQ_LEN
 [ -n "${EX_MEGATRON_SP:-}" ] && export AUTORUN_MEGATRON_SP=$EX_MEGATRON_SP
