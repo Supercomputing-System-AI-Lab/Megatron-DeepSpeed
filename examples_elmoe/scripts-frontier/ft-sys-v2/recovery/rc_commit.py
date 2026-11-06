@@ -59,7 +59,11 @@ class Commit:
         self.tok_send = torch.zeros(2, dtype=torch.float64, device=device)
         self.done_ev, self.inflight = None, None
         self.ms = []                                         # host time of each commit's launch
-        self.mode = os.environ.get('FTV2_COMMIT_MODE', 'p2p')
+        # the transport (FTV2_COMMIT_MODE): under the pipeline (spaced reductions) the default is "keep" (all-reduce + keep; the
+        # user, 2026-11-06: "Alright for 2", m3_map question 4), when ZeRO's all-reduce path is configured; otherwise p2p
+        # (milestone 2's default, and the only transport on the reduce path)
+        allreduce_path = bool(getattr(getattr(adapter, 'zero', None), 'use_multi_rank_bucket_allreduce', False))
+        self.mode = os.environ.get('FTV2_COMMIT_MODE') or ('keep' if spaced and allreduce_path else 'p2p')
         # diagnosis (FTV2_COMMIT_DEBUG=1): the norm of every group's sums at each epilogue of the steps in
         # [FTV2_COMMIT_DEBUG_FROM, FTV2_COMMIT_DEBUG_TO], one line per rank (a device sync each: diagnosis runs only)
         self.debug = os.environ.get('FTV2_COMMIT_DEBUG') == '1'
