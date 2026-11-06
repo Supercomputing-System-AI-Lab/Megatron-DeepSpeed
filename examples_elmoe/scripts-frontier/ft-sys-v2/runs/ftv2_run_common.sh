@@ -8,20 +8,25 @@
 # The model's run file sets: EX_LABEL, EX_EP_LAYOUT ("nodes:EP:TP"), EX_EP_CMD (" mbs:nbs:iters:X-MOE:<model>:ckpt:1:<zero>"),
 # optional EX_PP_SIZE, EX_SEQ_LEN, EX_MEGATRON_SP, EX_STRIDE (partner stride = ranks per data-parallel replica), EX_WALL, EX_QOS,
 # EX_MODE. RENDER_ONLY=1 renders the job script (and the standby hook's copy) without submitting.
-# Paths: FTV2_TREE (this worktree: megatron and ft-sys-v2), FTV2_SF (the scripts-frontier folder that holds the data, the DeepSpeed
-# json template and the launcher; default the user's checkout, where every X-MoE run is launched from), the new stack's env file.
+# Paths: every path the run reads is a variable of ../env/ftv2_paths.sh (FTV2_TREE this tree, FTV2_SF the launch folder = this
+# tree's scripts-frontier since 2026-11-06, FTV2_ENV = ../env/newstack_env.sh, the venv, ROCm 7.14.1, the plugin, etcd, the data,
+# the tokenizer); the defaults outside the repositories are the user's folders. ../env/ftv2_check_env.sh checks them all.
+# To launch from the user's shared checkout as before 2026-11-06: FTV2_SF=/lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/examples_elmoe/scripts-frontier
 set -euo pipefail
 FTV2_TREE=${FTV2_TREE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)}
-FTV2_SF=${FTV2_SF:-/lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/examples_elmoe/scripts-frontier}
-FTV2_ENV=${FTV2_ENV:-/lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/examples_elmoe/assistant_deep_dive/2026-11-04-xmoe_newstack/runs/newstack_env.sh}
+. "$(dirname "${BASH_SOURCE[0]}")/../env/ftv2_paths.sh"
 FT=$FTV2_TREE/examples_elmoe/scripts-frontier/ft-sys-v2
 cd "$FTV2_SF"
+mkdir -p temp_slurm logs   # the launcher writes temp_slurm/ and the job's -o/-e go to logs/; neither is in git (a fresh clone has none)
 set +e +u; . ./eval/submit_env.sh; . "$FTV2_ENV"; set -euo pipefail
 export CXX=$(which g++) CC=$(which gcc)
 export PYTHONPATH=$FTV2_TREE:${PYTHONPATH:-}
 python -I -B -c "import sys; sys.path.insert(0, '$FTV2_TREE'); import megatron; assert megatron.__file__.startswith('$FTV2_TREE'), megatron.__file__" \
   || { echo "FATAL: megatron does not import from $FTV2_TREE"; exit 1; }
-export FTV2_PY=$(command -v python) FTV2_ETCD_BIN=${FTV2_ETCD_BIN:-/lustre/orion/world-shared/gen150/zixianw4/tools/etcd-v3.5.17/etcd-v3.5.17-linux-amd64/etcd}
+# deepspeed is found through PYTHONPATH in the job's order (find_spec only: nothing is imported, no sitecustomize runs)
+python -I -B -c "import os, sys, importlib.util; sys.path[:0] = [p for p in os.environ['PYTHONPATH'].split(':') if p]; o = importlib.util.find_spec('deepspeed').origin; assert o.startswith('$NEWSTACK_DEEPSPEED/'), o" \
+  || { echo "FATAL: deepspeed does not import from NEWSTACK_DEEPSPEED=$NEWSTACK_DEEPSPEED"; exit 1; }
+export FTV2_PY=$(command -v python) FTV2_ETCD_BIN
 export AUTORUN_EP_KEY="$EX_EP_LAYOUT" AUTORUN_EP_CMD="$EX_EP_CMD"
 [ -n "${EX_PP_SIZE:-}" ] && export AUTORUN_PP_SIZE=$EX_PP_SIZE
 [ -n "${EX_SEQ_LEN:-}" ] && export AUTORUN_SEQ_LEN=$EX_SEQ_LEN
@@ -30,6 +35,11 @@ export AUTORUN_QOS=${EX_QOS:-debug} AUTORUN_WALLTIME="${EX_WALL:-00:30:00}" AUTO
 export AUTORUN_NO_CKPT=${EX_NO_CKPT:-1} AUTORUN_NO_PROFILING=1 AUTORUN_NCCL_DEBUG=WARN AUTORUN_DS_CONFIG_PER_JOB=1
 export XMOE_FT_V2=1
 PRE="ulimit -c 0; export TORCH_NCCL_ASYNC_ERROR_HANDLING=0 NCCL_ASYNC_ERROR_HANDLING=0 PYTHONUNBUFFERED=1; $NEWSTACK_PRE_CMD; export FTV2_OUT=\$PWD/\${JOB_DIR}"
+# The template fixes the tokenizer (VOCAB_FILE, no variable reaches it) and builds data_options from it before this hook runs; with
+# FTV2_VOCAB_FILE set, the hook replaces the --vocab-file argument in data_options (read by the training srun) and stops if it did not.
+if [ -n "$FTV2_VOCAB_FILE" ]; then
+  PRE="$PRE; data_options=\"\${data_options/ --vocab-file \${VOCAB_FILE} / --vocab-file $FTV2_VOCAB_FILE }\"; VOCAB_FILE=$FTV2_VOCAB_FILE; case \"\$data_options\" in *' --vocab-file $FTV2_VOCAB_FILE '*) echo '[ftv2] tokenizer FTV2_VOCAB_FILE=$FTV2_VOCAB_FILE' ;; *) echo 'FATAL [ftv2] FTV2_VOCAB_FILE did not reach data_options'; exit 1 ;; esac"
+fi
 if [ "${EX_MODE:-recovery}" = recovery ]; then
   export FTV2_RECOVERY=1 FTV2_STANDBY=1 FTV2_STANDBY_NODES=${EX_STANDBY_NODES:-1} FTV2_PARTNER_STRIDE=${EX_STRIDE:-8}
   export FTV2_SHADOW=${FTV2_SHADOW:-cpu} FTV2_CPU_ADAM=${FTV2_CPU_ADAM:-torch} FTV2_ARMS=${FTV2_ARMS:-main:}

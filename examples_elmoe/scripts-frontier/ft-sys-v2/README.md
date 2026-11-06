@@ -53,6 +53,61 @@ through a peer's death). Test arms and injections: `FTV2_ARMS` and `FTV2_INJECT`
 seconds later; resubmit with the resume riders (`AUTORUN_LOAD_DIR`/`AUTORUN_SAVE_DIR` with `AUTORUN_NATIVE_RESUME=1` or
 `AUTORUN_UCP_RESUME=1`) to restart from the last save.
 
+## Run from a fresh clone
+
+Every path a run reads is a variable of `env/ftv2_paths.sh`; a variable set in the shell wins. The defaults are the folders the
+runs used on 2026-11-06. Those in `/lustre/orion/world-shared/gen150` and `/opt` are readable by every member of gen150; those
+in `/lustre/orion/gen150/scratch/zixianw4` are not (the folder is `drwx------`). Another user sets the private ones to copies
+of their own, checks, renders, then submits:
+
+```
+git clone -b ft-sys-v2 --recurse-submodules https://github.com/Supercomputing-System-AI-Lab/X-MoE.git
+cd X-MoE/Megatron-DeepSpeed-X-MoE && git checkout ft-sys-v2     # the submodule is checked out detached at the pinned commit
+FT=$PWD/examples_elmoe/scripts-frontier/ft-sys-v2
+export NEWSTACK_DEEPSPEED=$(cd .. && pwd)                       # this clone's DeepSpeed (X-MoE root)
+export NEWSTACK_OVERLAY=$FT/env/overlay                         # the copy of sitecustomize.py in this repository
+export NEWSTACK_JIT=/lustre/orion/<project>/scratch/$USER/ftv2_jit   # any folder you can write, on Lustre
+export NEWSTACK_R714=<your ROCm 7.14.1 gfx90a>/rocm NEWSTACK_PLUGIN=<your aws-ofi-nccl>/install/lib
+export DATA_PATH=<prefix of a .bin/.idx pair> FTV2_VOCAB_FILE=<tokenizer.json>
+export WANDB_MODE=disabled                                      # or `wandb login` once
+bash $FT/env/ftv2_check_env.sh                                  # every path: OK / MISSING / NOT READABLE / NOT WRITABLE
+cd $FT/runs && RENDER_ONLY=1 bash ftv2_10B.sh                   # render only, submit nothing
+bash ftv2_10B.sh                                                # submit (debug QOS, 30 min, 3 + 1 nodes)
+```
+
+| Variable | What | Default (2026-11-06) | Others can read | Where to get it |
+|---|---|---|---|---|
+| `FTV2_TREE` | this Megatron tree (megatron/, ft-sys-v2/) | the tree of the run file | - | this clone |
+| `FTV2_SF` | the launch folder: launcher, job template, `eval/submit_env.sh`, `../ds_config_gpt_TEMPLATE.json`; jobs write `logs/`, `temp_slurm/` here | `$FTV2_TREE/examples_elmoe/scripts-frontier` | - | this clone |
+| `FTV2_ENV` | the new stack's env file | `env/newstack_env.sh` | - | this clone |
+| `NEWSTACK_V` | Python venv: torch 2.13.0+rocm7.1, apex, flash-attn 2.8.3 (CK, gfx90a), mpi4py on Cray MPICH | `/lustre/orion/world-shared/gen150/zixianw4/envs/TORCH2.13-ROCM7.14-XMOE_venv` | yes | use as is (read only) |
+| `NEWSTACK_DEEPSPEED` | the X-MoE DeepSpeed, first on PYTHONPATH (in place of `eval/submit_env.sh`'s entry) | `/lustre/orion/gen150/scratch/zixianw4/X-MoE` | no | the X-MoE clone's root |
+| `NEWSTACK_R714` | ROCm 7.14.1 for gfx90a (HIP, HSA, RCCL 2.30.4), loaded by LD_PRELOAD | `/lustre/orion/gen150/scratch/zixianw4/therock-7.14.1-gfx90a/rocm` | no | `https://repo.amd.com/rocm/tarball-multi-arch/therock-dist-linux-gfx90a-7.14.1.tar.gz` (2.0 GB), `tar -xzf` into `<dir>/rocm` |
+| `NEWSTACK_PLUGIN` | aws-ofi-nccl 1.22.0, RCCL's network plugin | `/lustre/orion/gen150/scratch/zixianw4/aws-ofi-nccl-v1.22.0/install/lib` | no | `https://github.com/aws/aws-ofi-nccl` tag v1.22.0: `autoreconf -ivf; ./configure --prefix=<dir>/install --with-rocm=/opt/rocm-7.14.1 --with-libfabric=/opt/cray/libfabric/2.3.1 --disable-tests --enable-werror=no CC=gcc CXX=g++; make -j; make install` |
+| `NEWSTACK_LIBFABRIC` | libfabric 2.3.1 | `/opt/cray/libfabric/2.3.1/lib64` | yes | site |
+| `NEWSTACK_JIT` | JIT caches (torch extensions, Megatron fused kernels, Triton); written by the job | `.../2026-11-04-xmoe_newstack/jit` (user's scratch) | no | any writable folder of yours |
+| `NEWSTACK_OVERLAY` | `triton_deepbind/sitecustomize.py` (Triton with RTLD_DEEPBIND on the 7.14.1 runtime) | `.../2026-11-04-xmoe_newstack/overlay` (user's scratch) | no | `env/overlay` in this repository |
+| `NEWSTACK_MEGATRON_COPY` | a copy of megatron/ that the 11-04 runs used; after `FTV2_TREE` on PYTHONPATH, so not imported | `.../2026-11-04-xmoe_newstack/tree` | no | not needed |
+| `FTV2_ETCD_BIN` | etcd 3.5.17 (the heartbeat's store) | `/lustre/orion/world-shared/gen150/zixianw4/tools/etcd-v3.5.17/etcd-v3.5.17-linux-amd64/etcd` | yes | or `bash heartbeat-sys/get_etcd.sh <dir>` (GitHub release, SHA-256 checked) |
+| `DATA_PATH` | training data prefix; the job template reads it | template default `.../examples_elmoe/data/longctx/L8-dolma3-deepseek_text_document` (user's scratch, 6.8 GB) | no | a copy, or any Megatron .bin/.idx made with the DeepSeek tokenizer (`examples_elmoe/data/README.md`) |
+| `FTV2_VOCAB_FILE` | tokenizer; empty = the template's `VOCAB_FILE` | template `.../examples_elmoe/data/deepseek_tokenizer/tokenizer.json` (user's scratch) | no | `tokenizer.json` of `deepseek-ai/deepseek-moe-16b-base` (100,015 tokens; padded to 102,400) |
+| py-spy | the hang's stacks (agent: PATH, else `~/.local/bin/py-spy`) | `~/.local/bin/py-spy` 0.4.2 | own | `pip install --user py-spy` |
+
+- `env/ftv2_check_env.sh` prints each path as OK, MISSING, NOT READABLE or NOT WRITABLE with its variable, adds "(private: ...)"
+  to an OK path that other members of gen150 cannot read, shows where `deepspeed` and `megatron` will be imported from, and exits
+  1 on any problem. `ftv2_run_common.sh` also stops at render time if megatron or deepspeed would not come from `FTV2_TREE` /
+  `NEWSTACK_DEEPSPEED`.
+- The tokenizer: the template sets `VOCAB_FILE` without reading a variable and builds `data_options` from it. With
+  `FTV2_VOCAB_FILE` set, the batch script replaces the `--vocab-file` argument of `data_options` right before the training srun
+  (through the launcher's `AUTORUN_PRE_CMD`) and stops if the replacement did not land. The launcher and the template are unchanged.
+- The template copies the user's Triton cache (`/lustre/orion/gen150/scratch/zixianw4/.triton/cache`) to `/tmp` on every node
+  before training. For another user the copy fails with "Permission denied" and nothing else happens: the new stack uses
+  `NEWSTACK_JIT/triton`. `PROFILING_SKIP_CACHE_WARM=1` (read by the template) skips the copy.
+- Since 2026-11-06 the launch folder is this tree's `scripts-frontier` (before: the user's shared checkout). To launch from the
+  shared checkout as before: `FTV2_SF=/lustre/orion/gen150/scratch/zixianw4/X-MoE/Megatron-DeepSpeed-X-MoE/examples_elmoe/scripts-frontier`.
+- Still private with no variable: the optional pre-run gate (`FTV2_GATE`, off by default) reads `alltoall_perf` and
+  `rccl_torch_lib` from the user's `assistant_deep_dive/2026-10-09-collective_stack/tools` (`gate/gate_node.sh`).
+
 ## What the recovery covers today (milestone 1)
 
 - Failure kinds that replace a node: a rank killed (also a GPU fault that ends the process by a signal), a hang (counts +
