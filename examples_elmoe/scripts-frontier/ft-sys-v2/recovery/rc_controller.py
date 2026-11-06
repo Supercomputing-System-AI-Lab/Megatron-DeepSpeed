@@ -82,6 +82,24 @@ class Recovery:
         self.standby_list = None
         self.standby_event = threading.Event()
         self._etcd = None
+        if os.environ.get('FTV2_DETERMINISTIC') == '1':
+            self.deterministic_mode()
+
+    @staticmethod
+    def deterministic_mode():
+        """Test M1-D (FTV2_DETERMINISTIC=1): PyTorch's deterministic algorithms where they exist (warn elsewhere), and the
+        flash-attention backward in its deterministic mode (its dq accumulation uses atomics otherwise); the RCCL algorithm and
+        protocol are fixed by the arm's environment (NCCL_ALGO, NCCL_PROTO). Called before the model is built."""
+        import functools
+        os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        try:
+            import megatron.model.transformer as T
+            f = getattr(T, 'flash_attn_varlen_func', None)
+            if f is not None and not isinstance(f, functools.partial):
+                T.flash_attn_varlen_func = functools.partial(f, deterministic=True)
+        except Exception as e:
+            print(f'[ftv2 recovery] deterministic flash attention not set: {e!r}'[:200], file=sys.stderr, flush=True)
 
     # ------------------------------------------------------------------ small helpers
     @staticmethod
