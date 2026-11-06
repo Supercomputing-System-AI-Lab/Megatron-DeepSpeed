@@ -267,11 +267,6 @@ class Recovery:
             self.log('FTV2_COMMIT=1 needs ZeRO stage 2 (per-micro-batch reduction) or the pipeline engine: commits off')
             self.commit_on = False
             return
-        if pipe and adapter.pipe_tied_groups():
-            self.log('FTV2_COMMIT=1 under the pipeline: weights tied across stages are summed after the last backward '
-                     '(ReduceTiedGrads), after a spaced reduction would have cleared them: commits off')
-            self.commit_on = False
-            return
         pg = dist.new_group(list(range(self.world)))
         c = Commit(adapter, self.rank, self.world, self.device, self.log, group=pg, spaced=pipe)
         c.set_position(step, J, flats)
@@ -284,7 +279,7 @@ class Recovery:
             adapter.wrap_epilogue(self._commit_after)
         self.commit = c
         self.log(f'commits on: every {c.k} micro-batch(es), {c.mode}, async {c.asyn}, position step {step} micro-batch {J}'
-                 f'{" (pipeline: spaced ZeRO-1 reductions)" if pipe else ""}')
+                 f'{" (pipeline: spaced ZeRO-1 reductions after the " + self.pipe_st["at"] + ", " + str(self.pipe_st["tied"]) + " tied weight(s) summed across stages before ReduceTiedGrads)" if pipe else ""}')
 
     def _pipe_start(self):
         """The pipeline engine's train_batch asks where its step starts: (J, drop_until) once after a recovery, else (0, 0)."""

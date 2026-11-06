@@ -378,10 +378,56 @@ class ZeroAdapter:
             if st['pending']:
                 st['pending'] = False
                 reduce_now()
+        # Weights tied across stages (the embedding table of the first stage and the output layer of the last one, X-MoE's
+        # TiedLayerSpec('embed'): the template unties them only for DENSE models). DeepSpeed sums their gradients across the
+        # stages after the last backward (ReduceTiedGrads: an all-reduce of each tied weight's .grad over its tie group, pipe/
+        # engine.py:276-292), then ReduceGrads reduces over the data-parallel group. The spaced reductions have by then moved
+        # every earlier micro-batch's tied gradient into averaged_gradients, the stage's own part only. So, before the engine's
+        # ReduceTiedGrads (where the stages already meet), each stage rebuilds its whole data-parallel sum of the tied weight from
+        # the disjoint ZeRO partitions (an all-reduce of zeros plus each owner's slice), adds the other stage's over the tie
+        # group, and writes its slice back. Sums commute: DPavg(g0) + DPavg(g1) = DPavg(g0 + g1); only the rounding order
+        # differs from the original, so a clean run compares with a clean run at the same k.
+        tied = []
+        try:
+            tied = list(eng.module.get_tied_weights_and_groups())
+        except Exception:
+            tied = []
+        st['tied'] = len(tied)
+
+        def tied_exchange():
+            import torch.distributed as dist
+            for w, tgroup in tied:
+                gi = next((i for i, g in enumerate(z.bit16_groups) if any(q is w for q in g)), None)
+                if gi is None:
+                    continue
+                if not z.averaged_gradients.get(gi):
+                    self.zero2_set_partial(gi, torch.zeros(self.zero2_partition_size(gi), dtype=self.zero2_dtype(),
+                                                           device=z.device))
+                full = torch.zeros(w.numel(), dtype=self.zero2_dtype(), device=z.device)
+                li = next((j for j, q in enumerate(z.params_in_partition[gi]) if q is w), None)
+                if li is not None:
+                    piece = z.averaged_gradients[gi][li].view(-1)
+                    start = int(z.first_offset[gi]) if li == 0 else 0
+                    full[start:start + piece.numel()].copy_(piece)
+                dist.all_reduce(full, group=z.real_dp_process_group[gi])      # disjoint owners: the stage's whole sum
+                dist.all_reduce(full, group=tgroup)                            # plus the other stage's
+                if li is not None:
+                    piece = z.averaged_gradients[gi][li]
+                    start = int(z.first_offset[gi]) if li == 0 else 0
+                    piece.copy_(full[start:start + piece.numel()].view_as(piece))
+
+        orig_tied = type(eng)._INSTRUCTION_MAP[pipe_sched.ReduceTiedGrads]
+
+        def reduce_tied(self_):
+            if tied and st['k'] < st['m']:
+                tied_exchange()
+            orig_tied(self_)
+        reduce_tied._ftv2_wrapped = True
         backward._ftv2_wrapped = True
         send_grad._ftv2_wrapped = True
         imap = dict(type(eng)._INSTRUCTION_MAP)
         imap[pipe_sched.BackwardPass] = backward
+        imap[pipe_sched.ReduceTiedGrads] = reduce_tied
         if defer:
             imap[pipe_sched.SendGrad] = send_grad
         eng._INSTRUCTION_MAP = imap
