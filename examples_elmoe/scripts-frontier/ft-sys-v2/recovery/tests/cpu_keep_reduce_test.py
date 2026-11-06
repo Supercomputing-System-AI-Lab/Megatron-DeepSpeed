@@ -48,9 +48,9 @@ def owned_slices(z, owner_of, i):
         w = sorted(((p, z.grad_start_offset[gi][p][param_id]) for p in z.param_to_partition_ids[gi][param_id]),
                    key=lambda t: t[1])
         for idx, (p, off) in enumerate(w):
-            n = (param.numel() - off) if idx == len(w) - 1 else (w[idx + 1][1] - off)
+            n = int((param.numel() - off) if idx == len(w) - 1 else (w[idx + 1][1] - off))
             if p == owner_of(pg):
-                out.append((curr, n, p * z.partition_size[gi] + z.grad_partition_insertion_offset[gi][p][param_id]))
+                out.append((int(curr), int(n), int(p * z.partition_size[gi] + z.grad_partition_insertion_offset[gi][p][param_id])))
             curr += n
     return out
 
@@ -92,7 +92,8 @@ def worker(rank, port, out, mode='keep'):
     z.reduce_bucket_size, z.sequence_parallel_size, z.communication_data_type = 10, 1, torch.float32
     z.flatten, z.unflatten = _flatten_dense_tensors, _unflatten_dense_tensors
     nparts = [W, 2]
-    z.partition_size = {i: -(-sum(p.numel() for p in g) // nparts[i]) for i, g in enumerate(groups)}
+    # a float, as DeepSpeed computes it (len(flat) / world over the padded flat group, stage_1_and_2.py:421)
+    z.partition_size = {i: float(-(-sum(p.numel() for p in g) // nparts[i])) for i, g in enumerate(groups)}
     z.param_to_partition_ids, z.total_grads_in_partition = {0: {}, 1: {}}, {0: {}, 1: {}}
     z.is_grad_computed = {i: {q: {} for q in range(nparts[i])} for i in range(2)}
     z.grad_partition_insertion_offset = {i: {q: {} for q in range(nparts[i])} for i in range(2)}
@@ -104,7 +105,7 @@ def worker(rank, port, out, mode='keep'):
     from adapters.deepspeed_zero import ZeroAdapter
     ad = ZeroAdapter(types.SimpleNamespace(optimizer=z))
     owner = (rank - STRIDE) % W
-    pieces = [torch.full((z.partition_size[i],), -7.0) for i in range(2)]
+    pieces = [torch.full((int(z.partition_size[i]),), -7.0) for i in range(2)]
     res = {'rank': rank, 'mode': mode, 'checks': []}
     if mode != 'keep':                               # DeepSpeed's reduce path, as shipped or with the fix on the object
         z.use_multi_rank_bucket_allreduce = False
@@ -142,7 +143,7 @@ def worker(rank, port, out, mode='keep'):
             members = list(range(W)) if i == 0 else [r for r in range(W) if r % 2 == owner % 2]
             flat = sum(torch.cat([grad(r, mb, i, j, g[j].numel()) for j in range(len(g))]) for r in members) / W
             o = members.index(owner)
-            ps = z.partition_size[i]
+            ps = int(z.partition_size[i])
             want = torch.zeros(ps)
             part = flat[o * ps:(o + 1) * ps]
             want[:part.numel()] = part

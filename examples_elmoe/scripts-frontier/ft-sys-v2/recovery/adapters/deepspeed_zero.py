@@ -263,9 +263,11 @@ class ZeroAdapter:
                 w = sorted(((p, z.grad_start_offset[i][p][param_id]) for p in z.param_to_partition_ids[i][param_id]),
                            key=lambda t: t[1])
                 for idx, (p, off) in enumerate(w):
-                    n = (param.numel() - off) if idx == len(w) - 1 else (w[idx + 1][1] - off)
+                    # DeepSpeed's offsets can be floats (partition_size = len(flat) / world, stage_1_and_2.py:421; it casts with
+                    # int() where it uses them, :1129): E5c 5862600's first keep arm stopped on a float slice index
+                    n = int((param.numel() - off) if idx == len(w) - 1 else (w[idx + 1][1] - off))
                     if p == o:
-                        slices.append((curr, n, i, z.grad_partition_insertion_offset[i][p][param_id]))
+                        slices.append((curr, n, i, int(z.grad_partition_insertion_offset[i][p][param_id])))
                     curr += n
             ctx['base'], ctx['slices'] = tensor, slices
             try:
