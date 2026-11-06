@@ -92,6 +92,24 @@ Exit codes of a recovery that cannot proceed: 74 a lost rank and the rank keepin
 optimizer step (the versions disagree); 76 the list replaces no node; 77 the recovery itself failed. ft-sys-v1's restart takes over
 from these (not wired in milestone 1).
 
+## What milestone 1 supports, and what another model needs
+
+Supported: one DeepSpeed engine without a pipeline (PP 1), ZeRO stage 1 (or 2), any EP inside a node, data parallelism over nodes,
+TP 1; a standby node per run; a lost node whose partner node survives. The partner of rank r is r + FTV2_PARTNER_STRIDE (default
+8, one node): Keep needs the owner's and the partner's partitions to have the same sizes, which holds when r and r + 8 have the
+same position in their data-parallel replica (PP 1, TP 1, EP 8). Checked at every seed (a size mismatch stops the run with a message).
+
+| example (model registry) | layout | runs with ft-sys-v2 recovery today? |
+|---|---|---|
+| X-MoE 10B (`10B`) | EP 8, PP 1, DP over nodes | yes (tested, this folder's experiments) |
+| DeepSeek-MoE-16B (`DeepSeek_16B`) at EP 8, PP 1, 2+ nodes | EP 8, PP 1 | expected yes (same path; not run) |
+| DeepSeek-V3 2 layers (`DeepSeek_V3_671B_L2`) at PP 1 | EP 8 or 16, PP 1 | expected yes at EP 8 (EP 16 spans two nodes: the partner stride must be 16) |
+| X-MoE 63B (PP 4), DeepSeek-V3 8 layers and full (PP > 1) | pipeline | no: milestone 3 (a pipeline engine: its own schedule state and stage groups) |
+
+To run a model: copy `assistant_deep_dive/2026-11-05-ftv2_heartbeat/runs/rc_common.sh`, set `AUTORUN_EP_KEY` / `AUTORUN_EP_CMD`
+for the model (and `AUTORUN_PP_*` stays off), keep `XMOE_FT_V2=1 FTV2_RECOVERY=1 FTV2_STANDBY=1`, the two launch hooks and
+`TORCH_NCCL_ASYNC_ERROR_HANDLING=0`, and give `FTV2_ARMS` one arm (`main:` and the settings of the table above).
+
 ## Run
 
 See `assistant_deep_dive/2026-11-05-ftv2_heartbeat/runs/rc_common.sh` and `runs/1106_*.sh`: the 0623 launcher with
