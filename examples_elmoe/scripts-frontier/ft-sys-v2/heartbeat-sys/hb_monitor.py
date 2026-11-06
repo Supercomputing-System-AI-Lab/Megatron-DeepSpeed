@@ -15,8 +15,13 @@ ft-sys-v2/recovery/rc_stop.py, 2026-11-06). The recovery's one hook in the count
 raises StopForRecovery in the calling thread (the toy's before_communication_call, recovery_core.py:186-192).
 Fault injection for tests (FTV2_INJECT, comma-separated): hang:<rank>:<step>, kill:<rank>:<step>, exit:<rank>:<step>,
 oom:<rank>:<step>, oomstuck:<rank>:<step> (the same, then the exit blocks), abort:<rank>:<step>, hip:<rank>:<step> (a GPU
-memory access fault from a HIP kernel, FTV2_HIP_FAULT_SO), pause:all:<step>:<seconds>, slow:<rank>:<step>:<milliseconds>; kill, hang, hip, abort and exit take an optional 4th field, the
-micro-batch of the step to fire at (the micro-batches done, as the recovery's commit hook counts them; milestone 2).
+memory access fault from a HIP kernel, FTV2_HIP_FAULT_SO; on the X-MoE stack the runtime reports it to Python as AcceleratorError,
+E3 5862190), hipabort:<rank>:<step> (the same fault, then SIGABRT if the process is still alive: the end the toy's process had,
+toy 5841333, where threads raised signal 6 after the same queue error), hwfault:<rank>:<step> (synthetic: an exception whose text
+names a hardware fault, to test the classifier's branch "hardware fault -> replace the node"; no real fault),
+pause:all:<step>:<seconds>, slow:<rank>:<step>:<milliseconds>; kill, hang, hip, hipabort, hwfault, abort and exit take an
+optional 4th field, the micro-batch of the step to fire at (the micro-batches done, as the recovery's commit hook counts them;
+milestone 2).
 Each fires before a communication call of that step; an injection fires once per process (a rank that recovers does not fire it
 again)."""
 import atexit
@@ -58,7 +63,8 @@ def _inject():
         if j['done'] or S['step'] < j['step'] or (j['rank'] != 'all' and int(j['rank']) != S['rank']):
             continue
         k = j['kind']
-        if k in ('kill', 'hang', 'hip', 'abort', 'exit') and j['arg'] and S['step'] == j['step'] and S['micro_batch'] < j['arg']:
+        if k in ('kill', 'hang', 'hip', 'hipabort', 'hwfault', 'abort', 'exit') and j['arg'] and S['step'] == j['step'] and \
+                S['micro_batch'] < j['arg']:
             continue                                   # kind:<rank>:<step>:<micro-batch>: wait for that micro-batch of the step
         if k == 'slow':
             time.sleep(j['arg'] / 1000.0)              # every call from this step on: a slow rank, not a hang
@@ -81,15 +87,26 @@ def _inject():
             raise torch.OutOfMemoryError('ftv2 injected: out of memory on the CPU test (no GPU)')
         if k == 'abort':
             os.abort()                                 # SIGABRT and no exit record, as a HIP memory fault ends a process
-        if k == 'hip':                                 # a real GPU memory access fault: one store 2^40 floats past a tensor
+        if k == 'hwfault':                             # synthetic: the text matches hb_rules.HARDWARE; no fault happens
+            raise RuntimeError('ftv2 injected (synthetic) hardware fault: HW_EXCEPTION: GPU lost')
+        if k in ('hip', 'hipabort'):                   # a real GPU memory access fault: one store 2^40 floats past a tensor
             import ctypes
             import torch
             lib = ctypes.CDLL(os.environ['FTV2_HIP_FAULT_SO'])
             lib.hip_fault.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
             x = torch.empty(1, device=f'cuda:{S["local_rank"]}')
             lib.hip_fault(ctypes.c_void_p(x.data_ptr()), ctypes.c_void_p(torch.cuda.current_stream().cuda_stream))
-            torch.cuda.synchronize()
-            _log('the HIP fault did not end the process')
+            if k == 'hip':
+                torch.cuda.synchronize()               # on this stack: AcceleratorError (hipErrorIllegalAddress) here
+                _log('the HIP fault did not end the process')
+            else:
+                try:
+                    torch.cuda.synchronize()
+                    _log('hipabort: the synchronize returned: SIGABRT now')
+                except Exception as e:
+                    _log(f'hipabort: the runtime reported the fault as {type(e).__name__}: SIGABRT now')
+                sys.stderr.flush()
+                os.abort()                             # no exit record, as a process the runtime aborts
         if k == 'pause':
             time.sleep(j['arg'])                       # every rank pauses at the same call: equal counts
 
