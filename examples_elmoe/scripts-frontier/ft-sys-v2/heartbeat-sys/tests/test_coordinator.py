@@ -139,6 +139,33 @@ k, plan = run_death('signal')
 check('a death by a signal: killed, replace the node', k == 'killed' and 'no standby free' in plan, (k, plan))
 
 
+def run_conseq_only():
+    """Every rank of n1 gone with a communication error, no root death, no lost node: after the settle time the coordinator
+    writes no list (nothing to blame) but marks the run done, so that the standby leaves (E5c 5862600)."""
+    import hb_rules as HR
+    st = Store()
+    for n in ('n0', 'n1'):
+        st.kv[f'members/{n}'] = json.dumps({'role': 'train'})
+        beat(st, n, 100, 101)
+    b1 = json.loads(st.kv['node/n1'])
+    b1.update(run='r.g0002', dead=list(range(8)),
+              dead_why={str(r): 'exception: DistBackendError: NCCL error: remote process exited' for r in range(8)})
+    st.kv['node/n1'] = json.dumps(b1)
+    b0 = json.loads(st.kv['node/n0']); b0.update(run='r.g0002'); st.kv['node/n0'] = json.dumps(b0)
+    c = Coordinator(st, 'nX', tempfile.mkdtemp(), lambda m: None)
+    c.step(1000.0)                                  # a real clock (the coordinator's "first seen" treats 0 as unset)
+    early = st.kv.get('run_done/r')
+    c.step(1000.0 + HR.SETTLE + 1)
+    return failed(st), early, st.kv.get('run_done/r')
+
+
+f, early, done = run_conseq_only()
+check('communication errors only: no list', f == [], f)
+check('communication errors only: run_done not before the settle time', early is None, early)
+check('communication errors only: run_done of the base run after it', done is not None and 'no list' in json.loads(done)['stopped'],
+      done)
+
+
 def run_stuck():
     """Every rank still with equal counts past the first steps: stacks from every node, then kind stuck."""
     st = Store()

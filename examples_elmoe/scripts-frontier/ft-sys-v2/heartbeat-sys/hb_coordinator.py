@@ -256,6 +256,13 @@ class Coordinator:
                 self.warned.add(('conseq', run))
                 self.record(f'ALARM: ranks gone with communication errors only, no root death and no lost node in '
                             f'{hb_rules.SETTLE:.0f} s: {conseq[:8]}; no replacement')
+                # no list will come for this run, so nothing would tell its standby that the run is over: mark the run done
+                # (the key the recovery's standby polls, rc_controller.standby_wait), so that the standby leaves and the job's
+                # step can end (E5c 5862600: the standby waited until the wall after every training rank had gone)
+                base = str(run).split('.g')[0]
+                self.etcd.put(f'run_done/{base}', json.dumps({'t': round(now, 3), 'by': self.me,
+                                                              'stopped': 'ranks gone with communication errors only, no list'}))
+                self.record(f'RUN DONE {base}: written, so that its standby leaves (no list will come)')
             return
         s = hb_rules.hang_suspect(self.track, now)
         if s and now >= self.hold.get(s[:2], 0):
