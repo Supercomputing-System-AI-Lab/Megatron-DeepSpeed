@@ -68,6 +68,10 @@ seconds later; resubmit with the resume riders (`AUTORUN_LOAD_DIR`/`AUTORUN_SAVE
   progress, two neighbouring nodes lost, or no standby free: the recovery exits (codes 75, 74, 76) and v1's restart path applies.
 - Measured on X-MoE 10B: failure list -> ready about 8-9 s, first step after it done about 23 s; Keep costs 3-6% of the step
   (`RESULTS_M1_M2.md`, M1-A and M1-C).
+- Bit-exact claims need the determinism mode: `FTV2_DETERMINISTIC=1` with `NCCL_ALGO=Ring NCCL_PROTO=Simple` (torch's
+  deterministic algorithms, `CUBLAS_WORKSPACE_CONFIG=:4096:8`, flash-attention's deterministic backward; about +4.7% step
+  time). In it, two clean runs are bit-identical, and a kill recovered from the GPU shadow is bit-identical to the clean run on
+  every rank (E4 5863739). In normal mode, compare against the spread of several clean runs instead.
 - Milestone 2 (resume inside a step, `FTV2_COMMIT=1`, under test): it needs ZeRO stage 2, which reduces after every
   micro-batch, and on X-MoE 10B that reduction, not the commit, is the main cost: stage 2 is 35% slower than stage 1, and the
   commits at k = 1 add 7.3% (E5 5862320). `FTV2_COMMIT_K` spaces only the commits. A k that also spaces the reductions (stage 1,
