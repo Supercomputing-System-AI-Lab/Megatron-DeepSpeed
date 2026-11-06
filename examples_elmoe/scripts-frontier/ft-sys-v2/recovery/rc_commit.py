@@ -57,6 +57,11 @@ class Commit:
         self.done_ev, self.inflight = None, None
         self.ms = []                                         # host time of each commit's launch
         self.mode = os.environ.get('FTV2_COMMIT_MODE', 'p2p')
+        # diagnosis (FTV2_COMMIT_DEBUG=1): the norm of every group's sums at each epilogue of the steps in
+        # [FTV2_COMMIT_DEBUG_FROM, FTV2_COMMIT_DEBUG_TO], one line per rank (a device sync each: diagnosis runs only)
+        self.debug = os.environ.get('FTV2_COMMIT_DEBUG') == '1'
+        self.debug_from = int(os.environ.get('FTV2_COMMIT_DEBUG_FROM', '0'))
+        self.debug_to = int(os.environ.get('FTV2_COMMIT_DEBUG_TO', '1000000'))
         self.piece = None
         if self.mode == 'keep':
             if self.k != 1:
@@ -78,7 +83,17 @@ class Commit:
         self.step, self.added, self.c, self.snap_cur, self.snap_prev = int(step), int(c), int(c), snap, None
 
     # ------------------------------------------------------------------ after ZeRO's per-micro-batch epilogue
+    def debug_norms(self, what, flats=None):
+        """FTV2_COMMIT_DEBUG=1: log the norm of each group's sums (the current sums, or `flats`)."""
+        if not self.debug or self.step is None or not (self.debug_from <= self.step <= self.debug_to):
+            return
+        fl = flats if flats is not None else [self.ad.zero2_flat_partial(i) for i in self.groups]
+        ns = [round(float(f.float().norm()), 6) if f is not None else 0.0 for f in fl]
+        self.log(f'commit debug step {self.step} {what}: group norms {ns}')
+
     def after_epilogue(self, stopping, last):
+        if not stopping:
+            self.debug_norms(f'after micro-batch {self.added + 1}{" (last)" if last else ""}')
         if stopping:
             self.restore_own(self.c)                         # drop whatever came after the last commit
             if self.piece is not None:

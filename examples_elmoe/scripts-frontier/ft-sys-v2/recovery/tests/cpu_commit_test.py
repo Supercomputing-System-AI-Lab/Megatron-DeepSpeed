@@ -114,6 +114,29 @@ def worker(rank, port, k, out, mode='p2p'):
     dist.destroy_process_group()
 
 
+def snapshot_cases():
+    """ZeroAdapter.zero2_flat_partial on a stand-in ZeRO object with torch's own flatten: the snapshot must not move when the live
+    sums move (E5d 5862827: with one tensor in a group, torch's flatten returned a view of it)."""
+    import types
+    import torch
+    from torch._utils import _flatten_dense_tensors
+    from adapters.deepspeed_zero import ZeroAdapter
+    fails = []
+    for name, lst in (('one tensor in the group', [torch.ones(5)]), ('two tensors in the group', [torch.ones(3), torch.ones(2)])):
+        z = types.SimpleNamespace(averaged_gradients={0: lst}, flatten=_flatten_dense_tensors, partition_size=[5.0],
+                                  gradient_accumulation_dtype=torch.float32, device='cpu',
+                                  optimizer=types.SimpleNamespace(param_groups=[]))
+        ad = ZeroAdapter(types.SimpleNamespace(optimizer=z))
+        snap = ad.zero2_flat_partial(0)
+        for t in lst:
+            t.add_(1.0)                                 # the next micro-batch adds to the live sums
+        good = torch.equal(snap, torch.ones(5))
+        print(f'{"PASS" if good else "FAIL"}  snapshot independent of the live sums ({name}): {snap.tolist()}')
+        if not good:
+            fails.append(name)
+    return fails
+
+
 def decide_cases():
     from rc_commit import decide_microbatch
     fails = []
@@ -145,7 +168,7 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == '--worker':
         worker(int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6])
         return
-    fails = decide_cases()
+    fails = decide_cases() + snapshot_cases()
     env = {k: v for k, v in os.environ.items() if 'proxy' not in k.lower()}
     for n, (mode, k) in enumerate((('p2p', 1), ('p2p', 2), ('keep', 1))):
         out = os.path.join(os.environ.get('TMPDIR', '/tmp'), f'cpu_commit_{os.getpid()}_{mode}{k}')

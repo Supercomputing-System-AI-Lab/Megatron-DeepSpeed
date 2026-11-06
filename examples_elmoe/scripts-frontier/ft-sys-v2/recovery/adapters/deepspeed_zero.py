@@ -156,12 +156,18 @@ class ZeroAdapter:
         return self.zero.gradient_accumulation_dtype
 
     def zero2_flat_partial(self, i):
-        """A flat copy of group i's partial sum (zeros before the first micro-batch)."""
+        """A flat COPY of group i's partial sum (zeros before the first micro-batch). torch's _flatten_dense_tensors returns a
+        view of the tensor itself when the list holds one tensor, so a partition made of one parameter slice gave a "snapshot"
+        that kept accumulating with the live sums (E5d 5862827 z2_kill: the resume one commit back, J = 2, took S_3 for those
+        groups; the redone step's grad norm was 6.848 against 6.713-6.715). Always a fresh tensor now."""
         z = self.zero
         lst = z.averaged_gradients.get(i) if isinstance(z.averaged_gradients, dict) else None
         if not lst:
             return torch.zeros(self.zero2_partition_size(i), dtype=self.zero2_dtype(), device=z.device)
-        return z.flatten(lst)
+        flat = z.flatten(lst)
+        if any(flat.untyped_storage().data_ptr() == t.untyped_storage().data_ptr() for t in lst):
+            flat = flat.clone()
+        return flat
 
     @torch.no_grad()
     def zero2_set_partial(self, i, flat):

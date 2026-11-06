@@ -600,6 +600,9 @@ class Recovery:
                     torch.cuda.synchronize(self.device)
                 for n, i in enumerate(adapter.zero2_groups()):
                     adapter.zero2_set_partial(i, None if flats is None else flats[n])
+                if os.environ.get('FTV2_COMMIT_DEBUG') == '1':
+                    ns = [round(float(adapter.zero2_flat_partial(i).float().norm()), 6) for i in adapter.zero2_groups()]
+                    self.log(f'commit debug step {s} restored at micro-batch {J} ({role}): group norms {ns}')
             if os.environ.get('FTV2_STEP_SUMS_FROM') and self.out:
                 from rc_keep import state_fingerprint
                 sums_, samples_ = state_fingerprint(adapter)        # M1-B: the restored state, to compare with the step-end one
