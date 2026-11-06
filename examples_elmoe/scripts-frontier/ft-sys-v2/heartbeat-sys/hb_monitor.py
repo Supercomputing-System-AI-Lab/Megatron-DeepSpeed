@@ -198,12 +198,22 @@ def _hbm():
         return -1.0, -1.0
 
 
+def _stage(rank):
+    """The pipeline stage of a training rank (milestone 3): ranks are numbered stage by stage (the pipeline axis is outermost),
+    so stage = rank // (world / FTV2_PP). 0 without a pipeline; None for a standby."""
+    pp = int(os.environ.get('FTV2_PP', '1') or 1)
+    world = int(os.environ.get('FTV2_WORLD') or os.environ.get('WORLD_SIZE') or 0)
+    if pp <= 1 or world <= 0 or S['role'] != 'train' or rank is None or rank < 0 or rank >= world:
+        return 0 if pp <= 1 else None
+    return int(rank) // (world // pp)
+
+
 def line():
     hbm, peak = _hbm()
     return {'t': round(time.time(), 3), 'rank': S['rank'], 'local_rank': S['local_rank'], 'node': node_name(), 'pid': os.getpid(),
             'tid': S['tid'], 'run': os.environ.get('FTV2_RUN') or os.environ.get('SLURM_STEP_ID', '0'), 'step': S['step'],
             'micro_batch': S['micro_batch'], 'phase': S['phase'], 'calls': S['calls'], 'step_s': S['step_s'], 'loss': S['loss'],
-            'hbm_gb': hbm, 'hbm_peak_gb': peak, 'card': S['card'], 'role': S['role'],
+            'hbm_gb': hbm, 'hbm_peak_gb': peak, 'card': S['card'], 'role': S['role'], 'stage': _stage(S['rank']),
             **({'test_kill_noop': True} if S.get('test_kill_noop') else {})}
 
 

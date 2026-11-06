@@ -111,8 +111,19 @@ class Track:
                 and s['low'] is not None}
 
 
+def by_stage(nodes):
+    """{stage: {node: state}}. Under a pipeline the stages make different numbers of communication calls by design, so counts
+    are only compared inside a stage (m3_map question 3; design map 2.1). Without a pipeline every node is stage 0."""
+    out = {}
+    for n, s in nodes.items():
+        st = s['beat'].get('stage')
+        out.setdefault(0 if st is None else st, {})[n] = s
+    return out
+
+
 def hang_suspect(track, now, still=STILL, still_save=STILL_SAVE):
-    """Signal 1 of a hang: (node, rank, still_for) or None."""
+    """Signal 1 of a hang: (node, rank, still_for) or None. Every training node still for STILL seconds, and inside some stage
+    the counts differ: the suspect is the node furthest behind its own stage's highest count."""
     nodes = track.training()
     if not nodes:
         return None
@@ -122,23 +133,27 @@ def hang_suspect(track, now, still=STILL, still_save=STILL_SAVE):
     still_for = now - last_move
     if still_for < limit:
         return None
-    low = min(s['low'] for s in nodes.values())
-    high = max(s['high'] for s in nodes.values())
-    if low >= high:
-        return None                                   # equal counts: a pause, or the open case (see all_still_equal)
-    node = sorted(n for n, s in nodes.items() if s['low'] == low)[0]
+    best = None
+    for st, group in sorted(by_stage(nodes).items(), key=lambda kv: str(kv[0])):
+        high = max(s['high'] for s in group.values())
+        for n, s in sorted(group.items()):
+            gap = high - s['low']
+            if gap > 0 and (best is None or gap > best[0]):
+                best = (gap, n)
+    if best is None:
+        return None                                   # equal counts in every stage: a pause, or the open case (all_still_equal)
+    node = best[1]
     return node, nodes[node]['beat'].get('low_rank'), round(still_for, 1)
 
 
 def all_still_equal(track, now, long=LONG):
-    """Everyone still with equal counts for LONG seconds: an alarm only (no single suspect)."""
+    """Everyone still with equal counts (inside each stage) for LONG seconds: an alarm only (no single suspect)."""
     nodes = track.training()
     if not nodes:
         return False
     last_move = max(s['changed'] for s in nodes.values())
-    low = min(s['low'] for s in nodes.values())
-    high = max(s['high'] for s in nodes.values())
-    return (now - last_move >= long and low == high and not any('save' in s['beat'].get('phases', []) for s in nodes.values())
+    equal = all(min(s['low'] for s in g.values()) == max(s['high'] for s in g.values()) for g in by_stage(nodes).values())
+    return (now - last_move >= long and equal and not any('save' in s['beat'].get('phases', []) for s in nodes.values())
             and min(s['beat'].get('step', -1) for s in nodes.values()) >= LONG_FROM_STEP)
 
 

@@ -74,4 +74,5 @@ def node_beat(node, lines, dead, now, role='train', dead_why=None, thread_errors
             'step': min((ln.get('step', -1) for ln in live), default=-1), 'low': low, 'low_rank': low_rank, 'high': high,
             'ranks': len(lines), 'rank_ids': sorted(ln.get('rank') for ln in lines), 'dead': sorted(dead), 'dead_why': dead_why or {},
             'thread_errors': thread_errors or {},
-            'phases': sorted({ln.get('phase', '?') for ln in live}), 'role': role}
+            'phases': sorted({ln.get('phase', '?') for ln in live}), 'role': role,
+            'stage': min((ln.get('stage') for ln in live if ln.get('stage') is not None), default=None)}

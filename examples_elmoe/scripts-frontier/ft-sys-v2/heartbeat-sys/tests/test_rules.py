@@ -35,6 +35,24 @@ t = track([(0, {'n0': beat(100, 101), 'n1': beat(100, 101)}), (5, {'n0': beat(15
            (10, {'n0': beat(158, 158), 'n1': beat(155, 158, 13)}), (20, {'n0': beat(158, 158), 'n1': beat(155, 158, 13)})])
 check('hang suspect after 15 s', R.hang_suspect(t, 20.1), ('n1', 13, 15.1))
 check('no suspect before 15 s', R.hang_suspect(t, 19.0), None)
+
+
+# milestone 3: a pipeline of two stages makes different numbers of calls by design; counts are compared inside a stage only
+def sbeat(low, high, stage, low_rank=0, step=5):
+    return dict(beat(low, high, low_rank, step=step), stage=stage)
+
+
+t = track([(0, {'a0': sbeat(100, 101, 0), 'b0': sbeat(100, 101, 0), 'a1': sbeat(60, 61, 1), 'b1': sbeat(60, 61, 1)}),
+           (5, {'a0': sbeat(158, 158, 0), 'b0': sbeat(158, 158, 0), 'a1': sbeat(90, 90, 1), 'b1': sbeat(90, 90, 1)}),
+           (25, {'a0': sbeat(158, 158, 0), 'b0': sbeat(158, 158, 0), 'a1': sbeat(90, 90, 1), 'b1': sbeat(90, 90, 1)})])
+check('pipeline: stages at different counts, equal inside each: no suspect', R.hang_suspect(t, 25), None)
+check('pipeline: equal inside each stage for LONG: the stuck alarm', R.all_still_equal(t, 5 + R.LONG), True)
+t = track([(0, {'a0': sbeat(100, 101, 0), 'b0': sbeat(100, 101, 0), 'a1': sbeat(60, 61, 1), 'b1': sbeat(60, 61, 1)}),
+           (5, {'a0': sbeat(158, 158, 0), 'b0': sbeat(158, 158, 0), 'a1': sbeat(90, 90, 1), 'b1': sbeat(86, 90, 1, 21)}),
+           (25, {'a0': sbeat(158, 158, 0), 'b0': sbeat(158, 158, 0), 'a1': sbeat(90, 90, 1), 'b1': sbeat(86, 90, 1, 21)})])
+check('pipeline: a node behind inside its stage is the suspect, not the stage with fewer calls', R.hang_suspect(t, 25),
+      ('b1', 21, 20.0))
+check('pipeline: counts differ inside a stage: no stuck alarm', R.all_still_equal(t, 5 + R.LONG), False)
 # a pause: everyone still with equal counts -> no suspect; an alarm only after LONG
 t = track([(0, {'n0': beat(100, 101), 'n1': beat(100, 101)}), (5, {'n0': beat(150, 150), 'n1': beat(150, 150)}),
            (60, {'n0': beat(150, 150), 'n1': beat(150, 150)})])
