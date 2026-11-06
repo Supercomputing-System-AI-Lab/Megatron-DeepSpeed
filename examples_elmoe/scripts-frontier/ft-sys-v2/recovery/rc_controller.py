@@ -287,12 +287,46 @@ class Recovery:
         return r
 
     def _commit_after(self, last):
-        stopping = bool(self.hb.S.get('stop'))
         st = getattr(self, 'pipe_st', None)
+        if not last and os.environ.get('FTV2_COMMIT_VERIFY', '1') == '1' and self.device.type == 'cuda':
+            # A commit is valid only if its reduction really ended on the GPU with every peer (M3P4 5867778): the host enqueues
+            # the reduction, the epilogue's adds and the commit's snapshot and token without waiting, so a reduction cut by a
+            # lost peer still "commits" its partial sums; the stop's revoke later ends the cut kernel and the stream runs on.
+            # Wait for the stream here; a reduction that ended because of the stop finds the stop flag set (it is set before the
+            # revoke, _on_failure), and one that ended on a network error leaves an error on its communicator.
+            torch.cuda.current_stream(self.device).synchronize()
+        stopping = bool(self.hb.S.get('stop')) or (not last and self._reduce_comm_error())
         self.commit.after_epilogue(stopping, last, pos=st['pos'] if st is not None else None)
         self.hb.S['micro_batch'] = self.commit.added           # the heartbeat line's micro-batch (and the tests' injection point)
         if stopping:
             raise self.hb.StopForRecovery('a stop began during a micro-batch epilogue')
+
+    def _reduce_comm_error(self):
+        """Has a communicator of this rank's ZeRO reduction groups (dense and expert data parallel) an asynchronous error?"""
+        lib = rc_stop.rccl()
+        if lib is None or self.adapter is None or self.device.type != 'cuda':
+            return False
+        import ctypes
+        z = self.adapter.zero
+        groups = list(getattr(z, 'real_dp_process_group', []) or [])
+        groups += list((getattr(z, 'expert_dp_process_group', None) or {}).values())
+        seen = set()
+        for pg in groups:
+            if pg is None or id(pg) in seen:
+                continue
+            seen.add(id(pg))
+            try:
+                ptr = pg._get_backend(self.device)._comm_ptr()
+            except Exception:
+                continue
+            if not ptr:
+                continue
+            st = ctypes.c_int(0)
+            lib.ncclCommGetAsyncError(ctypes.c_void_p(ptr), ctypes.byref(st))
+            if st.value != 0:
+                self.log(f'commit refused: a reduction communicator reports error {st.value}')
+                return True
+        return False
 
     def _on_step(self, iteration):
         """The top of every training iteration (hb_monitor.set_step): counters and RNG as they are at this step's start."""
