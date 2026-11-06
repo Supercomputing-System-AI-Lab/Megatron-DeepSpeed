@@ -67,6 +67,16 @@ check('signal is a root', R.death_cause('signal'), 'root')
 check('communication error is a consequence', R.death_cause('exception: RuntimeError: Connection reset by peer'), 'consequence')
 check('NCCL error is a consequence', R.death_cause('exception: DistBackendError: NCCL error in: ...'), 'consequence')
 check('ValueError is a root', R.death_cause('exception: ValueError: bad shape'), 'root')
+check('evidence: a rank in state D is a fault', R.evidence_verdict({20: {'state': 'D (disk sleep)', 'probe': 'ok'}})[0], True)
+check('evidence: a GPU probe that timed out is a fault', R.evidence_verdict({20: {'state': 'S (sleeping)', 'probe': 'timeout'}})[0],
+      True)
+check('evidence: a failed GPU probe is a fault', R.evidence_verdict({20: {'state': 'S', 'probe': 'fail'}})[0], True)
+check('evidence: sleeping, probe ok: no fault', R.evidence_verdict({20: {'state': 'S (sleeping)', 'probe': 'ok'}})[0], False)
+check('evidence: probe unavailable is not a fault', R.evidence_verdict({20: {'state': 'S', 'probe': 'unavailable'}})[0], False)
+check('evidence: nothing gathered: no fault', R.evidence_verdict({})[0], False)
+check('node checks: a failed node first, then a silent one',
+      R.node_check_verdict({'a': {'ok': True}, 'b': {'ok': False}}, {'a', 'b', 'c'}), ['b', 'c'])
+check('node checks: all passed', R.node_check_verdict({'a': {'ok': True}, 'b': {'ok': True}}, {'a', 'b'}), [])
 check('TypeError is a root ("peer" inside "TypeError", E5c 5862600)',
       R.death_cause('exception: TypeError: slice indices must be integers or None or have an __index__ method'), 'root')
 check('ProcessGroupNCCL text is a consequence', R.death_cause('exception: RuntimeError: ProcessGroupNCCL is aborted'), 'consequence')

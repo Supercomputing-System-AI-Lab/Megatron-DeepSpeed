@@ -13,6 +13,12 @@ Started by its own srun step, so a crashing training process cannot take it down
                      alive after FTV2_VICTIM_GRACE_S (a hung rank cannot leave by itself), and the standby's agent turns its role
                      into train
   on coordinator     when the key is deleted (the coordinator's node died), try to take the role (create-if-absent)
+  evidence           (2026-11-06, the real fault of V3-2L 5863006) for a rank py-spy cannot stack-dump: its main thread's state
+                     and wchan from /proc, a non-blocking py-spy dump, and a probe of its GPU in a process of its own
+                     (hb_gpu_probe.py); all go into the stacks answer, each step logged with its time
+  on check/<g>       the stuck rule's node check: a probe of every GPU of the node and its RAS counters against the agent's start
+  fencing            a replaced node's agent sends SIGKILL once to its ranks and their children and goes on; a rank that does not
+                     exit is left behind (logged), its run's lines no longer enter the beat
 Slow work (rocm-smi for ECC, py-spy) runs in threads of its own so the beat is never late. The ECC and xGMI readers follow
 ft-sys-v1's hb.py (_ecc_smi, _xgmi, host_mem_pct); here they run in the agent, outside the training processes (map 1.5).
 
@@ -34,6 +40,10 @@ from hb_coordinator import Coordinator
 from hb_etcd import Etcd, EtcdError
 
 STACK_GAP = float(os.environ.get('FTV2_STACK_GAP_S', '5'))   # seconds between the two py-spy dumps of a hang (the user, 11-05 11:50)
+PYSPY_TIMEOUT = float(os.environ.get('FTV2_PYSPY_TIMEOUT_S', '15'))   # a blocking dump that has not returned by then: no stack
+PROBE_IMPORT_S = float(os.environ.get('FTV2_PROBE_IMPORT_S', '90'))  # the probe's torch import from Lustre (not a GPU verdict)
+PROBE_GPU_S = float(os.environ.get('FTV2_PROBE_TIMEOUT_S', '30'))    # the probe's GPU work after the import: past this, "timeout"
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def host_mem_pct():
@@ -45,6 +55,20 @@ def host_mem_pct():
         return round(100.0 * (m['MemTotal'] - m['MemAvailable']) / m['MemTotal'], 1)
     except Exception:
         return -1.0
+
+
+def ras_ue():
+    """The node's uncorrectable memory-error count from the amdgpu RAS files (the gate's counters, gate/gate_node.sh), or -1."""
+    tot, seen = 0, False
+    for f in glob.glob('/sys/class/drm/card*/device/ras/umc_err_count'):
+        try:
+            for ln in open(f):
+                if ln.startswith('ue:'):
+                    tot += int(ln.split()[1])
+                    seen = True
+        except Exception:
+            pass
+    return tot if seen else -1
 
 
 def find_smi():
@@ -89,6 +113,104 @@ def proc_state(pid, tid):
         return 'gone'
 
 
+def proc_status(pid):
+    """The main thread's state letter and wchan from /proc (both readable without attaching to the process)."""
+    out = {}
+    try:
+        for ln in open(f'/proc/{int(pid)}/status'):
+            if ln.startswith('State:'):
+                out['state'] = ln.split(':', 1)[1].strip()
+                break
+    except Exception as e:
+        out['state'] = f'unreadable ({type(e).__name__})'
+    try:
+        out['wchan'] = open(f'/proc/{int(pid)}/wchan').read().strip() or '0'
+    except Exception as e:
+        out['wchan'] = f'unreadable ({type(e).__name__})'
+    try:
+        out['threads_d'] = sum(1 for t in glob.glob(f'/proc/{int(pid)}/task/*/stat')
+                               if open(t).read().rsplit(')', 1)[1].split()[0] == 'D')
+    except Exception:
+        pass
+    return out
+
+
+def children(pid):
+    """The pids whose parent is pid (one level; a rank's helpers, e.g. the vfork child of the D-state test)."""
+    out = []
+    for st in glob.glob('/proc/[0-9]*/stat'):
+        try:
+            if int(open(st).read().rsplit(')', 1)[1].split()[1]) == int(pid):
+                out.append(int(st.split('/')[2]))
+        except Exception:
+            pass
+    return out
+
+
+def run_probe(gpu, log=None, via_srun=None):
+    """hb_gpu_probe.py on one GPU, in a process of its own. Returns (result, detail): 'ok' | 'fail' | 'timeout' (the GPU work did
+    not finish within PROBE_GPU_S after the import) | 'unavailable' (no GPU visible here, or the import itself did not finish:
+    neither is a verdict on the GPU). The process is killed on a timeout and not waited for.
+    The agent's own Slurm step requests no GPU; if the probe sees none from there, it runs again as a step of its own that
+    shares the node's GPUs with the training (srun --overlap --gpus-per-node; FTV2_PROBE_SRUN=0 turns this off)."""
+    py = os.environ.get('FTV2_PROBE_PY') or sys.executable
+    env = dict(os.environ, HIP_VISIBLE_DEVICES=str(gpu))
+    cmd = [py, '-I', os.path.join(HERE, 'hb_gpu_probe.py')]
+    if via_srun:
+        cmd = ['srun', '--overlap', '-N1', '-n1', '-w', via_srun, '--gpus-per-node=8', '--cpus-per-task=1'] + cmd
+    t0 = time.time()
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+    except Exception as e:
+        return 'unavailable', f'could not start: {e}'
+    got = []
+
+    def reader():
+        for ln in p.stdout:
+            got.append((time.time(), ln.strip()))
+    th = threading.Thread(target=reader, daemon=True)
+    th.start()
+    t_imp = None
+    while True:
+        time.sleep(0.2)
+        lines = [g[1] for g in got]
+        if t_imp is None:
+            t_imp = next((t for t, ln in got if ln.startswith('imported')), None)
+        if any(ln.startswith('devices 0') for ln in lines):
+            res = ('unavailable', 'no GPU visible to the probe')
+            break
+        done = next((ln for ln in lines if ln.startswith(('ok', 'fail'))), None)
+        if done:
+            res = ('ok', done) if done.startswith('ok') else ('fail', done[5:])
+            break
+        if p.poll() is not None and not done:
+            th.join(timeout=1)
+            lines = [g[1] for g in got]
+            done = next((ln for ln in lines if ln.startswith(('ok', 'fail'))), None)
+            if done:
+                res = ('ok', done) if done.startswith('ok') else ('fail', done[5:])
+            else:
+                res = ('fail' if t_imp else 'unavailable', f'probe ended with code {p.returncode}: {" | ".join(lines)[-200:]}')
+            break
+        if t_imp is None and time.time() - t0 > PROBE_IMPORT_S:
+            res = ('unavailable', f'torch import not done in {PROBE_IMPORT_S:.0f} s')
+            break
+        if t_imp is not None and time.time() - t_imp > PROBE_GPU_S:
+            res = ('timeout', f'no answer from the GPU {PROBE_GPU_S:.0f} s after the import')
+            break
+    if p.poll() is None:
+        try:
+            p.kill()
+            p.wait(timeout=2)
+        except Exception:
+            pass                                   # a probe stuck in the driver is left behind, as a stuck rank is
+    if res[0] == 'unavailable' and res[1] == 'no GPU visible to the probe' and not via_srun and \
+            os.environ.get('SLURM_JOB_ID') and os.environ.get('FTV2_PROBE_SRUN', '1') == '1':
+        r2 = run_probe(gpu, log, via_srun=node_name())
+        return r2[0], f'{r2[1]} [as its own Slurm step: none visible from the agent\'s step]'
+    return res[0], f'{res[1]} ({time.time() - t0:.1f} s)'
+
+
 def alive(pid):
     """The process exists and is not a zombie (ended, not yet reaped by its parent: found in the login-node test, 11-05)."""
     try:
@@ -120,6 +242,8 @@ class Agent:
         self.seen_gone = set()     # (rank, pid) already logged as gone
         self.rec = os.path.join(self.job_dir, 'ft')
         os.makedirs(os.path.join(self.rec, 'nodes'), exist_ok=True)
+        self.fenced = {}           # run -> {pid: rank} left behind after this node was replaced (fencing)
+        self.ras0 = ras_ue()       # uncorrectable-error counts at the agent's start (the node check compares with them)
 
     def log(self, msg):
         print(f'[ftv2 agent {self.node}] {time.strftime("%H:%M:%S")} {msg}', flush=True)
@@ -168,20 +292,42 @@ class Agent:
             self.log(f'this standby node takes the place of {f.get("node")} (list {f.get("gen")})')
 
     def end_my_ranks(self, f):
-        """This node was replaced: SIGKILL its training ranks that are still alive (their monitors exit by themselves after the
-        stop; a rank hung in a GPU call or in a sleep cannot, HB2c)."""
+        """This node was replaced: SIGKILL, once, its training ranks that are still alive and their children (their monitors exit
+        by themselves after the stop; a rank hung in a GPU call or in a sleep cannot, HB2c), then go on: 5 s later the ones still
+        alive are logged and left behind (a process inside a stuck driver call cannot be ended, V3-2L 5863006), and the run's
+        lines no longer enter this node's beat (fenced). A rank whose line says test_kill_noop (the RF2 test) is not killed:
+        the synthetic "kill had no effect" branch; such leftovers are ended when the run is marked done."""
         import signal
-        for ln in self.read_lines():
+        run = str(f.get('run'))
+        left = {}
+        for ln in self.read_lines(include_fenced=True):
             pid = ln.get('pid')
-            if str(ln.get('run')) != str(f.get('run')):
+            if str(ln.get('run')) != run:
                 continue                       # a later run's process on this node (the next test arm): not a victim
-            if pid and alive(pid):
+            if not (pid and alive(pid)):
+                continue
+            if ln.get('test_kill_noop'):
+                self.log(f'replaced node: rank {ln.get("rank")} (pid {pid}): test_kill_noop: SIGKILL not sent (synthetic "kill had '
+                         f'no effect")')
+                left[int(pid)] = ln.get('rank')
+                continue
+            kids = children(pid)
+            for k in [int(pid)] + kids:
                 try:
-                    os.kill(int(pid), signal.SIGKILL)
-                    self.log(f'replaced node: rank {ln.get("rank")} (pid {pid}) still alive {time.time() - f.get("t", 0):.0f} s '
-                             f'after list {f.get("gen")}: SIGKILL')
+                    os.kill(k, signal.SIGKILL)
                 except OSError as e:
-                    self.log(f'could not end pid {pid}: {e}')
+                    self.log(f'could not end pid {k}: {e}')
+            self.log(f'replaced node: rank {ln.get("rank")} (pid {pid}, state {proc_status(pid).get("state", "?")}) still alive '
+                     f'{time.time() - f.get("t", 0):.0f} s after list {f.get("gen")}: SIGKILL to it and {len(kids)} child(ren)')
+            left[int(pid)] = ln.get('rank')
+        time.sleep(5)
+        still = {p: r for p, r in left.items() if alive(p)}
+        self.fenced[run] = still
+        if still:
+            self.log(f'fenced: run {run}: {len(still)} rank(s) still alive 5 s after the kill, left behind: '
+                     + ', '.join(f'rank {r} pid {p} {proc_status(p).get("state", "?")}' for p, r in still.items()))
+        else:
+            self.log(f'fenced: run {run}: every rank of this node has ended')
 
     def on_sample(self, kind, key, value, rev):
         if kind != 'PUT':
@@ -195,13 +341,20 @@ class Agent:
 
     def sample(self, g, req):
         """Signal 2's evidence: py-spy on this node's ranks twice, STACK_GAP seconds apart; the dumps and the last full lines to
-        Lustre; the verdict to etcd (confirmed only if both dumps confirm and the suspect has not moved, hb_stacks.verdict_twice)."""
+        Lustre; the verdict to etcd (confirmed only if both dumps confirm and the suspect has not moved, hb_stacks.verdict_twice).
+        Ranks with no stack in the first dump (py-spy could not attach within PYSPY_TIMEOUT) are not dumped again; for them the
+        agent gathers other evidence (evidence()), which goes into the same answer."""
+        t0 = time.time()
         lines = self.read_lines()
         pyspy = self.a.pyspy or shutil.which('py-spy') or os.path.expanduser('~/.local/bin/py-spy')
         first = self.dump_all(lines, pyspy)
+        nostack = [r for r, txt in first.items() if hb_stacks.main_thread_frames(txt or '') is None]
+        self.log(f'stacks for {g}: first dump in {time.time() - t0:.1f} s; no stack from rank(s) {nostack}')
         time.sleep(STACK_GAP)
-        second = self.dump_all(lines, pyspy)
+        second = self.dump_all([ln for ln in lines if ln['rank'] not in nostack], pyspy)
+        second.update({r: first[r] for r in nostack})
         decision, detail = hb_stacks.verdict_twice(first, second, req.get('rank'))
+        evidence = self.evidence(g, [ln for ln in lines if ln['rank'] in nostack], pyspy) if nostack else {}
         d = os.path.join(self.rec, 'failures', g)
         os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, f'stacks_{self.node}.txt'), 'w') as fh:
@@ -210,8 +363,82 @@ class Agent:
                     fh.write(f'=== rank {r}, {k} ===\n{dumps[r]}\n')
         with open(os.path.join(d, f'lines_{self.node}.json'), 'w') as fh:
             json.dump(lines, fh, indent=1)
-        self.etcd.put(f'stacks/{g}/{self.node}', json.dumps({'decision': decision, 'detail': detail, 't': round(time.time(), 3)}))
-        self.log(f'stacks for {g}: {decision} {detail}')
+        if evidence:
+            with open(os.path.join(d, f'evidence_{self.node}.json'), 'w') as fh:
+                json.dump(evidence, fh, indent=1)
+        self.etcd.put(f'stacks/{g}/{self.node}', json.dumps({'decision': decision, 'detail': detail, 'evidence': evidence,
+                                                             't': round(time.time(), 3)}))
+        self.log(f'stacks for {g}: {decision} {detail}; answered {time.time() - t0:.1f} s after the request reached this agent')
+
+    def evidence(self, g, lines, pyspy):
+        """For ranks py-spy could not stack-dump: /proc state and wchan, a non-blocking dump (reads memory without stopping the
+        process), and a probe of the rank's GPU, the last two in parallel. {rank: {...}}, every step logged with its time."""
+        t0 = time.time()
+        ev = {}
+        for ln in lines:
+            ps = proc_status(ln['pid'])
+            ev[ln['rank']] = dict(ps, pid=ln['pid'], gpu=ln.get('local_rank'))
+            self.log(f'evidence {g}: rank {ln["rank"]} (pid {ln["pid"]}): state {ps.get("state")}, wchan {ps.get("wchan")}, '
+                     f'threads in D {ps.get("threads_d")} ({time.time() - t0:.1f} s)')
+
+        def nb(ln):
+            try:
+                r = subprocess.run([pyspy, 'dump', '--nonblocking', '--pid', str(ln['pid'])], capture_output=True, text=True,
+                                   timeout=PYSPY_TIMEOUT)
+                txt = r.stdout + r.stderr
+            except Exception as e:
+                txt = f'py-spy --nonblocking failed: {e}'
+            fr = hb_stacks.main_thread_frames(txt)
+            e = ev[ln['rank']]
+            e['nonblocking'] = 'none' if fr is None else ('waiting' if hb_stacks.is_waiting(fr) else 'outside')
+            e['nonblocking_site'] = ' | '.join(hb_stacks.blocking_site(fr))[:200] if fr else txt.strip()[-160:]
+            self.log(f'evidence {g}: rank {ln["rank"]}: non-blocking dump: {e["nonblocking"]} ({e["nonblocking_site"][:120]}) '
+                     f'({time.time() - t0:.1f} s)')
+
+        def pr(gpu, ranks):
+            res, det = run_probe(gpu)
+            for r in ranks:
+                ev[r]['probe'], ev[r]['probe_detail'] = res, det
+            self.log(f'evidence {g}: probe of GPU {gpu} (rank(s) {ranks}): {res}: {det} ({time.time() - t0:.1f} s)')
+        gpus = {}
+        for ln in lines:
+            gpus.setdefault(ln.get('local_rank'), []).append(ln['rank'])
+        ts = [threading.Thread(target=nb, args=(ln,)) for ln in lines]
+        ts += [threading.Thread(target=pr, args=(gpu, rs)) for gpu, rs in gpus.items() if gpu is not None and gpu >= 0]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        return ev
+
+    def on_check(self, kind, key, value, rev):
+        if kind != 'PUT':
+            return
+        try:
+            req = json.loads(value)
+        except ValueError:
+            return
+        if req.get('node') in (self.node, '*'):            # the coordinator counts only the training nodes' answers
+            threading.Thread(target=self.check, args=(key.split('/')[1], req), daemon=True).start()
+
+    def check(self, g, req):
+        """The stuck rule's node check: every GPU of this node probed at once (hb_gpu_probe.py, each in a process of its own) and
+        the RAS uncorrectable-error count compared with the agent's start. ok unless a probe failed or timed out, or the count
+        grew. A probe that is unavailable here is reported, not counted as a failure."""
+        t0 = time.time()
+        res = {}
+
+        def one(gpu):
+            res[gpu] = run_probe(gpu)
+        ts = [threading.Thread(target=one, args=(k,)) for k in range(self.a.gpus)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        ue = ras_ue()
+        bad = {k: v for k, v in res.items() if v[0] in ('fail', 'timeout')}
+        ras_grew = ue >= 0 and self.ras0 >= 0 and ue > self.ras0
+        ok = not bad and not ras_grew
+        detail = {'gpus': {str(k): f'{v[0]}: {v[1]}'[:160] for k, v in sorted(res.items())}, 'ras_ue': [self.ras0, ue]}
+        self.etcd.put(f'check/{g}/{self.node}', json.dumps({'ok': ok, 'detail': detail, 't': round(time.time(), 3)}))
+        self.log(f'node check {g}: {"ok" if ok else "FAILED"} in {time.time() - t0:.1f} s: '
+                 + ', '.join(f'GPU {k} {v[0]}' for k, v in sorted(res.items())) + f'; RAS ue {self.ras0} -> {ue}')
 
     def dump_all(self, lines, pyspy):
         """One py-spy dump of each live rank of this node, all at once: {rank: text}."""
@@ -219,7 +446,8 @@ class Agent:
 
         def one(ln):
             try:
-                r = subprocess.run([pyspy, 'dump', '--native', '--pid', str(ln['pid'])], capture_output=True, text=True, timeout=50)
+                r = subprocess.run([pyspy, 'dump', '--native', '--pid', str(ln['pid'])], capture_output=True, text=True,
+                                   timeout=PYSPY_TIMEOUT)
                 dumps[ln['rank']] = r.stdout + r.stderr
             except Exception as e:
                 dumps[ln['rank']] = f'py-spy failed: {e}'
@@ -229,9 +457,9 @@ class Agent:
         return dumps
 
     # the beats
-    def read_lines(self):
+    def read_lines(self, include_fenced=False):
         lines = [read_json(p) for p in glob.glob(os.path.join(self.dir, 'rank_*.json'))]
-        lines = [ln for ln in lines if ln]
+        lines = [ln for ln in lines if ln and (include_fenced or str(ln.get('run')) not in self.fenced)]
         if not lines:
             return []
         run = max(lines, key=lambda ln: ln.get('t', 0)).get('run')
@@ -292,6 +520,28 @@ class Agent:
             self.log(f'fast beat failed: {e}')
         return lines
 
+    def end_leftovers(self):
+        """Ranks left behind by a fenced run (the RF2 test's synthetic leftovers) are ended once the run is marked done, so that
+        the test arm's Slurm step can end. A process that cannot be killed stays, as on frontier02408."""
+        import signal
+        for run, left in list(self.fenced.items()):
+            if not left:
+                continue
+            try:
+                v, _ = self.etcd.get(f'run_done/{run.split(".g")[0]}')
+            except EtcdError:
+                v = None
+            if not v:
+                continue
+            for p, r in list(left.items()):
+                for k in [p] + children(p):
+                    try:
+                        os.kill(k, signal.SIGKILL)
+                    except OSError:
+                        pass
+                self.log(f'fenced run {run} is done: leftover rank {r} (pid {p}) ended (cleanup)')
+            self.fenced[run] = {}
+
     def slow_beat(self, lines):
         hm = host_mem_pct()
         out = []
@@ -316,7 +566,15 @@ class Agent:
         self.etcd.watch('coordinator', self.on_coordinator, name='watch-coordinator')
         self.etcd.watch('failed/', self.on_failed, name='watch-failed')
         self.etcd.watch('sample/', self.on_sample, name='watch-sample')
+        self.etcd.watch('check/', self.on_check, name='watch-check')
         self.try_coordinate()
+        if os.environ.get('FTV2_PROBE_AT_START') == '1' and self.a.gpus > 0:
+            def startup_probe():
+                t0 = time.time()
+                r = run_probe(0)
+                self.log(f'startup probe of GPU 0 (can this agent probe its GPUs?): {r[0]}: {r[1]}; RAS ue {self.ras0} '
+                         f'({time.time() - t0:.1f} s)')
+            threading.Thread(target=startup_probe, daemon=True).start()
         if self.a.gpus > 0 and self.a.role == 'train':
             threading.Thread(target=self.ecc_loop, name='ecc', daemon=True).start()
         self.log(f'agent on: etcd {self.a.etcd}; lease {self.a.lease} s; fast beat every {self.a.beat} s; slow every {self.a.slow} s; '
@@ -325,6 +583,7 @@ class Agent:
         while True:
             t0 = time.time()
             lines = self.fast_beat()
+            self.end_leftovers()
             c = self.coord
             if c is not None:
                 try:

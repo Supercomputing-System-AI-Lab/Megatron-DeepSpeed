@@ -12,6 +12,10 @@ on the design map (11-04):
   pause          every rank still with equal counts (an optimizer step, a save): nothing for LONG seconds; then, once training is
                  past its first steps, kind "stuck" (the user, 11-05 12:0x: "for a stuck over the nccl or anything, I will give it
                  3 mins"): every node's stacks are saved and training stops; finding the node or link (gate checks) comes later.
+  no stacks      (2026-11-06, the real fault of V3-2L 5863006) the suspect's stacks cannot be taken: the agent gathers other
+                 evidence (evidence_verdict): a rank in state D or a GPU that does not answer -> kind "hardware fault", replace
+                 the node; no evidence -> the stuck rule at LONG seconds of stall: every training node checks its GPUs
+                 (node_check_verdict), a failing node is replaced, none -> kind "stuck", stop. A decision in bounded time.
 Times are the coordinator's own clock: it compares what it read at different moments, never times written on other nodes."""
 
 import os
@@ -26,6 +30,35 @@ LONG = float(os.environ.get('FTV2_EQUAL_STILL_S', '180'))      # everyone still 
 LONG_FROM_STEP = 2                                              # ... once every node is past its first steps (a long first-step
                                                                 #   compile or autotune is still, with equal counts, and healthy)
 SETTLE = float(os.environ.get('FTV2_CRASH_SETTLE_S', '25'))    # with only communication deaths, how long to wait for a lost node
+CHECK_WAIT = float(os.environ.get('FTV2_CHECK_WAIT_S', '120'))  # the stuck rule's node checks: how long to wait for every answer
+
+
+def evidence_verdict(evidence):
+    """The evidence an agent gathered on ranks it could not stack-dump (2026-11-06, the real fault of V3-2L 5863006: two ranks
+    inside the GPU driver, unkillable, py-spy could not attach). evidence: {rank: {'state': the main thread's /proc state letter,
+    'wchan': ..., 'probe': 'ok' | 'fail' | 'timeout' | 'unavailable', 'nonblocking': 'outside' | 'waiting' | 'none'}}.
+    Returns (fault, why): fault True when a rank's main thread is in state D (uninterruptible: inside the kernel, as a driver call
+    that does not return) or its GPU's probe failed or did not answer; else False (no evidence of a fault: the stuck rule)."""
+    reasons = []
+    for r, e in sorted((evidence or {}).items(), key=lambda kv: str(kv[0])):
+        if str(e.get('state', '')).startswith('D'):
+            reasons.append(f'rank {r} in state D (wchan {e.get("wchan") or "?"})')
+        if e.get('probe') in ('fail', 'timeout'):
+            reasons.append(f'rank {r}: its GPU probe {e.get("probe")} ({e.get("probe_detail", "")[:80]})')
+    if reasons:
+        return True, '; '.join(reasons)
+    seen = ', '.join(f'rank {r}: state {e.get("state", "?")}, probe {e.get("probe", "?")}, nonblocking stack '
+                     f'{e.get("nonblocking", "?")}' for r, e in sorted((evidence or {}).items(), key=lambda kv: str(kv[0])))
+    return False, f'no evidence of a fault ({seen or "nothing gathered"})'
+
+
+def node_check_verdict(answers, want):
+    """The stuck rule's node checks (every training node's agent probes each of its GPUs and reads its RAS counters).
+    answers: {node: {'ok': bool, 'detail': ...}}; want: the training nodes. Returns the failing nodes, in order: a node whose check
+    failed, then a node that did not answer (its probe hung, or its agent did)."""
+    failed = [n for n in sorted(want) if n in answers and not answers[n].get('ok')]
+    silent = [n for n in sorted(want) if n not in answers]
+    return failed + silent
 
 # A death whose exception names a communication failure is a consequence: a peer died and this rank's call failed with it.
 # Whole words only: case-insensitive "peer" matched inside "TyPEError", so every TypeError counted as a communication error

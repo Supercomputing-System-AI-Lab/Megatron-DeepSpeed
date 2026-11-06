@@ -166,6 +166,58 @@ check('communication errors only: run_done of the base run after it', done is no
       done)
 
 
+def run_unconfirmed(answer, checks=None, quiet_node_check=False):
+    """A rank hangs on n1 and its stacks cannot be taken (2026-11-06, the real fault of V3-2L 5863006). answer: the evidence in
+    n1's stacks answer ({} = none), or None = no answer at all; checks: the node checks' answers. Returns (list or None, time)."""
+    import hb_rules as HR
+    st = Store()
+    for n in ('n0', 'n1', 'n2'):
+        st.kv[f'members/{n}'] = json.dumps({'role': 'train'})
+        beat(st, n, 100, 101)
+    st.kv['members/nS'] = json.dumps({'role': 'standby'})
+    st.kv['node/nS'] = json.dumps({'node': 'nS', 'run': None, 'low': None, 'high': None, 'rank_ids': [], 'dead': [],
+                                   'dead_why': {}, 'phases': [], 'role': 'standby'})
+    c = Coordinator(st, 'nX', tempfile.mkdtemp(), lambda m: None)
+    c.step(1000)
+    beat(st, 'n0', 240, 240); beat(st, 'n1', 230, 240, low_rank=12); beat(st, 'n2', 240, 240)
+    for t in range(1005, 1600, 5):
+        c.step(t)
+        inc = c.incident
+        if inc and answer is not None and f'stacks/{inc["gen"]}/{inc["node"]}' not in st.kv:
+            st.kv[f'stacks/{inc["gen"]}/{inc["node"]}'] = json.dumps(
+                {'decision': 'no-stack', 'detail': {'outside': [], 'waiting': [8, 9], 'no_stack': [12]}, 'evidence': answer})
+        if inc and 'check_t' in inc and checks is not None:
+            for n, ok in checks.items():
+                if not (quiet_node_check and n == 'n2'):
+                    st.kv[f'check/{inc["gen"]}/{n}'] = json.dumps({'ok': ok, 'detail': {'gpus': {}}})
+        if failed(st):
+            return failed(st)[0], t - 1000
+    return None, None
+
+
+D_EV = {12: {'state': 'D (disk sleep)', 'wchan': 'kernel_clone', 'probe': 'ok', 'nonblocking': 'outside'}}
+NO_EV = {12: {'state': 'S (sleeping)', 'wchan': 'unreadable (PermissionError)', 'probe': 'ok', 'nonblocking': 'none'}}
+f, t = run_unconfirmed(D_EV)
+check('no stacks, rank in state D: hardware fault, n1 replaced by the standby, at once',
+      bool(f) and f['kind'] == 'hardware fault' and f['node'] == 'n1' and f.get('standby') == 'nS' and t < 60,
+      f and (f['kind'], f['node'], f.get('standby'), t))
+f, t = run_unconfirmed({12: dict(NO_EV[12], probe='timeout')})
+check('no stacks, GPU probe timed out: hardware fault, replaced', bool(f) and f['kind'] == 'hardware fault' and f.get('replace'),
+      f and (f['kind'], f.get('replace'), t))
+f, t = run_unconfirmed(NO_EV, checks={'n0': True, 'n1': True, 'n2': True})
+check('no evidence, every node check passes: stuck at the stuck rule (180 s of stall), no replacement',
+      bool(f) and f['kind'] == 'stuck' and not f.get('replace') and 180 <= t + 15 < 260, f and (f['kind'], f.get('replace'), t))
+f, t = run_unconfirmed(NO_EV, checks={'n0': True, 'n1': True, 'n2': False})
+check('no evidence, n2 fails its node check: hardware fault on n2, replaced',
+      bool(f) and f['kind'] == 'hardware fault' and f['node'] == 'n2' and f.get('replace'), f and (f['kind'], f['node'], t))
+f, t = run_unconfirmed(NO_EV, checks={'n0': True, 'n1': True, 'n2': True}, quiet_node_check=True)
+check('no evidence, n2 never answers its node check: n2 replaced after the check wait',
+      bool(f) and f['kind'] == 'hardware fault' and f['node'] == 'n2', f and (f['kind'], f['node'], t))
+f, t = run_unconfirmed(None, checks={'n0': True, 'n1': True, 'n2': True})
+check('no answer at all from n1 (its agent stuck too): the stuck rule, then stuck', bool(f) and f['kind'] == 'stuck',
+      f and (f['kind'], t))
+
+
 def run_stuck():
     """Every rank still with equal counts past the first steps: stacks from every node, then kind stuck."""
     st = Store()

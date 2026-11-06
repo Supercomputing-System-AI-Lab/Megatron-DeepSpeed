@@ -19,7 +19,10 @@ memory access fault from a HIP kernel, FTV2_HIP_FAULT_SO; on the X-MoE stack the
 E3 5862190), hipabort:<rank>:<step> (the same fault, then SIGABRT if the process is still alive: the end the toy's process had,
 toy 5841333, where threads raised signal 6 after the same queue error), hwfault:<rank>:<step> (synthetic: an exception whose text
 names a hardware fault, to test the classifier's branch "hardware fault -> replace the node"; no real fault),
-pause:all:<step>:<seconds>, slow:<rank>:<step>:<milliseconds>; kill, hang, hip, hipabort, hwfault, abort and exit take an
+dhang:<rank>:<step> (the main thread enters state D through a vfork whose child pauses, FTV2_DHANG_SO; with
+FTV2_TEST_STAY_ALIVE=1 the process also ignores the failure list and asks its agent not to kill it: RF2's synthetic leftover),
+nodump:<rank>:<step> (the process makes itself non-dumpable, prctl PR_SET_DUMPABLE 0, and hangs: no stack can be taken),
+pause:all:<step>:<seconds>, slow:<rank>:<step>:<milliseconds>; kill, hang, hip, hipabort, hwfault, dhang, nodump, abort and exit take an
 optional 4th field, the micro-batch of the step to fire at (the micro-batches done, as the recovery's commit hook counts them;
 milestone 2).
 Each fires before a communication call of that step; an injection fires once per process (a rank that recovers does not fire it
@@ -63,7 +66,8 @@ def _inject():
         if j['done'] or S['step'] < j['step'] or (j['rank'] != 'all' and int(j['rank']) != S['rank']):
             continue
         k = j['kind']
-        if k in ('kill', 'hang', 'hip', 'hipabort', 'hwfault', 'abort', 'exit') and j['arg'] and S['step'] == j['step'] and \
+        if k in ('kill', 'hang', 'hip', 'hipabort', 'hwfault', 'dhang', 'nodump', 'abort', 'exit') and j['arg'] and \
+                S['step'] == j['step'] and \
                 S['micro_batch'] < j['arg']:
             continue                                   # kind:<rank>:<step>:<micro-batch>: wait for that micro-batch of the step
         if k == 'slow':
@@ -107,6 +111,19 @@ def _inject():
                     _log(f'hipabort: the runtime reported the fault as {type(e).__name__}: SIGABRT now')
                 sys.stderr.flush()
                 os.abort()                             # no exit record, as a process the runtime aborts
+        if k == 'dhang':                               # the RF1/RF2 tests: the main thread enters state D, as inside a driver call
+            import ctypes
+            if os.environ.get('FTV2_TEST_STAY_ALIVE') == '1':
+                S['test_kill_noop'] = True             # RF2: this process ignores the list and the agent does not kill it (synthetic)
+            lib = ctypes.CDLL(os.environ['FTV2_DHANG_SO'])
+            _log('dhang: entering state D (vfork; the child pauses, so the parent waits in the kernel)')
+            lib.ftv2_vfork_hang()                      # does not return; ctypes releases the GIL, so the monitor thread runs on
+        if k == 'nodump':                              # the RF3 test: a hang no stack dump can see, on a healthy GPU
+            import ctypes
+            ctypes.CDLL(None).prctl(4, 0, 0, 0, 0)     # PR_SET_DUMPABLE = 4: ptrace attach (py-spy) is refused
+            _log('nodump: this process is no longer dumpable; hanging')
+            while True:
+                time.sleep(3600)
         if k == 'pause':
             time.sleep(j['arg'])                       # every rank pauses at the same call: equal counts
 
@@ -186,7 +203,8 @@ def line():
     return {'t': round(time.time(), 3), 'rank': S['rank'], 'local_rank': S['local_rank'], 'node': node_name(), 'pid': os.getpid(),
             'tid': S['tid'], 'run': os.environ.get('FTV2_RUN') or os.environ.get('SLURM_STEP_ID', '0'), 'step': S['step'],
             'micro_batch': S['micro_batch'], 'phase': S['phase'], 'calls': S['calls'], 'step_s': S['step_s'], 'loss': S['loss'],
-            'hbm_gb': hbm, 'hbm_peak_gb': peak, 'card': S['card'], 'role': S['role']}
+            'hbm_gb': hbm, 'hbm_peak_gb': peak, 'card': S['card'], 'role': S['role'],
+            **({'test_kill_noop': True} if S.get('test_kill_noop') else {})}
 
 
 def _write_exit(reason, code):

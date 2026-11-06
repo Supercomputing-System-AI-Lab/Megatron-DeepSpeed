@@ -28,7 +28,8 @@ import time
 
 import hb_rules
 
-STACK_WAIT = 90.0        # seconds to wait for the suspect node's stacks before an alarm
+STACK_WAIT = float(os.environ.get('FTV2_STACK_WAIT_S', '150'))   # seconds to wait for the suspect node's stacks and evidence
+                                                                #   (two dumps of at most 15 s, the evidence: a probe of up to 2 min)
 HOLD = 60.0              # seconds before the same suspect is sampled again after an ambiguous answer
 SUMMARY = float(os.environ.get('FTV2_SLOW_BEAT_S', '60'))
 OOM_RECONFIG = os.environ.get('FTV2_OOM_RECONFIG', '1') == '1'   # out of memory: re-configure with the OOM ladder (on by default)
@@ -283,6 +284,53 @@ class Coordinator:
                 self.record(f'STUCK {g}: every rank still for {hb_rules.LONG:.0f} s with equal counts; stacks requested from '
                             f'every node')
 
+    def _start_stuck_rule(self, now, why):
+        inc = self.incident
+        inc['stuck_rule'] = True
+        inc['stall_start'] = inc['t_sample'] - float(inc.get('still_s') or 0)
+        inc['stuck_why'] = why
+        left = max(0.0, hb_rules.LONG - (now - inc['stall_start']))
+        self.record(f'STUCK RULE {inc["gen"]}: no evidence of a fault ({why}); node checks on every training node once the '
+                    f'stall reaches {hb_rules.LONG:.0f} s (in {left:.0f} s)')
+
+    def _stuck_rule(self, beats, run, now):
+        """The user's stuck rule (#5, 11-05: "for a stuck over the nccl or anything, I will give it 3 mins") for a stall the
+        evidence could not explain: at LONG seconds of stall every training node checks its GPUs (the agents' check/<g>); a
+        failing node is replaced (kind "hardware fault"); if every node passes, kind "stuck": stop for debugging."""
+        inc = self.incident
+        g, node, rank = inc['gen'], inc['node'], inc['rank']
+        if now - inc['stall_start'] < hb_rules.LONG:
+            return
+        want = set(self.track.training())
+        if 'check_t' not in inc:
+            req = {'node': '*', 'run': run, 'for': g, 't': round(now, 3), 'by': self.me}
+            self.etcd.put(f'check/{g}', json.dumps(req))
+            inc['check_t'] = now
+            self.record(f'NODE CHECKS {g}: stall of {now - inc["stall_start"]:.0f} s: every training node probes its GPUs '
+                        f'({", ".join(sorted(want))})')
+            return
+        got, _ = self.etcd.range(f'check/{g}/')
+        answers = {}
+        for k, v in got.items():
+            try:
+                answers[k.split('/')[2]] = json.loads(v)
+            except (ValueError, IndexError):
+                pass
+        if not (want <= set(answers)) and now - inc['check_t'] < hb_rules.CHECK_WAIT:
+            return
+        failing = hb_rules.node_check_verdict(answers, want)
+        if failing:
+            bad = node if node in failing else failing[0]
+            d = answers.get(bad, {}).get('detail', 'no answer in time')
+            self.declare(beats, run, 'hardware fault', bad, rank if bad == node else None,
+                         f'stuck rule: stall of {now - inc["stall_start"]:.0f} s with no evidence on {node} '
+                         f'({inc.get("stuck_why")}); the node check of {bad} failed: {json.dumps(d)[:300]}', gen=g)
+            return
+        self.declare(beats, run, 'stuck', node, rank,
+                     f'stuck rule: stall of {now - inc["stall_start"]:.0f} s; no stacks and no evidence of a fault on {node} '
+                     f'({inc.get("stuck_why")}); the node checks of {len(answers)} training nodes passed: stop for debugging',
+                     gen=g)
+
     def _progress(self, beats, run, now):
         inc = self.incident
         g, node, rank = inc['gen'], inc['node'], inc['rank']
@@ -299,13 +347,14 @@ class Coordinator:
             if hb_rules.lost_node_verdict(self.track, node, now) == 'lost':
                 self.declare(beats, run, 'node lost', node, rank, f'lease of {node} ended while its stacks were awaited', gen=g)
             return
+        if inc.get('stuck_rule'):                      # no stacks and no evidence of a fault: the stuck rule decides
+            self._stuck_rule(beats, run, now)
+            return
         ans, _ = self.etcd.get(f'stacks/{g}/{node}')
         if ans is None:
             if now - inc['t_sample'] > STACK_WAIT:
-                self.record(f'ALARM {g}: no stacks from {node} in {STACK_WAIT:.0f} s; no replacement')
-                self.etcd.put(f'closed/{g}', 'no stacks')
-                self.hold[(node, rank)] = now + HOLD
-                self.incident = None
+                self.record(f'NO ANSWER {g}: no stacks or evidence from {node} in {STACK_WAIT:.0f} s: the stuck rule decides')
+                self._start_stuck_rule(now, f'no answer from {node} in {STACK_WAIT:.0f} s')
             return
         a = json.loads(ans)
         if a.get('decision') == 'confirmed':
@@ -322,9 +371,25 @@ class Coordinator:
                              f'lease of {silent[0]} ended and the training stalled; the stacks of {node} show every rank '
                              f'waiting, so the silent node is the cause', gen=g)
                 return
-            self.record(f'ALARM {g}: stacks of {node} do not confirm rank {rank} ({a.get("decision")}: {a.get("detail")}); '
-                        f'no replacement')
-            self.log(f'signal 2 not confirmed for rank {rank}: {a}')
-            self.etcd.put(f'closed/{g}', a.get('decision', '?'))
-            self.hold[(node, rank)] = now + HOLD
-            self.incident = None
+            if a.get('decision') == 'moved':
+                # the suspect is not blocked (its stack changed between the dumps): no fault to act on yet
+                self.record(f'ALARM {g}: stacks of {node} do not confirm rank {rank} ({a.get("decision")}: {a.get("detail")}); '
+                            f'no replacement')
+                self.log(f'signal 2 not confirmed for rank {rank}: {a}')
+                self.etcd.put(f'closed/{g}', a.get('decision', '?'))
+                self.hold[(node, rank)] = now + HOLD
+                self.incident = None
+                return
+            # no confirming stacks (none could be taken, or every rank waits): the evidence decides, else the stuck rule
+            # (2026-11-06, the real fault of V3-2L 5863006: "no stacks, no replacement" waited until PyTorch's watchdog
+            # killed the survivors; a decision must come in bounded time)
+            fault, why = hb_rules.evidence_verdict(a.get('evidence') or {})
+            if fault:
+                self.declare(beats, run, 'hardware fault', node, rank,
+                             f'GPU stuck: signal 1: counts still for {inc.get("still_s")} s and differ; the stacks of {node} '
+                             f'were not taken ({a.get("decision")}: no stack from {a.get("detail", {}).get("no_stack")}); '
+                             f'evidence: {why}', gen=g)
+                return
+            self.record(f'UNCONFIRMED {g}: stacks of {node} do not confirm rank {rank} ({a.get("decision")}: '
+                        f'{a.get("detail")}); {why}: the stuck rule decides')
+            self._start_stuck_rule(now, why)
