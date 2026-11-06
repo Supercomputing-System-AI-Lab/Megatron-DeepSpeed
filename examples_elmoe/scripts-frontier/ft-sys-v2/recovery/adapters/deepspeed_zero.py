@@ -335,10 +335,29 @@ class ZeroAdapter:
         micro_batches set to m - J for this call; the loss scale stays 1/m, DeepSpeedEngine.backward), and a stage whose
         sums already hold micro-batches J..drop_until-1 drops their gradients instead of reducing them.
         Returns the state dict {'pos': micro-batches of this step done here, 'spaced': True inside a spaced reduction}."""
+        import os
         from deepspeed.runtime.pipe import schedule as pipe_sched
         eng, z = self.engine, self.zero
-        st = {'pos': 0, 'drop_until': 0, 'm': int(eng.micro_batches), 'spaced': False, 'k': int(k)}
+        # where the reduction runs (FTV2_COMMIT_AT): 'backward' right after the backward pass; 'send' after the next
+        # instruction that sends this micro-batch's input gradient to the previous stage (SendGrad, issued at the stage's next
+        # forward step, pipe/schedule.py:213-216), so the previous stage is not kept waiting for its gradient while this stage
+        # reduces. The first stage sends no gradient: it reduces right after its backward either way.
+        at = os.environ.get('FTV2_COMMIT_AT', 'backward')
+        defer = at == 'send' and not eng.is_first_stage()
+        st = {'pos': 0, 'drop_until': 0, 'm': int(eng.micro_batches), 'spaced': False, 'k': int(k), 'pending': False,
+              'at': 'send' if defer else 'backward'}
         orig_bwd = type(eng)._INSTRUCTION_MAP[pipe_sched.BackwardPass]
+        orig_sgrad = type(eng)._INSTRUCTION_MAP[pipe_sched.SendGrad]
+
+        def reduce_now():
+            prev = z.is_gradient_accumulation_boundary
+            z.is_gradient_accumulation_boundary = True
+            st['spaced'] = True
+            try:
+                z.reduce_gradients(pipeline_parallel=True)
+            finally:
+                st['spaced'] = False
+                z.is_gradient_accumulation_boundary = prev
 
         def backward(self_, buffer_id):
             orig_bwd(self_, buffer_id)
@@ -349,23 +368,28 @@ class ZeroAdapter:
             if p <= st['drop_until']:
                 z.zero_grad(set_to_none=True)             # these micro-batches are in this stage's sums already
                 return
-            prev = z.is_gradient_accumulation_boundary
-            z.is_gradient_accumulation_boundary = True
-            st['spaced'] = True
-            try:
-                z.reduce_gradients(pipeline_parallel=True)
-            finally:
-                st['spaced'] = False
-                z.is_gradient_accumulation_boundary = prev
+            if defer:
+                st['pending'] = True
+            else:
+                reduce_now()
+
+        def send_grad(self_, buffer_id):
+            orig_sgrad(self_, buffer_id)
+            if st['pending']:
+                st['pending'] = False
+                reduce_now()
         backward._ftv2_wrapped = True
+        send_grad._ftv2_wrapped = True
         imap = dict(type(eng)._INSTRUCTION_MAP)
         imap[pipe_sched.BackwardPass] = backward
+        if defer:
+            imap[pipe_sched.SendGrad] = send_grad
         eng._INSTRUCTION_MAP = imap
         orig_tb = eng.train_batch
 
         def train_batch(data_iter=None):
             J, drop = start()
-            st['pos'], st['drop_until'] = int(J), int(drop)
+            st['pos'], st['drop_until'], st['pending'] = int(J), int(drop), False
             if J:
                 eng.micro_batches = st['m'] - int(J)
             try:
