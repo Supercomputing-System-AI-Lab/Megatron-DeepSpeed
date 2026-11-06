@@ -195,6 +195,15 @@ class Coordinator:
         for n, b in sorted(beats.items()):
             if b.get('run') != run:
                 continue
+            if b.get('role') == 'standby':
+                # a standby's processes are not in the training: their death is a lost standby, not a training failure
+                # (P1b 5861716: the standby's exception was written as a failure of the run and the training was stopped)
+                for r in hb_rules.crash_report(b):
+                    if ('standby-gone', n, run) not in self.warned:
+                        self.warned.add(('standby-gone', n, run))
+                        self.record(f'WARNING {n}: standby process {r} gone ({b.get("dead_why", {}).get(str(r), "signal")[:120]}); '
+                                    f'not a training failure')
+                continue
             for r in hb_rules.crash_report(b):
                 why = b.get('dead_why', {}).get(str(r), 'signal')
                 (roots if hb_rules.death_cause(why) == 'root' else conseq).append((n, r, why))

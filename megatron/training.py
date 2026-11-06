@@ -221,6 +221,26 @@ def _xmoe_ftv2():
     return _XMOE_FTV2['mod']
 
 
+# [ft-sys-v2 2026-11-06] the in-process recovery (examples_elmoe/scripts-frontier/ft-sys-v2/recovery/): on only with XMOE_FT_V2=1
+# AND FTV2_RECOVERY=1. Off, nothing below is imported and pretrain() runs exactly as before. The hooks in pretrain(): the standby's
+# start (no world until it joins), Keep installed after the first build, and train() run inside the recovery's loop, which enters
+# it again at the resume step after a recovery (train() starts at args.iteration). No line of train() changes.
+_XMOE_FTV2_RC = {'obj': None, 'tried': False}
+
+
+def _xmoe_ftv2_rc():
+    if not _XMOE_FTV2_RC['tried']:
+        _XMOE_FTV2_RC['tried'] = True
+        if _xmoe_ftv2() is not None and os.environ.get('FTV2_RECOVERY') == '1':
+            _d = os.environ.get('FTV2_RC_DIR') or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                                               'examples_elmoe', 'scripts-frontier', 'ft-sys-v2', 'recovery')
+            if _d not in sys.path:
+                sys.path.insert(0, _d)
+            import rc_controller as _rcm
+            _XMOE_FTV2_RC['obj'] = _rcm.Recovery(_XMOE_FTV2['mod'], None)
+    return _XMOE_FTV2_RC['obj']
+
+
 # [X-MoE resilience 2026-10-10] THE WALL-AWARE EXIT (XMOE_WALL_AWARE_EXIT=1; unset or 0 = today's behaviour, unchanged).
 # WHY: in the 260-node job 5645677 (wall 2 h, steps of 43 min) the exit was --exit-duration-in-mins = wall - 20, checked by
 # Megatron only at the END of an iteration against the trainer's own start time; the steps ended at minute 51 and 94, the third
@@ -554,12 +574,24 @@ def pretrain(train_valid_test_dataset_provider,
     # torch.cuda.set_device(local_rank)
 
     _xmoe_ftv2()             # [ft-sys-v2] the call counter goes in before the first communication call
+    _rc = _xmoe_ftv2_rc()    # [ft-sys-v2 recovery] None unless FTV2_RECOVERY=1
+    _rc_standby = _rc is not None and _rc.role == 'standby'
+    if _rc is not None:
+        from adapters.megatron_train import MegatronTrainer
+        _rc.tr = MegatronTrainer(model_provider, model_type, train_valid_test_dataset_provider, data_post_process)
+        _rc.split_mpi_world()    # [ft-sys-v2 recovery] the standby shares the Slurm step: MPI's world is split by role first
     # Initalize and get arguments, timers, and Tensorboard writer.
-    initialize_megatron(extra_args_provider=extra_args_provider,
-                        args_defaults=args_defaults)
+    if _rc_standby:
+        _rc.standby_init(extra_args_provider, args_defaults)   # [ft-sys-v2 recovery] arguments, device, kernels; no world yet
+    else:
+        initialize_megatron(extra_args_provider=extra_args_provider,
+                            args_defaults=args_defaults)
     print_rank_0 (f'after initialize_megatron')
-    if _XMOE_FTV2['mod'] is not None:
-        _XMOE_FTV2['mod'].start(torch.distributed.get_rank(), int(os.getenv('LOCAL_RANK', os.getenv('SLURM_LOCALID', '0'))))
+    if _XMOE_FTV2['mod'] is not None and not _rc_standby:
+        _XMOE_FTV2['mod'].start(torch.distributed.get_rank(), int(os.getenv('LOCAL_RANK', os.getenv('SLURM_LOCALID', '0'))),
+                                on_failure=_rc.on_failure if _rc is not None else None)
+        if _rc is not None:
+            _rc.on_start(torch.distributed.get_rank(), torch.distributed.get_world_size())
     _res = _xmoe_res()
     if _res is not None:
         _res._ctx['rank'] = torch.distributed.get_rank()
@@ -584,12 +616,14 @@ def pretrain(train_valid_test_dataset_provider,
     start_time_tensor = torch.tensor([_TRAIN_START_TIME], dtype=torch.float64, device=f'cuda:{device_id}')
     # start_time_tensor = torch.cuda.FloatTensor([_TRAIN_START_TIME])
     print (f'[megatron/training.py] before init all-reduce {rank=} {start_time_tensor=}', flush=True)
-    torch.distributed.all_reduce(start_time_tensor,
-                                 op=torch.distributed.ReduceOp.MIN)
+    if not _rc_standby:      # [ft-sys-v2 recovery] the standby has no world yet; it keeps its own start time
+        torch.distributed.all_reduce(start_time_tensor,
+                                     op=torch.distributed.ReduceOp.MIN)
     _TRAIN_START_TIME = start_time_tensor.item()
     print_rank_0('time to initialize megatron (seconds): {:.3f}'.format(
         time.time() - _TRAIN_START_TIME))
-    print_datetime('after megatron is initialized')
+    if not _rc_standby:      # [ft-sys-v2 recovery] print_datetime is a barrier; the standby has no world yet
+        print_datetime('after megatron is initialized')
     print (f'[megatron/training.py] after init all-reduce', flush=True)
 
     args = get_args()
@@ -608,6 +642,12 @@ def pretrain(train_valid_test_dataset_provider,
                 args.deepspeed_config_dict["curriculum_learning"])
         if "compression_training" in args.deepspeed_config_dict:
             args.compression_training = True
+
+    if _rc_standby:          # [ft-sys-v2 recovery] wait for a failure list naming this node, join, build with everyone, train
+        _box = _rc.standby_join(_rc.standby_wait())
+        _rc.train(train, _box, forward_step_func, process_non_loss_data_func)
+        _rc.finish()         # ends the process (it trained after a recovery)
+        return
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
@@ -652,6 +692,8 @@ def pretrain(train_valid_test_dataset_provider,
             train_data_iterator = None
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
+    if _rc is not None:      # [ft-sys-v2 recovery] Keep on the inner optimizer; every partner's shadow seeded (collective)
+        _rc.after_build(model, optimizer, opt_param_scheduler, args.iteration)
     if _res is not None: _res.set_phase('init')
 
     # args.teacher_model is used as global variable to pass the teacher model
@@ -675,7 +717,14 @@ def pretrain(train_valid_test_dataset_provider,
             print_rank_0("retro cyclic train iters : %d" % args.train_iters)
 
         iteration = 0
-        if args.do_train and args.train_iters > 0:
+        if args.do_train and args.train_iters > 0 and _rc is not None:
+            # [ft-sys-v2 recovery] the old objects must be free to go during a rebuild: the box holds the only references
+            _box = [model, optimizer, opt_param_scheduler, train_data_iterator, valid_data_iterator]
+            del model, optimizer, opt_param_scheduler, train_data_iterator, valid_data_iterator
+            iteration = _rc.train(train, _box, forward_step_func, process_non_loss_data_func)
+            model, optimizer, opt_param_scheduler, train_data_iterator, valid_data_iterator = _box
+            _rc.finish()     # after a recovery: ends the process here (MPI's finalize would wait for the dead ranks)
+        elif args.do_train and args.train_iters > 0:
             iteration = train(forward_step_func,
                             model, optimizer, opt_param_scheduler,
                             train_data_iterator, valid_data_iterator,
