@@ -271,6 +271,11 @@ class Recovery:
         self.hb.S['stop'] = True
         lost = set(int(r) for r in f.get('ranks', []))
         info = self.stop_info.setdefault(g, {})
+        if self.device.type == 'cuda':
+            # HIP's current device is per thread; _comm_ptr() looks up the communicator of the CURRENT device, and this monitor
+            # thread's device was 0, so only GPU 0 of each node found its communicators (E2 5861942: 6 on ranks 0, 8, 16, none on
+            # the other survivors, whose stop was the abort alone)
+            torch.cuda.set_device(self.device)
         info['revoke'] = rc_stop.revoke_all(self.device, self.log)
         self.mark(g, 'revoke_done')
         if self.rank in lost or not f.get('replace'):
@@ -549,12 +554,21 @@ class Recovery:
             self.tr.set_counters(cnt['iteration'], cnt['samples'], cnt['tokens'])
             self.tr.set_scheduler(sched, cnt['samples'], max(0, cnt['tokens'] - inc['tokens']))
             adapter.set_counters(cnt['iteration'], cnt['samples'], cnt['iteration'] * inc.get('micro', 1))
-            snap = [self.step_snap.get('rng') if (role == 'survivor' and self.step_snap.get('iteration') == s) else None]
-            dist.broadcast_object_list(snap, src=host)
-            if role == 'survivor' and self.step_snap.get('iteration') == s and self.step_snap.get('rng'):
-                self.tr.rng_restore(self.step_snap['rng'])
-            elif snap[0] is not None:
-                self.tr.rng_restore(snap[0])
+            # RNG: a survivor keeps its own state of the step start; a joiner takes the state of the survivor with its GPU position
+            # (its partner, rank + stride: the same expert-parallel rank, whose tracker is seeded the same way), not rank 0's
+            mine = self.step_snap.get('rng') if (role == 'survivor' and self.step_snap.get('iteration') == s) else None
+            snaps = [None] * world
+            dist.all_gather_object(snaps, mine)
+            if role == 'survivor' and mine is not None:
+                self.tr.rng_restore(mine)
+                rng_src = 'own'
+            else:
+                src_rank = (self.rank + stride) % world
+                if snaps[src_rank] is None:
+                    src_rank = next((r for r in survivors if r % stride == self.rank % stride and snaps[r] is not None), host)
+                if snaps[src_rank] is not None:
+                    self.tr.rng_restore(snaps[src_rank])
+                rng_src = f'rank {src_rank}'
             self.mark(g, 'restore_done')
             train_it, valid_it, test_it = self.tr.build_data()
             if J > 0:                                        # milestone 2: the step resumes at micro-batch J
@@ -594,8 +608,8 @@ class Recovery:
         self.first_step_wait = (g, s)
         mem = torch.cuda.memory_allocated(self.device) / 1e9 if self.device.type == 'cuda' else 0
         self.log(f'recovery {g} ready: resume at step {s} (samples {cnt["samples"]}), state from {src}, '
-                 f'rng snapshots equal on every survivor: {rng_same}, re-seed {reseed_s} s, {mem:.2f} GB allocated')
-        self.write_times(g, {'resume_step': s, 'resume_microbatch': J, 'state_from': src, 'rng_same': rng_same,
+                 f'rng from {rng_src} (survivors\' snapshots all equal: {rng_same}), re-seed {reseed_s} s, {mem:.2f} GB allocated')
+        self.write_times(g, {'resume_step': s, 'resume_microbatch': J, 'state_from': src, 'rng_same': rng_same, 'rng_from': rng_src,
                              'reseed_s': reseed_s, 'checksums': sums,
                              'counters': cnt, 'lost': lost, 'kind': f.get('kind'), 'node': f.get('node'),
                              'standby': f.get('standby')})
