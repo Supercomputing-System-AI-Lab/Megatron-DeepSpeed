@@ -68,6 +68,12 @@ seconds later; resubmit with the resume riders (`AUTORUN_LOAD_DIR`/`AUTORUN_SAVE
   progress, two neighbouring nodes lost, or no standby free: the recovery exits (codes 75, 74, 76) and v1's restart path applies.
 - Measured on X-MoE 10B: failure list -> ready about 8-9 s, first step after it done about 23 s; Keep costs 3-6% of the step
   (`RESULTS_M1_M2.md`, M1-A and M1-C).
+- Milestone 2 (resume inside a step, `FTV2_COMMIT=1`, under test): it needs ZeRO stage 2, which reduces after every
+  micro-batch, and on X-MoE 10B that reduction, not the commit, is the main cost: stage 2 is 35% slower than stage 1, and the
+  commits at k = 1 add 7.3% (E5 5862320). `FTV2_COMMIT_K` spaces only the commits. A k that also spaces the reductions (stage 1,
+  ZeRO's own reduction called every k micro-batches; its partition sums accumulate across reductions) is the way to lower the
+  35%; it is described in `RESULTS_M1_M2.md` (M2-C, design note) and not built. Two copy transports: `FTV2_COMMIT_MODE=p2p`
+  (send the sums to the partner) and `keep` (the partner keeps its owner's slices from ZeRO's own all-reduce; no network).
 
 ## A new recovery plan: where it plugs in
 
