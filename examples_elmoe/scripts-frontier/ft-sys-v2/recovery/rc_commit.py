@@ -1,5 +1,6 @@
 """rc_commit.py (ft-sys-v2 recovery, milestone 2, 2026-11-06): commits inside the step. Framework-free: it sees the optimizer
-adapter's per-group partial gradient sums only. NOT YET RUN ON GPUs (written while the queue was full; see RESULTS_M1_M2.md M2).
+adapter's per-group partial gradient sums only. Tested on GPUs (X-MoE 10B, ZeRO-2): E5 5862320, E5b 5862517, E5c 5862600,
+E5d 5862827, E6 5863343 (RESULTS_M1_M2.md, M2-Z, M2-C, M2-A/B, M2-K).
 
 The question of milestone 2 (the user, 11-06): resume from the last committed micro-batch instead of the step start; the reduced
 partial sums are copied to the partner every k micro-batches (FTV2_COMMIT_K, default 1); the copy is asynchronous so that it hides
