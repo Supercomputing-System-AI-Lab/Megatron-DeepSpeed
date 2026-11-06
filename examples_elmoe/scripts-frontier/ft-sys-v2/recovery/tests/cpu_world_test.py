@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """cpu_world_test.py (ft-sys-v2 recovery tests, 2026-11-06): the new world's handshake and the resume decision, on the login node.
-  1. decide(): the resume step from the survivors' reports (consistent, a step half done, a lost rank and its copy both lost).
+  1. decide(): the resume step from the survivors' reports (consistent, a step half done, a lost rank and its copy both lost);
+     waits_for_stop(): which exceptions of the main thread wait for the stop, and how the heartbeat classifies the others.
   2. rc_world.make_world against a real etcd (one member on local ports): 4 processes; generation 'a' hosted by rank 1, then
      the world torn down (the abort's registry clear, rc_stop.forget_all) and generation 'b' hosted by rank 2, each checked by an
      all-reduce (gloo). The address goes through etcd (world/<g>), as on the GPUs.
@@ -42,6 +43,44 @@ def decide_cases():
     check('null recovery (nobody lost)', decide(ok, [], 4, stride)[:2], (True, 7))
 
 
+def wrapper_cases():
+    """Which exceptions in the main thread wait for the recovery's stop (E3 5862190: every one did, and a HIP fault became a
+    "hang"). The messages are the real ones of the runs where they exist."""
+    import torch
+    import torch.distributed as dist
+    from rc_controller import waits_for_stop
+    import hb_monitor
+    ill = ("CUDA error: an illegal memory access was encountered\nSearch for `hipErrorIllegalAddress' in "
+           "https://rocm.docs.amd.com/projects/HIP/en/latest/index.html for more information.")
+    AccErr = getattr(torch, 'AcceleratorError', RuntimeError)
+    try:
+        acc = AccErr(ill)
+    except TypeError:
+        acc = RuntimeError(ill)
+    cases = [
+        ('StopForRecovery (the counter, after the list)', hb_monitor.StopForRecovery('a failure list arrived'), False, True),
+        ('any exception once the stop flag is up', RuntimeError('anything'), True, True),
+        ('a peer gone: DistBackendError', dist.DistBackendError('NCCL error: remote process exited or there was a network '
+                                                               'error'), False, True),
+        ('a peer gone: RCCL text in a RuntimeError', RuntimeError('NCCL communicator was aborted on rank 3'), False, True),
+        ('a HIP fault raised as AcceleratorError (E3 hip arm)', acc, False, False),
+        ('out of memory', torch.OutOfMemoryError('HIP out of memory. Tried to allocate 2.00 TiB'), False, False),
+        ('out of memory inside the communication library', RuntimeError('NCCL error: out of memory'), False, False),
+        ('a program error', KeyError('lm loss'), False, False),
+        ('the synthetic hardware fault (hwfault)', RuntimeError('ftv2 injected (synthetic) hardware fault: HW_EXCEPTION: '
+                                                                'GPU lost'), False, False),
+        ('SystemExit before any stop', SystemExit(3), False, False),
+    ]
+    for name, e, stopping, want in cases:
+        check(f'waits for the stop: {name}', waits_for_stop(e, stopping), want)
+    import hb_rules
+    check('death_kind of the HIP fault record', hb_rules.death_kind(f'exception: {type(acc).__name__}: {ill[:200]}'), 'exception')
+    check('death_kind of the hwfault record',
+          hb_rules.death_kind('exception: RuntimeError: ftv2 injected (synthetic) hardware fault: HW_EXCEPTION: GPU lost'),
+          'hardware fault')
+    check('death_kind of a SIGABRT death (hipabort: no exit record)', hb_rules.death_kind('signal'), 'killed')
+
+
 def worker(rank, endpoints):
     import torch
     import torch.distributed as dist
@@ -70,6 +109,7 @@ def main():
         worker(int(a.worker[0]), a.worker[1])
         return
     decide_cases()
+    wrapper_cases()
     tmp = os.path.join(os.environ.get('TMPDIR', '/tmp'), f'cpu_world_{os.getpid()}')
     c, p = 24700 + os.getpid() % 200, 24900 + os.getpid() % 200
     env = {k: v for k, v in os.environ.items() if 'proxy' not in k.lower()}

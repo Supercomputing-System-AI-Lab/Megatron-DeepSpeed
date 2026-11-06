@@ -64,6 +64,23 @@ def decide(reports, lost, world, stride):
     return True, vals.pop(), 'consistent', 0
 
 
+def waits_for_stop(exc, stopping):
+    """Does an exception in the main thread wait for the recovery's stop (True), or go up at once (False)? It waits only when
+    the stop has begun (StopForRecovery, or the flag is up) or when the exception is a communication error, which a peer's
+    failure can raise before the failure list arrives. Every other exception (out of memory, a GPU fault raised as an
+    exception, an error in the program) goes up at once, so that the heartbeat's exit record and hb_rules.death_kind classify it
+    by the user's rules (out of memory -> the OOM plan; a hardware fault -> replace the node; any other exception -> stop for
+    debugging). Found in E3 5862190: the wrapper waited 90 s on every exception, the hang detector fired first (37 s), and a
+    HIP fault raised as AcceleratorError became a "hang" with a node replaced. The test of "communication error" is the
+    heartbeat's own (hb_rules.death_cause: COMM_ERROR, out of memory excluded)."""
+    if stopping or type(exc).__name__ == 'StopForRecovery':
+        return True
+    if isinstance(exc, (SystemExit, KeyboardInterrupt)):
+        return False
+    import hb_rules
+    return hb_rules.death_cause(f'exception: {type(exc).__name__}: {str(exc)[:400]}') == 'consequence'
+
+
 class Recovery:
     def __init__(self, hb, trainer):
         self.hb, self.tr = hb, trainer
@@ -278,11 +295,22 @@ class Recovery:
             torch.cuda.set_device(self.device)
         info['revoke'] = rc_stop.revoke_all(self.device, self.log)
         self.mark(g, 'revoke_done')
-        if self.rank in lost or not f.get('replace'):
-            why = 'my node is replaced' if self.rank in lost else f'the plan replaces no node: {f.get("plan")}'
+        if not f.get('replace'):
+            # the plan stops the run (an exception, out of memory, stuck, no standby free): every training rank ends with 76, and
+            # the run is marked done so that the standby stops waiting (E3b: without it the standby waited for ever)
+            why = f'the plan replaces no node: {f.get("plan")}'
             self.log(f'list {g}: {why}; exiting')
             self.write_times(g, {'exit': why})
-            self._exit(0 if self.rank in lost else EXIT_NO_PLAN, f'recovery: {why}' if self.rank in lost else 'finished')
+            try:
+                self.etcd().put(f'run_done/{self.base_run}', json.dumps({'t': round(time.time(), 3), 'stopped': why}))
+            except Exception:
+                pass
+            self._exit(EXIT_NO_PLAN, f'recovery: {why}')
+        if self.rank in lost:
+            why = 'my node is replaced'
+            self.log(f'list {g}: {why}; exiting')
+            self.write_times(g, {'exit': why})
+            self._exit(0, f'recovery: {why}')
         survivors = [r for r in range(self.world) if r not in lost]
         info['barrier'] = rc_stop.etcd_barrier(self.etcd(), g, self.rank, survivors, self.log)
         self.mark(g, 'barrier_done')
@@ -307,9 +335,11 @@ class Recovery:
             try:
                 return train_fn(forward_step_func, box[0], box[1], box[2], box[3], box[4], process_non_loss_data_func)
             except BaseException as e:
-                if isinstance(e, (SystemExit, KeyboardInterrupt)) and not self.hb.S.get('stop'):
-                    raise
                 name, text = type(e).__name__, str(e)[:240]
+                if not waits_for_stop(e, bool(self.hb.S.get('stop'))):
+                    self.log(f'the main thread raised {name}: not a stop and not a communication error: it goes up at once '
+                             f'(the heartbeat classifies it): {text}')
+                    raise
                 if not self.wait_stop(90):
                     raise
                 self.log(f'the main thread left the step: {name}: {text}')
@@ -379,6 +409,9 @@ class Recovery:
                 self.standby_event.clear()
                 if f and f.get('standby') == me:
                     return f
+                if f and not f.get('replace'):
+                    self.log(f'list {f.get("gen")} replaces no node ({f.get("plan")}): the run stops; exiting')
+                    self._exit(0, 'finished: the run stopped')
                 self.log(f'list {f.get("gen") if f else None} names standby {f.get("standby") if f else None}, not me')
             try:
                 v, _ = self.etcd().get(f'run_done/{self.base_run}')

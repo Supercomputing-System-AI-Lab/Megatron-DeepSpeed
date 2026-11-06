@@ -55,8 +55,14 @@ seconds later; resubmit with the resume riders (`AUTORUN_LOAD_DIR`/`AUTORUN_SAVE
 
 ## What the recovery covers today (milestone 1)
 
-- Failure kinds that replace a node: a rank killed, a hang (counts + stacks), a node lost (lease + the others stopped), a GPU
-  fault (as a death by signal). One failure per standby node.
+- Failure kinds that replace a node: a rank killed (also a GPU fault that ends the process by a signal), a hang (counts +
+  stacks), a node lost (lease + the others stopped), a hardware fault raised as an exception whose text names it (ECC, GPU
+  lost, ...). One failure per standby node.
+- Kinds that stop the run (every training rank exits with 76, the standby leaves): an exception in the program, out of memory
+  (the OOM ladder is not built yet), stuck. A GPU memory access fault that the runtime reports to Python (AcceleratorError,
+  "illegal memory access") is an exception by `heartbeat-sys/hb_rules.py`: most often a kernel bug, which a new node would hit
+  again. The recovery's loop never holds an exception back: only a stop already under way or a communication error waits for
+  the failure list (`recovery/rc_controller.py`, `waits_for_stop`).
 - Layout: one DeepSpeed engine, PP 1, ZeRO stage 1 or 2, EP inside a node or spanning nodes, data parallelism over nodes, TP 1.
 - The resume point is the step boundary: every rank redoes the interrupted step. A failure while the optimizer step is in
   progress, two neighbouring nodes lost, or no standby free: the recovery exits (codes 75, 74, 76) and v1's restart path applies.
