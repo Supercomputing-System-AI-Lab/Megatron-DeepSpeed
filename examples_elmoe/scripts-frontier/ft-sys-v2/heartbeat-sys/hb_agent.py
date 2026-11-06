@@ -8,7 +8,10 @@ Started by its own srun step, so a crashing training process cannot take it down
                      <job>/ft/nodes/<node>.log on Lustre                                                    the slow heartbeat
   on sample/<g>      if the request names this node (or every node, '*'): py-spy on its ranks twice, STACK_GAP apart, the stacks
                      to Lustre, the verdict to stacks/<g>/<node>
-  on failed/<g>      copy the failure list into host memory (failed.json) for its ranks' monitor threads, and to Lustre
+  on failed/<g>      copy the failure list into host memory (failed.json) for its ranks' monitor threads, and to Lustre;
+                     a list that replaces a node (2026-11-06, the recovery): the replaced node's agent ends its ranks still
+                     alive after FTV2_VICTIM_GRACE_S (a hung rank cannot leave by itself), and the standby's agent turns its role
+                     into train
   on coordinator     when the key is deleted (the coordinator's node died), try to take the role (create-if-absent)
 Slow work (rocm-smi for ECC, py-spy) runs in threads of its own so the beat is never late. The ECC and xGMI readers follow
 ft-sys-v1's hb.py (_ecc_smi, _xgmi, host_mem_pct); here they run in the agent, outside the training processes (map 1.5).
@@ -157,6 +160,28 @@ class Agent:
             return
         write_json(failed_path(self.dir), f)
         self.log(f'failure list {f.get("gen")} copied to {failed_path(self.dir)}: {f.get("kind")} on {f.get("node")}')
+        if f.get('replace') and f.get('node') == self.node:
+            grace = float(os.environ.get('FTV2_VICTIM_GRACE_S', '20'))
+            threading.Timer(grace, self.end_my_ranks, args=(f,)).start()
+        if f.get('standby') == self.node:
+            # the node's role in its beat follows its ranks' lines (fast_beat): the joined ranks write role train
+            self.log(f'this standby node takes the place of {f.get("node")} (list {f.get("gen")})')
+
+    def end_my_ranks(self, f):
+        """This node was replaced: SIGKILL its training ranks that are still alive (their monitors exit by themselves after the
+        stop; a rank hung in a GPU call or in a sleep cannot, HB2c)."""
+        import signal
+        for ln in self.read_lines():
+            pid = ln.get('pid')
+            if str(ln.get('run')) != str(f.get('run')):
+                continue                       # a later run's process on this node (the next test arm): not a victim
+            if pid and alive(pid):
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                    self.log(f'replaced node: rank {ln.get("rank")} (pid {pid}) still alive {time.time() - f.get("t", 0):.0f} s '
+                             f'after list {f.get("gen")}: SIGKILL')
+                except OSError as e:
+                    self.log(f'could not end pid {pid}: {e}')
 
     def on_sample(self, kind, key, value, rev):
         if kind != 'PUT':
@@ -252,7 +277,9 @@ class Agent:
                 if (ln['rank'], te.get('t')) not in self.seen_gone:
                     self.seen_gone.add((ln['rank'], te.get('t')))
                     self.log(f"rank {ln['rank']}: exception in {terr[str(ln['rank'])]}")
-        beat = node_beat(self.node, lines_live, list(why), time.time(), role=self.a.role, dead_why={str(k): v for k, v in why.items()},
+        roles = {ln.get('role') for ln in lines_live}
+        role = 'standby' if roles == {'standby'} else ('train' if 'train' in roles else self.a.role)   # the ranks' own role
+        beat = node_beat(self.node, lines_live, list(why), time.time(), role=role, dead_why={str(k): v for k, v in why.items()},
                          thread_errors=terr)
         try:
             if self.etcd.keepalive(self.lease) <= 0:

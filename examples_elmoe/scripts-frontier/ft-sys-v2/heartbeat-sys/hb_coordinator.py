@@ -17,7 +17,11 @@ Every 5 s (step()): read every node's beat in one read, then, for the current tr
 The plan follows the kind (the user, 11-05 11:50): out of memory -> the OOM ladder (FTV2_OOM_RECONFIG=1, the default; 0 -> stop);
 another exception -> stop for debugging; a hang, a lost node, a death by a signal or a hardware fault -> replace the node.
 The failure list failed/<g> is written with create-if-absent fenced on "coordinator still names me", so an old coordinator that is
-cut off cannot write one. One failure per training run tonight (no recovery yet): later signals of that run are its consequences."""
+cut off cannot write one. One failure per training run: later signals of that run are its consequences.
+Recovery (2026-11-06, ft-sys-v2/recovery/): a list whose plan replaces a node also names the standby node in the field 'standby'
+(and 'replace': true); that is the whole layout of a warm recovery (the standby's GPUs take the lost node's ranks, in order).
+The standby is then taken and the replaced node retired: neither is used or judged again. The recovered training writes its
+lines under a new run id (<run>.g<gen>), which the coordinator watches as a new run."""
 import json
 import os
 import time
@@ -43,6 +47,8 @@ class Coordinator:
         self.warned = set()
         self.hold = {}
         self.next_summary = 0.0
+        self.taken = set()       # standby nodes a failure list already gave a role
+        self.retired = set()     # nodes a failure list replaced: never judged again
         self.rec_dir = os.path.join(job_dir, 'ft')
         os.makedirs(self.rec_dir, exist_ok=True)
 
@@ -56,9 +62,10 @@ class Coordinator:
         failed, _ = self.etcd.range('failed/')
         for v in failed.values():
             try:
-                self.done_runs.add(json.loads(v).get('run'))
+                f = json.loads(v)
             except ValueError:
-                pass
+                continue
+            self.done_runs.add(f.get('run'))
         samples, _ = self.etcd.range('sample/')
         closed, _ = self.etcd.range('closed/')
         for k, v in sorted(samples.items()):
@@ -90,17 +97,29 @@ class Coordinator:
         if kind == 'stuck':
             return ('stop the training: every rank is still and no node can be named; the stacks of every node are saved '
                     '(the gate checks that find the node or link come later)')
-        standbys = sorted(n for n, b in beats.items() if b.get('role') == 'standby' and n != node)
-        return f'standby {standbys[0]} takes node {node}' if standbys else 'no standby free: stop, or a layout with fewer GPUs (config)'
+        sb = self._standby(beats, node, kind)
+        return f'standby {sb} takes node {node}' if sb else 'no standby free: stop, or a layout with fewer GPUs (config)'
+
+    def _standby(self, beats, node, kind):
+        """The standby node that takes `node`'s place, or None (a kind that replaces no node, or no standby free)."""
+        if kind in ('out of memory', 'exception', 'stuck'):
+            return None
+        standbys = sorted(n for n, b in beats.items() if b.get('role') == 'standby' and n != node and n not in self.taken)
+        return standbys[0] if standbys else None
 
     def declare(self, beats, run, kind, node, suspect, why, gen=None):
         b = beats.get(node) or self.track.nodes.get(node, {}).get('beat', {})
         g = gen or self._next_gen()
         val = {'gen': g, 'run': run, 'kind': kind, 'node': node, 'suspect': suspect, 'ranks': b.get('rank_ids', []),
                'why': why, 'plan': self._plan(beats, node, kind), 't': round(time.time(), 3), 'by': self.me}
+        sb = self._standby(beats, node, kind)
+        val.update(standby=sb, replace=bool(sb))
         ok = self.etcd.create_if_absent(f'failed/{g}', json.dumps(val), fence=('coordinator', self.me))
         if ok:
             self.done_runs.add(run)
+            if sb:
+                self.taken.add(sb)
+                self.retired.add(node)
             self.incident = None
             self.record(f'FAILURE {g}: {kind} on {node} (suspect {suspect}); {why}; plan: {val["plan"]}')
             self.log(f'failure list {g} written: {val}')
@@ -117,6 +136,25 @@ class Coordinator:
                 beats[k.split('/', 1)[1]] = json.loads(v)
             except ValueError:
                 pass
+        runs0 = [b.get('run') for b in beats.values() if b.get('role', 'train') == 'train' and b.get('run') is not None]
+        arm = str(max(set(runs0), key=runs0.count)).split('.g')[0] if runs0 else None
+        if arm is not None and arm != getattr(self, 'arm', None):
+            # a new training run: its standbys and nodes are free again, except those its own lists (an earlier generation
+            # of the same run, or a coordinator that took over) already used
+            if getattr(self, 'arm', None) is not None:
+                self.record(f'NEW RUN {arm}: standbys and replaced nodes of {self.arm} are free again')
+            self.taken.clear()
+            self.retired.clear()
+            for v in self.etcd.range('failed/')[0].values():
+                try:
+                    f = json.loads(v)
+                except ValueError:
+                    continue
+                if str(f.get('run')).split('.g')[0] == arm and f.get('standby'):
+                    self.taken.add(f['standby'])
+                    self.retired.add(f.get('node'))
+            self.arm = arm
+        beats = {n: b for n, b in beats.items() if n not in self.retired}     # a replaced node is never judged again
         gone = self.track.update(beats, now)
         mraw, _ = self.etcd.range('members/')
         members = {}
@@ -125,6 +163,10 @@ class Coordinator:
                 members[k.split('/', 1)[1]] = json.loads(v).get('role', 'train')
             except ValueError:
                 pass
+        members = {n: r for n, r in members.items() if n not in self.retired}
+        for n in self.retired:
+            self.track.nodes.pop(n, None)
+            self.track.missing.pop(n, None)
         gone += self.track.note_absent(members, beats, now)
         for n in gone:
             self.log(f'beat of {n} disappeared (its lease ended)')
@@ -136,6 +178,14 @@ class Coordinator:
             lows = ', '.join(f'{n} {beats[n].get("low")}' for n in alive if beats[n].get('role', 'train') == 'train')
             self.record(f'beat | {len(alive)} nodes with a beat: {" ".join(alive)} | run {run} | lowest counts {lows} | '
                         f'coordinator {self.me}')
+        if run is not None and run not in self.done_runs:
+            # a list written by another writer (a test's null recovery, rc_controller) also ends the judging of its run
+            for v in self.etcd.range('failed/')[0].values():
+                try:
+                    if json.loads(v).get('run') == run:
+                        self.done_runs.add(run)
+                except ValueError:
+                    pass
         if run is None or run in self.done_runs:
             return
         if self.incident:

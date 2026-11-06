@@ -10,11 +10,14 @@ Two pieces (design map 1.1, 1.5):
 The rules of map node 1.5: no GPU call for the monitor (HBM comes from the allocator's own counters, which live in CPU memory, as
 in ft-sys-v1's hb.py; no .item(), no synchronize); one small file write per beat. The trainer tells the monitor its step, phase
 and loss with set_step / set_phase / set_loss, which only set Python values.
-Tonight's scope is the heartbeat and its decisions: on a failure list the monitor records it and calls the trainer's callback
-if one was given; the stop (RCCL revoke, abort) comes with the recovery stage.
+On a failure list the monitor records it and calls the trainer's callback if one was given (the recovery's stop,
+ft-sys-v2/recovery/rc_stop.py, 2026-11-06). The recovery's one hook in the counter: once S['stop'] is set, the next counted call
+raises StopForRecovery in the calling thread (the toy's before_communication_call, recovery_core.py:186-192).
 Fault injection for tests (FTV2_INJECT, comma-separated): hang:<rank>:<step>, kill:<rank>:<step>, exit:<rank>:<step>,
-oom:<rank>:<step>, oomstuck:<rank>:<step> (the same, then the exit blocks), abort:<rank>:<step>,
-pause:all:<step>:<seconds>, slow:<rank>:<step>:<milliseconds>. Each fires before a communication call of that step."""
+oom:<rank>:<step>, oomstuck:<rank>:<step> (the same, then the exit blocks), abort:<rank>:<step>, hip:<rank>:<step> (a GPU
+memory access fault from a HIP kernel, FTV2_HIP_FAULT_SO), pause:all:<step>:<seconds>, slow:<rank>:<step>:<milliseconds>.
+Each fires before a communication call of that step; an injection fires once per process (a rank that recovers does not fire it
+again)."""
 import atexit
 import json
 import os
@@ -33,7 +36,11 @@ COLLECTIVES = ['all_reduce', 'all_gather', 'all_gather_into_tensor', '_all_gathe
 
 S = {'calls': 0, 'step': -1, 'micro_batch': -1, 'phase': 'start', 'loss': None, 'step_s': None, 'rank': -1, 'local_rank': -1,
      'role': 'train', 'started': False, 'installed': False, 'failure': None, 'card': None, 'tid': None, 'dir': None,
-     'on_failure': None, 'inject': [], 'exit_written': False}
+     'on_failure': None, 'inject': [], 'exit_written': False, 'stop': False, 'on_step': None}
+
+
+class StopForRecovery(Exception):
+    """Raised by the counter in the main thread once the recovery's stop has begun (S['stop']): the trainer leaves its step."""
 
 
 def _parse_inject():
@@ -71,11 +78,22 @@ def _inject():
             raise torch.OutOfMemoryError('ftv2 injected: out of memory on the CPU test (no GPU)')
         if k == 'abort':
             os.abort()                                 # SIGABRT and no exit record, as a HIP memory fault ends a process
+        if k == 'hip':                                 # a real GPU memory access fault: one store 2^40 floats past a tensor
+            import ctypes
+            import torch
+            lib = ctypes.CDLL(os.environ['FTV2_HIP_FAULT_SO'])
+            lib.hip_fault.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            x = torch.empty(1, device=f'cuda:{S["local_rank"]}')
+            lib.hip_fault(ctypes.c_void_p(x.data_ptr()), ctypes.c_void_p(torch.cuda.current_stream().cuda_stream))
+            torch.cuda.synchronize()
+            _log('the HIP fault did not end the process')
         if k == 'pause':
             time.sleep(j['arg'])                       # every rank pauses at the same call: equal counts
 
 
 def _count():
+    if S['stop']:
+        raise StopForRecovery('a failure list arrived: stopping for the recovery')
     if S['inject']:
         _inject()
     S['calls'] += 1
@@ -91,23 +109,30 @@ def install_counter():
     # Both spellings are wrapped: torch.distributed.<name> (Megatron, most of DeepSpeed) and torch.distributed.distributed_c10d.<name>
     # (DeepSpeed's all-gathers after the optimizer step, deepspeed/comm/torch.py:227, 243, 251, found 11-05). The same call counts once;
     # a c10d function that calls another one by its module name counts twice, the same way on every rank, so counts stay comparable.
+    # One wrapper per original function, set on both modules: torch checks a P2POp's op by identity against its own module's
+    # isend/irecv (distributed_c10d._check_op, `op.op is isend` in batch_isend_irecv), so torch.distributed.isend and
+    # distributed_c10d.isend must stay the same object (found 2026-11-06 for the recovery's batched sends).
+    made = {}
     for mod in (dist, c10d):
         for name in COLLECTIVES + ['_all_gather_base_coalesced']:
             f = getattr(mod, name, None)
             if f is None or getattr(f, '_ftv2_counted', False):
                 continue
-
-            def wrapped(*a, _f=f, **k):
-                _count()
-                return _f(*a, **k)
-            wrapped._ftv2_counted = True
-            wrapped.__name__, wrapped.__doc__, wrapped.__wrapped__ = f.__name__, f.__doc__, f
-            setattr(mod, name, wrapped)
+            if id(f) not in made:
+                def wrapped(*a, _f=f, **k):
+                    _count()
+                    return _f(*a, **k)
+                wrapped._ftv2_counted = True
+                wrapped.__name__, wrapped.__doc__, wrapped.__wrapped__ = f.__name__, f.__doc__, f
+                made[id(f)] = wrapped
+            setattr(mod, name, made[id(f)])
     S['installed'] = True
 
 
 def set_step(step, micro_batch=None, step_s=None):
     S['step'] = int(step)
+    if S['on_step'] is not None:
+        S['on_step'](int(step))
     if micro_batch is not None:
         S['micro_batch'] = int(micro_batch)
     if step_s is not None:
@@ -187,14 +212,13 @@ def _find_card(local_rank):
 
 
 def _loop():
-    path = rank_path(S['dir'], S['rank'])
     fpath = failed_path(S['dir'])
     next_beat, seen = 0.0, None
     while True:
         now = time.time()
         if now >= next_beat:
             try:
-                write_json(path, line())
+                write_json(rank_path(S['dir'], S['rank']), line())     # the rank can change once: a standby that joins
             except Exception as e:
                 _log(f'beat write failed: {e}')
             next_beat = now + BEAT
@@ -223,7 +247,7 @@ def start(rank, local_rank, role='train', on_failure=None):
         return
     S.update(rank=int(rank), local_rank=int(local_rank), role=role, on_failure=on_failure, dir=shm_dir(),
              tid=threading.main_thread().native_id, started=True)
-    S['card'] = _find_card(S['local_rank']) if role == 'train' else None
+    S['card'] = _find_card(S['local_rank'])
     prev = sys.excepthook
 
     def hook(t, v, tb):
@@ -240,3 +264,16 @@ def start(rank, local_rank, role='train', on_failure=None):
     atexit.register(lambda: _write_exit('finished', 0))
     threading.Thread(target=_loop, name='ftv2-monitor', daemon=True).start()
     _log(f'monitor on: {rank_path(S["dir"], S["rank"])} every {BEAT:.0f} s; counter installed: {S["installed"]}')
+
+
+def begin_generation(run, rank=None, role=None):
+    """After a recovery (rc_controller): this process now belongs to run `run` (its lines carry it, and a failure list of the old
+    run no longer applies), its call count starts again at 0 at the same point on every rank, and the stop flag is down."""
+    os.environ['FTV2_RUN'] = str(run)
+    S['calls'] = 0
+    S['stop'] = False
+    if rank is not None and int(rank) != S['rank']:
+        S['rank'] = int(rank)
+    if role is not None:
+        S['role'] = role
+    _log(f'new generation: run {run}, rank {S["rank"]}, role {S["role"]}')

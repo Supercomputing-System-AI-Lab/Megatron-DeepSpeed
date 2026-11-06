@@ -39,6 +39,13 @@ try:
     check('distributed_c10d.all_gather_into_tensor counts (at least once)', M.S['calls'] - c0 >= 1, True)
 except RuntimeError as e:                     # gloo may not have it; the count is still taken before the call
     check(f'distributed_c10d.all_gather_into_tensor counted before gloo refused it ({str(e)[:40]})', M.S['calls'] - c0 >= 1, True)
+check('torch.distributed.isend is distributed_c10d.isend (one wrapper: P2POp checks the op by identity)', dist.isend is c10d.isend, True)
+try:
+    dist.P2POp(dist.isend, torch.ones(2), 0); dist.P2POp(dist.irecv, torch.zeros(2), 0)
+    ok = True
+except ValueError:
+    ok = False
+check('P2POp accepts the wrapped dist.isend / dist.irecv', ok, True)
 dist.destroy_process_group()
 print(f'\n{len(fails)} failed' if fails else '\nall passed')
 sys.exit(1 if fails else 0)
