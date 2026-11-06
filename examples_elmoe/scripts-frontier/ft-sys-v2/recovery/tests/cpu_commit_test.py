@@ -125,6 +125,12 @@ def decide_cases():
         ('two ahead: window', {0: rep(6, [7, 6], [7, 5]), 1: rep(4, [7, 4], [7, 3]), 2: rep(4, [7, 4], [7, 3])}, (False, None)),
         ('copy cut (-1): window', {0: rep(4, [7, 4], [7, 3]), 1: rep(4, [-1, -1], [7, 2]), 2: rep(4, [7, 4], [7, 3])}, (False, None)),
         ('no commit yet: step start', {0: rep(0, [7, 0], [-1, -1]), 1: rep(0, [7, 0], [-1, -1]), 2: rep(0, [7, 0], [-1, -1])}, (True, 0)),
+        ('E5b: copy of J cut, all survivors at J: the previous commit', {0: rep(3, [7, 3], [7, 2]), 1: rep(3, [-1, -1], [7, 2]),
+                                                                       2: rep(3, [7, 3], [7, 2])}, (True, 2)),
+        ('copy of J cut, a survivor at J + k: window', {0: rep(4, [7, 4], [7, 3]), 1: rep(3, [-1, -1], [7, 2]),
+                                                        2: rep(3, [7, 3], [7, 2])}, (False, None)),
+        ('copy of J cut at J = 1: the step start', {0: rep(1, [7, 1], [7, 0]), 1: rep(1, [-1, -1], [7, 0]),
+                                                    2: rep(1, [7, 1], [7, 0])}, (True, 0)),
     ]
     for name, reps, want in cases:
         ok, J, why = decide_microbatch(reps, [3], 4, 2, 7)

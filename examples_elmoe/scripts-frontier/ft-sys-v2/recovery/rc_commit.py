@@ -192,7 +192,10 @@ class Commit:
 
 def decide_microbatch(reports, lost, world, stride, step):
     """(ok, J, why): the resume micro-batch of step `step` from the survivors' commit reports (pure; every rank computes it).
-    J = the lowest last commit among the survivors; every survivor is at J or J + k; every lost owner's copy holds (step, J)."""
+    J = the lowest last commit among the survivors; every survivor is at J or J + k; every lost owner's copy holds (step, J).
+    If a lost owner's copy of J was cut (the owner died while its copy was in flight: E5b 5862517, the kill fired at the first
+    call after the commit's asynchronous send) and every survivor is at J itself, J - k is the next candidate: each survivor
+    keeps its own snapshot of J - k (snap_prev) and the copy keeps the owner's previous commit (copy_prev)."""
     cs = [r['commit_c'] if r.get('commit_step') == step else 0 for r in reports.values()]
     if not cs:
         return True, 0, 'no survivor report'
@@ -200,12 +203,26 @@ def decide_microbatch(reports, lost, world, stride, step):
     J = min(cs)
     if any(c not in (J, J + k) for c in cs):
         return False, None, f'commit positions {sorted(set(cs))}: a rank more than one commit ahead'
+
+    def copies_hold(j):
+        for o in lost:
+            h = reports.get((o + stride) % world)
+            if h is None:
+                return f'no report from the rank that keeps the copy of rank {o}'
+            if [step, j] not in (h['copy_cur'], h['copy_prev']):
+                return f'the copy of rank {o} holds {h["copy_cur"]} / {h["copy_prev"]}, not [{step}, {j}]'
+        return None
+
     if J == 0:
         return True, 0, f'resume step {step} at its start (no commit common to every rank)'
-    for o in lost:
-        h = reports.get((o + stride) % world)
-        if h is None:
-            return False, None, f'no report from the rank that keeps the copy of rank {o}'
-        if [step, J] not in (h['copy_cur'], h['copy_prev']):
-            return False, None, f'the copy of rank {o} holds {h["copy_cur"]} / {h["copy_prev"]}, not [{step}, {J}]'
-    return True, J, f'resume step {step} at micro-batch {J}'
+    why = copies_hold(J)
+    if why is None:
+        return True, J, f'resume step {step} at micro-batch {J}'
+    if all(c == J for c in cs) and J - k >= 0:
+        if J - k == 0:
+            return True, 0, f'{why}; resume step {step} at its start'
+        why2 = copies_hold(J - k)
+        if why2 is None:
+            return True, J - k, f'{why}; resume step {step} at micro-batch {J - k} (the previous commit)'
+        return False, None, f'{why}; and {why2}'
+    return False, None, why
