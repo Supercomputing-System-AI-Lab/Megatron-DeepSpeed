@@ -66,8 +66,9 @@ class Keep:
     def __init__(self, adapter, rank, world, device, log, version, out_dir=None, reuse=None):
         self.ad, self.rank, self.world, self.device, self.log = adapter, rank, world, device, log
         self.stride = int(_env('FTV2_PARTNER_STRIDE', '8'))
-        self.partner = (rank + self.stride) % world        # keeps my copy
-        self.owner = (rank - self.stride) % world          # I keep its copy
+        import rc_pairs                                    # under a pipeline: the same stage's next replica (milestone 3)
+        self.partner = rc_pairs.partner(rank, world, self.stride)     # keeps my copy
+        self.owner = rc_pairs.owner(rank, world, self.stride)         # I keep its copy
         self.mode = _env('FTV2_SHADOW', 'cpu')
         self.cpu_impl = _env('FTV2_CPU_ADAM', 'ds')
         self.chunk = int(_env('FTV2_CPU_ADAM_CHUNK', str(8 * MB)))

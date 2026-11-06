@@ -33,6 +33,7 @@ import torch.distributed as dist
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+import rc_pairs
 import rc_stop
 import rc_world
 from rc_keep import Keep
@@ -53,7 +54,7 @@ def decide(reports, lost, world, stride):
     for r, rep in reports.items():
         vals |= set(rep['own'])
     for o in sorted(lost):
-        holder = (o + stride) % world
+        holder = rc_pairs.partner(o, world, stride)    # under a pipeline: the same stage's next replica (milestone 3)
         if holder in lost:
             return False, None, f'rank {o} and the rank that keeps its copy ({holder}) are both lost', EXIT_NEIGHBOURS
         if holder not in reports:
@@ -248,7 +249,8 @@ class Recovery:
         self.keep.install()
         self._start_commit(self.adapter, int(version), 0, None)
         stride = int(os.environ.get('FTV2_PARTNER_STRIDE', '8'))
-        if self.rank < stride:                 # the sizes a standby needs to pre-allocate its shadow while it waits
+        if self.rank < stride and rc_pairs.pp() == 1:   # the sizes a standby needs to pre-allocate its shadow while it waits
+            # (under a pipeline the stages' slices differ and the standby does not know its stage before the list: no pre-allocation)
             try:
                 self.etcd().put(f'keep/sizes/{self.rank}', json.dumps([t.numel() for _, t in self.keep.slots]))
             except Exception as e:
@@ -606,13 +608,13 @@ class Recovery:
             # restore: own kept tensors, or the shadow from the rank that keeps it (point to point)
             sums = None
             if role == 'joiner':
-                holder = (self.rank + stride) % world
+                holder = rc_pairs.partner(self.rank, world, stride)
                 states = Keep.recv_state(adapter.slots(), holder, self.device)
                 src = f'shadow of rank {holder}'
                 sums = {'received': [st['checksum'] for st in states]}
             else:
                 for o in lost:
-                    if (o + stride) % world == self.rank:
+                    if rc_pairs.partner(o, world, stride) == self.rank:
                         sums = {'sent_to': o, 'sent': old_keep.send_shadow(o)}
                 states, src = kept, 'own'
             if self.device.type == 'cuda':
@@ -623,14 +625,14 @@ class Recovery:
             if self.commit_on and J > 0:                     # milestone 2: the partial sums of the step at micro-batch J
                 old_c = getattr(self, 'old_commit', None)
                 if role == 'joiner':
-                    holder = (self.rank + stride) % world
+                    holder = rc_pairs.partner(self.rank, world, stride)
                     flats = [torch.empty(adapter.zero2_partition_size(i), dtype=adapter.zero2_dtype(), device=self.device)
                              for i in adapter.zero2_groups()]
                     for w in dist.batch_isend_irecv([dist.P2POp(dist.irecv, t, holder) for t in flats]):
                         w.wait()
                 else:
                     for o in lost:
-                        if (o + stride) % world == self.rank:
+                        if rc_pairs.partner(o, world, stride) == self.rank:
                             cp = old_c.copy_of(s, J)
                             for w in dist.batch_isend_irecv([dist.P2POp(dist.isend, t, o) for t in cp]):
                                 w.wait()
@@ -663,9 +665,10 @@ class Recovery:
                 self.tr.rng_restore(mine)
                 rng_src = 'own'
             else:
-                src_rank = (self.rank + stride) % world
+                src_rank = rc_pairs.partner(self.rank, world, stride)
                 if snaps[src_rank] is None:
-                    src_rank = next((r for r in survivors if r % stride == self.rank % stride and snaps[r] is not None), host)
+                    src_rank = next((r for r in survivors if r % stride == self.rank % stride and snaps[r] is not None
+                                     and rc_pairs.stage_of(r, world) == rc_pairs.stage_of(self.rank, world)), host)
                 if snaps[src_rank] is not None:
                     self.tr.rng_restore(snaps[src_rank])
                 rng_src = f'rank {src_rank}'

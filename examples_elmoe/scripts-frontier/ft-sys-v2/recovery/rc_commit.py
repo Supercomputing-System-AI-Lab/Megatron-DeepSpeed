@@ -40,7 +40,8 @@ class Commit:
     def __init__(self, adapter, rank, world, device, log, group=None):
         self.ad, self.rank, self.world, self.device, self.log = adapter, rank, world, device, log
         self.stride = int(os.environ.get('FTV2_PARTNER_STRIDE', '8'))
-        self.partner, self.owner = (rank + self.stride) % world, (rank - self.stride) % world
+        import rc_pairs                                      # under a pipeline: the same stage's next replica (milestone 3)
+        self.partner, self.owner = rc_pairs.partner(rank, world, self.stride), rc_pairs.owner(rank, world, self.stride)
         self.k = int(os.environ.get('FTV2_COMMIT_K', '1'))
         self.asyn = os.environ.get('FTV2_COMMIT_ASYNC', '1') == '1'
         self.pg = group
@@ -222,7 +223,8 @@ def decide_microbatch(reports, lost, world, stride, step):
 
     def copies_hold(j):
         for o in lost:
-            h = reports.get((o + stride) % world)
+            import rc_pairs
+            h = reports.get(rc_pairs.partner(o, world, stride))
             if h is None:
                 return f'no report from the rank that keeps the copy of rank {o}'
             if [step, j] not in (h['copy_cur'], h['copy_prev']):
