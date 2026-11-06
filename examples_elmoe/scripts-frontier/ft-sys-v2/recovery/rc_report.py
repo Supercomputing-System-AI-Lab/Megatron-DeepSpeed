@@ -7,6 +7,7 @@
     python rc_report.py keep <arm dir>                     Keep's per-step times (sums over the groups, the median over ranks)
     python rc_report.py final <arm dir A> <arm dir B>      the end-of-run fp32 masters rank by rank (md5, sampled difference)
     python rc_report.py inits <arm dir> <rank log name>     RCCL communicator setups in one rank's log, with their times
+    python rc_report.py restore <arm dir>                  restored optimizer state vs the same rank's state at that step end
     python rc_report.py recovery <arm dir>                 each recovery's phases, seconds after the failure list was written
                                                            (median and max over ranks), and each rank's outcome
 An arm dir is <job dir>/<arm> (it holds rank_<r>.log, standby_<l>.log and ft/). The iteration lines come from Megatron's last rank:
@@ -194,13 +195,39 @@ def inits(arm, rank_file):
         print(f'| {c} | {r["nranks"]} | {r.get("START")} | {r.get("COMPLETE")} | {d} |')
 
 
+def restore(arm):
+    """M1-B's exactness: each rank's restored optimizer state (fp32 master, exp_avg, exp_avg_sq per group) against that rank's own
+    state at the same step end, written before the failure by the process that held it (a lost rank's dead process included)."""
+    import torch
+    d = os.path.join(arm, 'ft', 'sums')
+    print('| rank | restored from | version | groups | fp32 equal | exp_avg equal | exp_avg_sq equal | max abs diff fp32 / m / v (sample) |')
+    print('|---|---|---|---|---|---|---|---|')
+    tot = {'ranks': 0, 'exact': 0}
+    for f in sorted(glob.glob(os.path.join(d, 'rank_*_restored_*.pt')), key=lambda x: int(re.findall(r'rank_(\d+)_', x)[0])):
+        r = torch.load(f)
+        v = r['tag'].rsplit('_v', 1)[1]
+        g = os.path.join(d, f'rank_{r["rank"]}_v{v}.pt')
+        if not os.path.exists(g):
+            print(f'| {r["rank"]} | {r.get("from")} | {v} | - | no step-end record | | | |')
+            continue
+        o = torch.load(g)
+        eq = [all(a[j] == b[j] for a, b in zip(r['sums'], o['sums'])) for j in range(3)]
+        dif = [max(float((a[j] - b[j]).abs().max()) for a, b in zip(r['samples'], o['samples'])) for j in range(3)]
+        tot['ranks'] += 1
+        tot['exact'] += all(eq)
+        print(f'| {r["rank"]} | {r.get("from")} | {v} | {len(r["sums"])} | {eq[0]} | {eq[1]} | {eq[2]} | '
+              f'{dif[0]:.2e} / {dif[1]:.2e} / {dif[2]:.2e} |')
+    print(f'ranks restored bit for bit (every group, all three tensors): {tot["exact"]} of {tot["ranks"]}')
+
+
 def main():
     if len(sys.argv) < 3:
         print(__doc__)
         sys.exit(2)
     cmd, args = sys.argv[1], sys.argv[2:]
     {'losses': lambda: losses(args), 'keep': lambda: keep(args[0]), 'recovery': lambda: recovery(args[0]),
-     'final': lambda: final(args), 'throughput': lambda: throughput(args), 'inits': lambda: inits(args[0], args[1])}[cmd]()
+     'final': lambda: final(args), 'throughput': lambda: throughput(args), 'inits': lambda: inits(args[0], args[1]),
+     'restore': lambda: restore(args[0])}[cmd]()
 
 
 if __name__ == '__main__':

@@ -38,6 +38,18 @@ def checksum(t):
     return int(t.detach().contiguous().view(torch.int32).to(torch.int64).sum().item())
 
 
+def state_fingerprint(adapter, sample_every=409):
+    """Per group of the inner optimizer: exact integer checksums of the fp32 partition and its two moments, and every
+    `sample_every`-th value of each (on the host), for M1-B's restore check."""
+    sums, samples = [], []
+    for gi, p in adapter.slots():
+        m, v = adapter.moments(p)
+        ts = [p.detach(), m if m is not None else torch.zeros_like(p), v if v is not None else torch.zeros_like(p)]
+        sums.append(torch.stack([torch.sum(t.contiguous().view(torch.int32), dtype=torch.int64) for t in ts]))
+        samples.append([t.reshape(-1)[::sample_every].float().cpu() for t in ts])
+    return [x.tolist() for x in torch.stack(sums).cpu()], samples
+
+
 def _ds_cpu_adam(adamw):
     """DeepSpeed's CPU Adam kernel object, made once per process and mode (its construction loads the op, about 1.4 s)."""
     if adamw not in _DS_CPU_ADAM:
@@ -90,6 +102,11 @@ class Keep:
         self.side = torch.cuda.Stream(device=device) if device.type == 'cuda' else None
         self._reuse = reuse
         self.cur_step = None
+        sf = os.environ.get('FTV2_STEP_SUMS_FROM')   # test: step-end state fingerprints from this version on (M1-B)
+        self.sums_from = int(sf) if sf not in (None, '') else None
+        st = os.environ.get('FTV2_STEP_SUMS_TO')
+        self.sums_to = int(st) if st not in (None, '') else 10 ** 9
+        self._sums_done = None
 
     # ------------------------------------------------------------------ point-to-point helpers
     def _exchange(self, send, recv, send_to=None, recv_from=None):
@@ -267,6 +284,19 @@ class Keep:
             if rec is not None and k in rec['groups']:
                 rec['groups'][k]['e_own1'] = self._ev() if cuda else time.time()
         self._flush_records()
+        v = min(self.own)
+        if self.sums_from is not None and self.sums_from <= v <= self.sums_to and max(self.own) == v and v != self._sums_done:
+            self._sums_done = v                # every group has its update of version v: the step-end state
+            self.save_fingerprint(f'v{v}')
+
+    def save_fingerprint(self, tag):
+        """M1-B: this rank's optimizer state fingerprint (checksums and samples) at a step end or after a restore."""
+        if not self.out:
+            return
+        sums, samples = state_fingerprint(self.ad)
+        d = os.path.join(os.path.dirname(self.out), '..', 'sums')
+        os.makedirs(d, exist_ok=True)
+        torch.save({'rank': self.rank, 'tag': tag, 'sums': sums, 'samples': samples}, os.path.join(d, f'rank_{self.rank}_{tag}.pt'))
 
     def _gpu_update(self, k, h):
         opt = self.gpu_opt[k]

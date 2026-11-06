@@ -421,6 +421,13 @@ class Recovery:
                 torch.cuda.synchronize(self.device)
             self.mark(g, 'state_moved')
             adapter.put_state(states)
+            if os.environ.get('FTV2_STEP_SUMS_FROM') and self.out:
+                from rc_keep import state_fingerprint
+                sums_, samples_ = state_fingerprint(adapter)        # M1-B: the restored state, to compare with the step-end one
+                dd = os.path.join(self.out, 'ft', 'sums')
+                os.makedirs(dd, exist_ok=True)
+                torch.save({'rank': self.rank, 'tag': f'restored_{g}_v{s}', 'sums': sums_, 'samples': samples_, 'from': src},
+                           os.path.join(dd, f'rank_{self.rank}_restored_{g}.pt'))
             adapter.refresh_weights()
             del states, kept
             self.tr.set_counters(cnt['iteration'], cnt['samples'], cnt['tokens'])
