@@ -189,15 +189,16 @@ class ZeroAdapter:
         assert off == flat.numel(), f'group {i}: {off} != {flat.numel()}'
         z.averaged_gradients[i] = lst
 
-    def wrap_epilogue(self, after):
+    def wrap_epilogue(self, after, last_fn=None):
         """Milestone 2's hook: after ZeRO's per-micro-batch epilogue (stage 2: the micro-batch's reduced piece was just added to
-        the owner's sums), call after(last), last = the gradient-accumulation boundary. Wrapped on the object."""
+        the owner's sums), call after(last), last = the gradient-accumulation boundary. Wrapped on the object. Milestone 3
+        (ZeRO-1 under the pipeline, install_pipe_commits) passes last_fn: a spaced reduction sets the boundary flag too."""
         z = self.zero
         orig = z.overlapping_partition_gradients_reduce_epilogue
 
         def epilogue(*a, **k):
             out = orig(*a, **k)
-            after(bool(getattr(z, 'is_gradient_accumulation_boundary', False)))
+            after(bool(last_fn()) if last_fn is not None else bool(getattr(z, 'is_gradient_accumulation_boundary', False)))
             return out
         epilogue._ftv2_wrapped = True
         z.overlapping_partition_gradients_reduce_epilogue = epilogue
@@ -302,6 +303,78 @@ class ZeroAdapter:
         allreduce_and_copy_with_multiple_ranks._ftv2_wrapped = True
         z.average_tensor = average_tensor
         z.allreduce_and_copy_with_multiple_ranks = allreduce_and_copy_with_multiple_ranks
+
+    # ------------------------------------------------------------------ milestone 3: reductions every k micro-batches under the
+    # pipeline engine (ZeRO stage 1; m3_map question 4, option 2, "spaced reductions")
+    def is_pipe(self):
+        from deepspeed.runtime.pipe.engine import PipelineEngine
+        return isinstance(self.engine, PipelineEngine)
+
+    def pipe_tied_groups(self):
+        """Weights shared by two stages (tied embeddings): their gradients are summed across stages at the step's end
+        (ReduceTiedGrads, pipe/engine.py:276-292), after a spaced reduction would have cleared them."""
+        try:
+            return len(self.engine.module.get_tied_weights_and_groups())
+        except Exception:
+            return 0
+
+    def install_pipe_commits(self, k, start):
+        """Reduce the stage's gradients after every k-th backward pass, with ZeRO-1's own code, in place of the one reduction
+        after the last backward. Why it is DeepSpeed's code and nothing else (stage_1_and_2.py, DeepSpeed 0.15.5):
+          - under the pipeline DeepSpeed turns overlap_comm off (engine.py:1711), so ZeRO-1 has no gradient hooks and the
+            gradients of every micro-batch so far sit in each parameter's .grad;
+          - reduce_gradients(pipeline_parallel=True) (:709-729) reduces them bucket by bucket only when the optimizer's
+            is_gradient_accumulation_boundary is set (:1426), and its epilogue ADDS the reduced partition into
+            averaged_gradients (:795-803), releases the partition buffer (:679-683) and sets .grad to None (:810);
+          - the engine's own reduction after the last backward (pipe/engine.py:294-313) then adds the last micro-batches.
+        The sum is the same as one reduction per step; only the order of additions (and so the rounding) differs, so a clean run
+        compares with a clean run at the same k.
+        Wrapped on the object: the engine's instruction map (an instance copy with BackwardPass replaced: _exec_schedule looks
+        the instruction up in self._INSTRUCTION_MAP, pipe/engine.py:1447-1451) and train_batch (the start of a resumed step).
+        start() is called at every train_batch and returns (J, drop_until): the step runs micro-batches J..m-1 (the engine's
+        micro_batches set to m - J for this call; the loss scale stays 1/m, DeepSpeedEngine.backward), and a stage whose
+        sums already hold micro-batches J..drop_until-1 drops their gradients instead of reducing them.
+        Returns the state dict {'pos': micro-batches of this step done here, 'spaced': True inside a spaced reduction}."""
+        from deepspeed.runtime.pipe import schedule as pipe_sched
+        eng, z = self.engine, self.zero
+        st = {'pos': 0, 'drop_until': 0, 'm': int(eng.micro_batches), 'spaced': False, 'k': int(k)}
+        orig_bwd = type(eng)._INSTRUCTION_MAP[pipe_sched.BackwardPass]
+
+        def backward(self_, buffer_id):
+            orig_bwd(self_, buffer_id)
+            st['pos'] += 1
+            p = st['pos']
+            if p >= st['m'] or p % st['k']:
+                return
+            if p <= st['drop_until']:
+                z.zero_grad(set_to_none=True)             # these micro-batches are in this stage's sums already
+                return
+            prev = z.is_gradient_accumulation_boundary
+            z.is_gradient_accumulation_boundary = True
+            st['spaced'] = True
+            try:
+                z.reduce_gradients(pipeline_parallel=True)
+            finally:
+                st['spaced'] = False
+                z.is_gradient_accumulation_boundary = prev
+        backward._ftv2_wrapped = True
+        imap = dict(type(eng)._INSTRUCTION_MAP)
+        imap[pipe_sched.BackwardPass] = backward
+        eng._INSTRUCTION_MAP = imap
+        orig_tb = eng.train_batch
+
+        def train_batch(data_iter=None):
+            J, drop = start()
+            st['pos'], st['drop_until'] = int(J), int(drop)
+            if J:
+                eng.micro_batches = st['m'] - int(J)
+            try:
+                return orig_tb(data_iter=data_iter)
+            finally:
+                eng.micro_batches = st['m']
+        train_batch._ftv2_wrapped = True
+        eng.train_batch = train_batch
+        return st
 
     # ------------------------------------------------------------------ the GPU shadow (check mode)
     def gpu_shadow_optimizer(self, params):

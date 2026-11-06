@@ -164,11 +164,48 @@ def decide_cases():
     return fails
 
 
+def pipe_decide_cases():
+    """Milestone 3: decide_microbatch_pipe on 8 ranks, PP 2 (stage 0 = ranks 0-3, stage 1 = ranks 4-7), stride 2 (a node = 2
+    ranks; the partner is the same stage's next replica): each stage decides on its own ranks, the pipeline restarts at the
+    lowest stage position."""
+    from rc_commit import decide_microbatch_pipe
+    old = os.environ.get('FTV2_PP')
+    os.environ['FTV2_PP'] = '2'
+    fails = []
+    rep = lambda c, cur, prv, k=1: {'commit_step': 7, 'commit_c': c, 'commit_k': k, 'copy_cur': cur, 'copy_prev': prv}
+    s0 = lambda c: {r: rep(c, [7, c], [7, c - 1]) for r in (0, 1)}            # stage 0 survivors when ranks 2, 3 are lost
+    s1 = lambda c: {r: rep(c, [7, c], [7, c - 1]) for r in (4, 5, 6, 7)}
+    cases = [
+        ('stage 0 node lost; stage 0 at 3, stage 1 at 4', [2, 3], {**s0(3), **s1(4)}, (True, 3, {0: 3, 1: 4})),
+        ('stage 1 node lost; stage 0 at 3, stage 1 at 4', [6, 7],
+         {**{r: rep(3, [7, 3], [7, 2]) for r in (0, 1, 2, 3)}, **{r: rep(4, [7, 4], [7, 3]) for r in (4, 5)}},
+         (True, 3, {0: 3, 1: 4})),
+        ('stage 1 copy of 4 cut, its survivors at 4: stage 1 falls back to 3', [6, 7],
+         {**{r: rep(3, [7, 3], [7, 2]) for r in (0, 1, 2, 3)}, 4: rep(4, [-1, -1], [7, 3]), 5: rep(4, [7, 4], [7, 3])},
+         (True, 3, {0: 3, 1: 3})),
+        ('stage 0 a rank two ahead: window', [2, 3], {0: rep(5, [7, 3], [7, 2]), 1: rep(3, [7, 3], [7, 2]), **s1(4)},
+         (False, None, None)),
+        ('no commit on stage 0 yet: the pipeline restarts at 0, stage 1 drops to 1', [2, 3],
+         {0: rep(0, [7, 0], [-1, -1]), 1: rep(0, [7, 0], [-1, -1]), **s1(1)}, (True, 0, {0: 0, 1: 1})),
+    ]
+    for name, lost, reps, want in cases:
+        ok, J, Js, why = decide_microbatch_pipe(reps, lost, 8, 2, 7)
+        good = (ok, J, Js) == want
+        print(f'{"PASS" if good else "FAIL"}  pipe decide: {name}: got {(ok, J, Js)} ({why}), want {want}')
+        if not good:
+            fails.append(name)
+    if old is None:
+        os.environ.pop('FTV2_PP', None)
+    else:
+        os.environ['FTV2_PP'] = old
+    return fails
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == '--worker':
         worker(int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6])
         return
-    fails = decide_cases() + snapshot_cases()
+    fails = decide_cases() + pipe_decide_cases() + snapshot_cases()
     env = {k: v for k, v in os.environ.items() if 'proxy' not in k.lower()}
     for n, (mode, k) in enumerate((('p2p', 1), ('p2p', 2), ('keep', 1))):
         out = os.path.join(os.environ.get('TMPDIR', '/tmp'), f'cpu_commit_{os.getpid()}_{mode}{k}')

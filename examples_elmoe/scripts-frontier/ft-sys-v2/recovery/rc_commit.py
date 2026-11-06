@@ -37,8 +37,9 @@ import torch.distributed as dist
 
 
 class Commit:
-    def __init__(self, adapter, rank, world, device, log, group=None):
+    def __init__(self, adapter, rank, world, device, log, group=None, spaced=False):
         self.ad, self.rank, self.world, self.device, self.log = adapter, rank, world, device, log
+        self.spaced = spaced                                 # milestone 3: one reduction (and one epilogue) every k micro-batches
         self.stride = int(os.environ.get('FTV2_PARTNER_STRIDE', '8'))
         import rc_pairs                                      # under a pipeline: the same stage's next replica (milestone 3)
         self.partner, self.owner = rc_pairs.partner(rank, world, self.stride), rc_pairs.owner(rank, world, self.stride)
@@ -66,7 +67,7 @@ class Commit:
         self.debug_to = int(os.environ.get('FTV2_COMMIT_DEBUG_TO', '1000000'))
         self.piece = None
         if self.mode == 'keep':
-            if self.k != 1:
+            if self.k != 1 and not self.spaced:
                 raise ValueError('FTV2_COMMIT_MODE=keep folds in every micro-batch: FTV2_COMMIT_K must be 1')
             self.piece = [torch.zeros_like(t) for t in self.copy_cur]
             adapter.wrap_reduce_keep(self.owner, self.piece)
@@ -93,7 +94,9 @@ class Commit:
         ns = [round(float(f.float().norm()), 6) if f is not None else 0.0 for f in fl]
         self.log(f'commit debug step {self.step} {what}: group norms {ns}')
 
-    def after_epilogue(self, stopping, last):
+    def after_epilogue(self, stopping, last, pos=None):
+        """After ZeRO's epilogue. pos (milestone 3, spaced reductions) = the micro-batches of this step summed after it; without
+        it every epilogue is one micro-batch (ZeRO-2)."""
         if not stopping:
             self.debug_norms(f'after micro-batch {self.added + 1}{" (last)" if last else ""}')
         if stopping:
@@ -102,7 +105,7 @@ class Commit:
                 for t in self.piece:
                     t.zero_()                                # a piece of a cut micro-batch is never folded in
             return
-        self.added += 1
+        self.added = int(pos) if pos is not None else self.added + 1
         if last or self.added % self.k != 0:
             if self.piece is not None:
                 for t in self.piece:
@@ -148,8 +151,8 @@ class Commit:
         self.copy_prev, self.copy_cur = self.copy_cur, self.copy_prev
         self.tok_prev, self.tok_cur = self.tok_cur, self.tok_prev
         for cur, prv, pc in zip(self.copy_cur, self.copy_prev, self.piece):
-            if self.added == 1:
-                cur.copy_(pc)                                # the owner's first micro-batch: its sums ARE the piece
+            if self.added == self.k:
+                cur.copy_(pc)                                # the owner's first commit of the step: its sums ARE the piece
             else:
                 torch.add(prv, pc, out=cur)                  # the owner's accumulated_grad.add_(new) (stage_1_and_2.py:802)
             pc.zero_()
@@ -244,3 +247,29 @@ def decide_microbatch(reports, lost, world, stride, step):
             return True, J - k, f'{why}; resume step {step} at micro-batch {J - k} (the previous commit)'
         return False, None, f'{why}; and {why2}'
     return False, None, why
+
+
+def decide_microbatch_pipe(reports, lost, world, stride, step):
+    """(ok, J, J_by_stage, why): milestone 3, under a pipeline (pure; every rank computes it). Each stage commits on its own
+    clock: its data-parallel group reduces after the stage's own k-th backward, and in one-forward-one-backward the last stage
+    finishes a micro-batch's backward first, so the stages' positions differ by design. decide_microbatch runs per stage, on
+    that stage's survivors and lost ranks (a lost rank's copy is on the same stage's next replica, rc_pairs): J_s. Every stage
+    restarts the pipeline at J = min over the stages of J_s (the data and the schedule start there), and stage s drops the
+    gradients of micro-batches J..J_s-1, which its sums hold already (m3_map question 5, B)."""
+    import rc_pairs
+    by = {}
+    for r, rep in reports.items():
+        by.setdefault(rc_pairs.stage_of(int(r), world), {})[int(r)] = rep
+    Js, whys = {}, []
+    for st, reps in sorted(by.items()):
+        lost_s = [o for o in lost if rc_pairs.stage_of(o, world) == st]
+        ok, J, why = decide_microbatch(reps, lost_s, world, stride, step)
+        whys.append(f'stage {st}: {why}')
+        if not ok:
+            return False, None, None, '; '.join(whys)
+        Js[st] = J
+    missing = sorted({rc_pairs.stage_of(o, world) for o in lost} - set(Js))
+    if missing:
+        return False, None, None, f'no survivor report from stage(s) {missing}'
+    J = min(Js.values()) if Js else 0
+    return True, J, Js, '; '.join(whys) + f'; every stage restarts at micro-batch {J}'

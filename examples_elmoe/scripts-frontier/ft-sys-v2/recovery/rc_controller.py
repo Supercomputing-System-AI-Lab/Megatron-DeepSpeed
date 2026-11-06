@@ -37,7 +37,7 @@ import rc_pairs
 import rc_stop
 import rc_world
 from rc_keep import Keep
-from rc_commit import Commit, decide_microbatch
+from rc_commit import Commit, decide_microbatch, decide_microbatch_pipe
 from adapters.deepspeed_zero import ZeroAdapter
 
 EXIT_NEIGHBOURS, EXIT_WINDOW, EXIT_NO_PLAN, EXIT_FAILED = 74, 75, 76, 77
@@ -228,12 +228,14 @@ class Recovery:
 
     def _ds_fixes(self, adapter):
         """DeepSpeed defects fixed on the object for this run (FTV2_DS_REDUCE_FIX, default 1): the owner check of ZeRO-2's
-        reduce path (adapters/deepspeed_zero.py fix_reduce_owner_check; E5c 5862600), when that path is configured."""
+        reduce path (adapters/deepspeed_zero.py fix_reduce_owner_check; E5c 5862600), when that path is configured. ZeRO-1 reduces
+        through the same average_tensor -> allreduce_and_copy path at its boundary (and, under the pipeline with commits, every k
+        micro-batches), so the fix applies to stage 1 too (milestone 3)."""
         z = adapter.zero
-        if os.environ.get('FTV2_DS_REDUCE_FIX', '1') == '1' and getattr(z, 'partition_gradients', False) and \
+        if os.environ.get('FTV2_DS_REDUCE_FIX', '1') == '1' and getattr(z, 'reduce_scatter', True) and \
                 getattr(z, 'use_multi_rank_bucket_allreduce', True) is False:
             adapter.fix_reduce_owner_check()
-            self.log('DeepSpeed fix on the object: ZeRO-2 reduce path, the owner check in the bucket\'s own group '
+            self.log('DeepSpeed fix on the object: ZeRO reduce path, the owner check in the bucket\'s own group '
                      '(stage_1_and_2.py:1548)')
 
     def after_build(self, model, optimizer, sched, version):
@@ -260,21 +262,39 @@ class Recovery:
         """Milestone 2 on a (re)built engine: its own communicator (collective), the epilogue hook, the copies seeded at (step, J)."""
         if not self.commit_on:
             return
-        if not getattr(adapter.zero, 'partition_gradients', False):
-            self.log('FTV2_COMMIT=1 needs ZeRO stage 2 (per-micro-batch reduction): commits off')
+        pipe = adapter.is_pipe()
+        if not getattr(adapter.zero, 'partition_gradients', False) and not pipe:
+            self.log('FTV2_COMMIT=1 needs ZeRO stage 2 (per-micro-batch reduction) or the pipeline engine: commits off')
+            self.commit_on = False
+            return
+        if pipe and adapter.pipe_tied_groups():
+            self.log('FTV2_COMMIT=1 under the pipeline: weights tied across stages are summed after the last backward '
+                     '(ReduceTiedGrads), after a spaced reduction would have cleared them: commits off')
             self.commit_on = False
             return
         pg = dist.new_group(list(range(self.world)))
-        c = Commit(adapter, self.rank, self.world, self.device, self.log, group=pg)
+        c = Commit(adapter, self.rank, self.world, self.device, self.log, group=pg, spaced=pipe)
         c.set_position(step, J, flats)
         c.seed(step, J, flats)
-        adapter.wrap_epilogue(self._commit_after)
+        if pipe:                                             # milestone 3: ZeRO-1 reduces every k micro-batches (spaced)
+            self.pipe_st = adapter.install_pipe_commits(c.k, self._pipe_start)
+            adapter.wrap_epilogue(self._commit_after, last_fn=lambda: not self.pipe_st['spaced'])
+        else:
+            self.pipe_st = None
+            adapter.wrap_epilogue(self._commit_after)
         self.commit = c
-        self.log(f'commits on: every {c.k} micro-batch(es), async {c.asyn}, position step {step} micro-batch {J}')
+        self.log(f'commits on: every {c.k} micro-batch(es), {c.mode}, async {c.asyn}, position step {step} micro-batch {J}'
+                 f'{" (pipeline: spaced ZeRO-1 reductions)" if pipe else ""}')
+
+    def _pipe_start(self):
+        """The pipeline engine's train_batch asks where its step starts: (J, drop_until) once after a recovery, else (0, 0)."""
+        r, self.pipe_resume = getattr(self, 'pipe_resume', None) or (0, 0), None
+        return r
 
     def _commit_after(self, last):
         stopping = bool(self.hb.S.get('stop'))
-        self.commit.after_epilogue(stopping, last)
+        st = getattr(self, 'pipe_st', None)
+        self.commit.after_epilogue(stopping, last, pos=st['pos'] if st is not None else None)
         self.hb.S['micro_batch'] = self.commit.added           # the heartbeat line's micro-batch (and the tests' injection point)
         if stopping:
             raise self.hb.StopForRecovery('a stop began during a micro-batch epilogue')
@@ -589,8 +609,14 @@ class Recovery:
             self.write_times(g, {'exit': f'step {s} far from the host report {hrep["base_iteration"]}', 'code': EXIT_FAILED})
             self._exit(EXIT_FAILED, 'exception: recovery failed: resume step far from the report')
         J = 0
+        Jown = 0                                             # this rank's stage's commit position (J without a pipeline)
         if self.commit_on:
-            okc, J, whyc = decide_microbatch(reports, lost, world, stride, s)
+            if rc_pairs.pp() > 1:                            # milestone 3: each stage commits on its own clock
+                okc, J, Js, whyc = decide_microbatch_pipe(reports, lost, world, stride, s)
+                Jown = Js[rc_pairs.stage_of(self.rank, world)] if okc else 0
+            else:
+                okc, J, whyc = decide_microbatch(reports, lost, world, stride, s)
+                Jown = J
             self.log(f'commit decision: {whyc}')
             if not okc:
                 self.write_times(g, {'exit': whyc, 'code': EXIT_WINDOW})
@@ -626,7 +652,7 @@ class Recovery:
             self.mark(g, 'state_moved')
             adapter.put_state(states)
             flats = None
-            if self.commit_on and J > 0:                     # milestone 2: the partial sums of the step at micro-batch J
+            if self.commit_on and Jown > 0:                  # milestone 2: the partial sums of the step at micro-batch J
                 old_c = getattr(self, 'old_commit', None)
                 if role == 'joiner':
                     holder = rc_pairs.partner(self.rank, world, stride)
@@ -637,17 +663,17 @@ class Recovery:
                 else:
                     for o in lost:
                         if rc_pairs.partner(o, world, stride) == self.rank:
-                            cp = old_c.copy_of(s, J)
+                            cp = old_c.copy_of(s, Jown)
                             for w in dist.batch_isend_irecv([dist.P2POp(dist.isend, t, o) for t in cp]):
                                 w.wait()
-                    flats = old_c.target(J)
+                    flats = old_c.target(Jown)
                 if self.device.type == 'cuda':
                     torch.cuda.synchronize(self.device)
                 for n, i in enumerate(adapter.zero2_groups()):
                     adapter.zero2_set_partial(i, None if flats is None else flats[n])
                 if os.environ.get('FTV2_COMMIT_DEBUG') == '1':
                     ns = [round(float(adapter.zero2_flat_partial(i).float().norm()), 6) for i in adapter.zero2_groups()]
-                    self.log(f'commit debug step {s} restored at micro-batch {J} ({role}): group norms {ns}')
+                    self.log(f'commit debug step {s} restored at micro-batch {Jown} ({role}): group norms {ns}')
             if os.environ.get('FTV2_STEP_SUMS_FROM') and self.out:
                 from rc_keep import state_fingerprint
                 sums_, samples_ = state_fingerprint(adapter)        # M1-B: the restored state, to compare with the step-end one
@@ -678,18 +704,21 @@ class Recovery:
                 rng_src = f'rank {src_rank}'
             self.mark(g, 'restore_done')
             train_it, valid_it, test_it = self.tr.build_data()
-            if J > 0:                                        # milestone 2: the step resumes at micro-batch J
+            if J > 0 and train_it is not None:               # milestone 2: the step resumes at micro-batch J
                 for _ in range(J):
                     next(train_it)
+            if J > 0 and rc_pairs.pp() == 1:
                 import megatron.core.pipeline_parallel.schedules as sch
                 sch.FTV2_START_MICROBATCH = J
+            if rc_pairs.pp() > 1 and (J > 0 or Jown > 0):  # milestone 3: every stage restarts at J, drops J..Jown-1
+                self.pipe_resume = (J, Jown)
             self.mark(g, 'data_built')
             keep = Keep(adapter, self.rank, world, self.device, self.log, s,
                         out_dir=os.path.join(self.out, 'ft') if self.out else None,
                         reuse=old_keep if role == 'survivor' else getattr(self, 'prealloc', None))
             reseed_s = keep.seed()
             keep.install()
-            self._start_commit(adapter, s, J, flats if self.commit_on else None)
+            self._start_commit(adapter, s, Jown, flats if self.commit_on else None)
             self.mark(g, 'reseed_done')
             rc_world.world_barrier(self.device)
             self.mark(g, 'ready')
