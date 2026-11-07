@@ -182,7 +182,7 @@ def dump_stuck(path, log):
         log(f'stack dump failed: {e!r}'[:200])
 
 
-def abort_all(device, log, limit_s=30.0, dump_path=None):
+def abort_all(device, log, limit_s=30.0, dump_path=None, clear='torch'):
     """Every backend's abort() at once, one thread each (one batch: an abort frees device memory, so it waits behind any kernel on
     its GPU, and the abort that ends that kernel must run at the same time, M3C0c). Then every revoke and abort thread of the
     stop must have returned (rc_stop._THREADS) before the registry is cleared and the old engine freed: a thread still inside
@@ -221,12 +221,14 @@ def abort_all(device, log, limit_s=30.0, dump_path=None):
             f'nothing is freed; this rank leaves; seconds per abort {ret}')
         return {'abort': 'stuck', 'backends': len(bs), 'stuck': stuck, 'alive': alive, 's': secs, 'returned_s': ret}
     res = 'partial'
-    try:
-        dist.distributed_c10d._abort_process_group()
-        res = 'ok'
-    except Exception as e:
-        log(f'registry clear after abort: {e!r}'[:300])
+    if clear == 'torch':
+        try:
+            dist.distributed_c10d._abort_process_group()
+            res = 'ok'
+        except Exception as e:
+            log(f'registry clear after abort: {e!r}'[:300])
     if res != 'ok':
-        forget_all()
+        forget_all()                              # the objects stay referenced (_LEFT_BEHIND): no destructor runs on them
+        res = 'ok' if clear == 'forget' else res
     log(f'abort: {res}, {len(bs)} backends, every abort returned, {time.time() - t0:.3f} s; seconds per abort {ret}')
     return {'abort': res, 'backends': len(bs), 'stuck': 0, 'alive': 0, 's': round(time.time() - t0, 3), 'returned_s': ret}
