@@ -26,6 +26,7 @@ Interface, and where each hook sits (the reason in one line):
   gpu_shadow_optimizer(ps)   an optimizer of the inner optimizer's own class over the shadow tensors (FTV2_SHADOW=gpu).
   set_step(opt, group, p, n) set an optimizer's step count before an update (apex keeps it in the group, torch in the state)."""
 import inspect
+import time
 
 import torch
 
@@ -350,6 +351,7 @@ class ZeroAdapter:
         orig_sgrad = type(eng)._INSTRUCTION_MAP[pipe_sched.SendGrad]
 
         def reduce_now():
+            st['red_t0'] = time.time()                    # milestone 3 C: was this reduction cut by a loss after it began?
             prev = z.is_gradient_accumulation_boundary
             z.is_gradient_accumulation_boundary = True
             st['spaced'] = True
@@ -359,9 +361,7 @@ class ZeroAdapter:
                 st['spaced'] = False
                 z.is_gradient_accumulation_boundary = prev
 
-        def backward(self_, buffer_id):
-            orig_bwd(self_, buffer_id)
-            st['pos'] += 1
+        def after_bwd():
             p = st['pos']
             if p >= st['m'] or p % st['k']:
                 return
@@ -372,6 +372,14 @@ class ZeroAdapter:
                 st['pending'] = True
             else:
                 reduce_now()
+
+        def backward(self_, buffer_id):
+            orig_bwd(self_, buffer_id)
+            st['pos'] += 1
+            if st.get('c_bwd_only'):                      # milestone 3 C (rc_pipe_c): the commit runs apart, so that it can
+                return                                    # run again without the backward
+            after_bwd()
+        st['after_bwd'] = after_bwd
 
         def send_grad(self_, buffer_id):
             orig_sgrad(self_, buffer_id)
@@ -436,6 +444,9 @@ class ZeroAdapter:
         def train_batch(data_iter=None):
             J, drop = start()
             st['pos'], st['drop_until'], st['pending'] = int(J), int(drop), False
+            if st.get('c_replay_pos') is not None:        # milestone 3 C's joiner: the whole schedule, positions from its plan
+                st['pos'], st['drop_until'] = st['c_replay_pos']
+                st['c_replay_pos'], J = None, 0
             if J:
                 eng.micro_batches = st['m'] - int(J)
             try:

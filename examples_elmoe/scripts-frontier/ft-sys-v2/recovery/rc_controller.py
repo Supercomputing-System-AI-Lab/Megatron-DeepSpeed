@@ -106,6 +106,14 @@ class Recovery:
         if os.environ.get('FTV2_DETERMINISTIC') == '1':
             self.deterministic_mode()
         self.pg_timeouts()
+        # milestone 3 C (rc_c_flow, rc_pipe_c): only the lost stage redoes; the survivors keep their engines
+        self.c, self.pipec, self.c_replay, self.c_pg = None, None, None, None
+        self.c_mode = os.environ.get('FTV2_RESUME_LEVEL', 'B').upper() == 'C' and self.commit_on
+        if self.c_mode:
+            from rc_pipe_c import use_pair_groups
+            use_pair_groups()                 # before the engine is built: the pipeline's sends on DeepSpeed's per-pair groups
+            import rc_c_flow
+            self.hb.S['c_hold'] = lambda: rc_c_flow.c_hold(self)
 
     @staticmethod
     def pg_timeouts():
@@ -267,7 +275,8 @@ class Recovery:
             self.log('FTV2_COMMIT=1 needs ZeRO stage 2 (per-micro-batch reduction) or the pipeline engine: commits off')
             self.commit_on = False
             return
-        pg = dist.new_group(list(range(self.world)))
+        pg = self.c_pg if self.c_pg is not None else dist.new_group(list(range(self.world)))
+        self.c_pg = None
         c = Commit(adapter, self.rank, self.world, self.device, self.log, group=pg, spaced=pipe)
         c.set_position(step, J, flats)
         c.seed(step, J, flats)
@@ -278,6 +287,14 @@ class Recovery:
             self.pipe_st = None
             adapter.wrap_epilogue(self._commit_after)
         self.commit = c
+        if pipe and self.c_mode:
+            from rc_pipe_c import PipeC
+            self.pipec = PipeC(adapter, self.pipe_st, self, self.log)
+            self.pipec.install()
+            if self.c_replay is not None:
+                p, store, g = self.c_replay
+                self.c_replay = None
+                self.pipec.set_replay(p, dist.PrefixStore(f'ftv2/c{g}/', store))
         self.log(f'commits on: every {c.k} micro-batch(es), {c.mode}, async {c.asyn}, position step {step} micro-batch {J}'
                  f'{" (pipeline: spaced ZeRO-1 reductions after the " + self.pipe_st["at"] + ", " + str(self.pipe_st["tied"]) + " tied weight(s) summed across stages before ReduceTiedGrads)" if pipe else ""}')
 
@@ -288,6 +305,15 @@ class Recovery:
 
     def _commit_after(self, last):
         st = getattr(self, 'pipe_st', None)
+        if self.c_mode and st is not None and not last:
+            self.c_sync()
+            if any(self.cut(g, st.get('red_t0', 0)) for g in (getattr(self.adapter.zero, 'real_dp_process_group', None) or [])):
+                from rc_pipe_c import CutReduction
+                self.commit.after_epilogue(True, last, pos=st['pos'])
+                raise CutReduction('the reduction was cut by the loss')
+            self.commit.after_epilogue(False, last, pos=st['pos'])
+            self.hb.S['micro_batch'] = self.commit.added
+            return
         if not last and os.environ.get('FTV2_COMMIT_VERIFY', '1') == '1' and self.device.type == 'cuda':
             # A commit is valid only if its reduction really ended on the GPU with every peer (M3P4 5867778): the host enqueues
             # the reduction, the epilogue's adds and the commit's snapshot and token without waiting, so a reduction cut by a
@@ -307,6 +333,34 @@ class Recovery:
         self.hb.S['micro_batch'] = self.commit.added           # the heartbeat line's micro-batch (and the tests' injection point)
         if stopping:
             raise self.hb.StopForRecovery('a stop began during a micro-batch epilogue')
+
+    # ------------------------------------------------------------------ milestone 3 C hooks (rc_pipe_c, rc_c_flow)
+    def c_sync(self):
+        """Wait for the stream, but park for the repair (rc_c_flow.c_hold) if a C stop begins meanwhile: a survivor waiting on
+        a healthy operation must not keep its process from parking (the monitor thread reports only parked processes)."""
+        import rc_c_flow
+        ev = torch.cuda.Event()
+        ev.record()
+        while not ev.query():
+            if self.hb.S.get('stop') and self.c is not None and not self.c['done'] and not self.hb.S.get('c_repairing'):
+                rc_c_flow.c_hold(self)
+            time.sleep(0.0005)
+        if self.hb.S.get('stop') and self.c is not None and not self.c['done'] and not self.hb.S.get('c_repairing'):
+            rc_c_flow.c_hold(self)
+
+    def cut(self, group, t0):
+        """Was an operation on `group` that began at t0 cut by the latest C stop (its backend aborted after it began)?"""
+        c = self.c
+        return bool(c is not None and group is not None and id(group) in c['aborted'] and c['abort_t'] is not None
+                    and t0 < c['abort_t'])
+
+    def wait_resumed(self):
+        import rc_c_flow
+        rc_c_flow.c_hold(self)
+
+    def restore_commit(self):
+        if self.commit is not None:
+            self.commit.restore_own(self.commit.c)
 
     def _reduce_comm_error(self):
         """Has a communicator of this rank's ZeRO reduction groups (dense and expert data parallel) an asynchronous error?"""
@@ -383,6 +437,14 @@ class Recovery:
         if self.role == 'standby':            # the standby has no world to stop: it only learns the list
             self.standby_list = f
             self.standby_event.set()
+            return
+        if self.c_mode and self.commit is not None and self.rank not in set(int(r) for r in f.get('ranks', [])) \
+                and f.get('replace'):
+            self.failure = f
+            self.mark(g, 'list_written')
+            self.T[g]['list_written'] = f.get('t')
+            import rc_c_flow
+            rc_c_flow.c_on_failure(self, f)
             return
         self.freed.clear()
         self.failure = f
@@ -608,6 +670,9 @@ class Recovery:
         self.rank = lost[self.local]
         self.tr.standby_set_rank(self.rank)
         self.hb.S['rank'] = self.rank
+        if self.c_mode:
+            import rc_c_flow
+            return rc_c_flow.c_join(self, f)
         return self._join(g, f, 'joiner', kept=None, old_keep=None)
 
     # ------------------------------------------------------------------ DECIDE + REBUILD + RE-SEED (every rank, same calls)

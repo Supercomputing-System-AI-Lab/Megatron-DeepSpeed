@@ -130,7 +130,11 @@ def _inject():
 
 def _count():
     if S['stop']:
-        raise StopForRecovery('a failure list arrived: stopping for the recovery')
+        h = S.get('c_hold')
+        if h is None:
+            raise StopForRecovery('a failure list arrived: stopping for the recovery')
+        if not S.get('c_repairing'):
+            h()                                        # milestone 3 C: park here until this rank's part of the repair is done
     if S['inject']:
         _inject()
     S['calls'] += 1
