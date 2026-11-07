@@ -206,10 +206,13 @@ def _send_state(ctl, p, plan):
     """The partner -> the joiner, in this order (c_join receives in the same order): Keep's shadow of the lost rank; the bf16
     flat groups; the sums at J (the copy); then Keep and the commit copies seeded pairwise."""
     L = p['rank']
+    ctl.log(f'C: sending rank {L} its state (Keep shadow, bf16 weights, sums at micro-batch {plan["J"]})')
     ctl.keep.send_shadow(L)
+    ctl.log('C: shadow sent')
     z = ctl.adapter.zero
     for t in z.bit16_groups_flat:
         dist.send(t, L)
+    ctl.log('C: weights sent')
     cp = ctl.commit.copy_of(plan['step'], plan['J'])
     if plan['J'] > 0:
         if cp is None:
@@ -251,11 +254,14 @@ def c_join(ctl, f):
     plan = make_plan(reports, lost, world, None)
     p = next(x for x in plan['joiners'] if x['rank'] == ctl.rank)
     holder = p['partner']
+    ctl.log(f'C join {g}: plan {p}; receiving from rank {holder}')
     states = Keep.recv_state(adapter.slots(), holder, ctl.device)
     adapter.put_state(states)
+    ctl.log('C join: state received')
     z = adapter.zero
     for t in z.bit16_groups_flat:
         dist.recv(t, holder)
+    ctl.log('C join: weights received')
     flats = None
     if plan['J'] > 0:
         flats = [torch.empty(adapter.zero2_partition_size(i), dtype=adapter.zero2_dtype(), device=ctl.device)
@@ -276,6 +282,7 @@ def c_join(ctl, f):
                 out_dir=os.path.join(ctl.out, 'ft') if ctl.out else None)
     keep.seed()
     keep.install()
+    ctl.log('C join: Keep seeded')
     ctl.c_replay = (p, store, g)
     ctl._start_commit(adapter, step, plan['J'], flats)
     train_it, valid_it, test_it = ctl.tr.build_data()
