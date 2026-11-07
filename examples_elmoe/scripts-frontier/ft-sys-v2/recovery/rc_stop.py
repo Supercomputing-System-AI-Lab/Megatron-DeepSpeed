@@ -81,7 +81,8 @@ def _backends(device):
 
 
 def revoke_all(device, log, limit_s=10.0, groups=None, dump_path=None):
-    """ncclCommRevoke on every communicator (or on those of `groups`: the groups that hold a lost rank, as C's stop does), one
+    """NOT CALLED by the stops since 2026-11-07 (M3R1 5872321: RCCL's revoke waits for the whole GPU to go idle, so it blocks while
+    a cut kernel on a communicator it does not revoke runs; the stops end every kernel with one batch of aborts). ncclCommRevoke on every communicator (or on those of `groups`: the groups that hold a lost rank, as C's stop does), one
     thread each. No device synchronization (2026-11-06: a thread waiting for the GPU while the old engine is freed is not
     needed; C's stop never waits for the GPU). Returns a summary dict."""
     t0 = time.time()

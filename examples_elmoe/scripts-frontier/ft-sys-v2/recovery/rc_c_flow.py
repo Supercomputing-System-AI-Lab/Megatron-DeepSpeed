@@ -74,7 +74,7 @@ def _backends(gs, device):
 
 
 def revoke_these(gs, device, log, limit_s, why, dump_path=None):
-    """ncclCommRevoke on the current backend of each group, one thread each: the kernels in flight on it end, the resources stay
+    """NOT CALLED since 2026-11-07 (the stop never revokes: M3R1 5872321). ncclCommRevoke on the current backend of each group, one thread each: the kernels in flight on it end, the resources stay
     (no device synchronization, so it returns even when another kernel keeps this GPU busy). Returns False if RCCL has no revoke."""
     lib = rc_stop.rccl()
     if lib is None or not hasattr(lib, 'ncclCommRevoke'):
@@ -118,9 +118,9 @@ def abort_batch(cgs, lgs, device, log, limit_s):
 
 
 def abort_groups(lost, device, log, limit_s):
-    """Revoke and abort the backend of every registered group that holds a lost rank, except the world group. Returns the groups."""
+    """Abort the backend of every registered group that holds a lost rank, except the world group, in one batch (no revoke).
+    Returns the groups."""
     gs = lost_groups(lost)
-    revoke_these(gs, device, log, float(os.environ.get('FTV2_REVOKE_WAIT_S', '10')), 'hold a lost rank')
     return abort_these(gs, device, log, limit_s, 'hold a lost rank')
 
 
@@ -278,11 +278,11 @@ def c_on_failure(ctl, f):
     # never be taken for a finished one)
     ctl.c['aborted'] = {id(pg) for pg in lgs}
     ctl.c['abort_t'] = time.time()
-    # 1. the groups with a lost rank: revoked only (their kernels end; their resources are freed after the cut groups' aborts,
-    #    because an abort frees device memory and so waits for a GPU that a cut healthy operation keeps busy: M3C1e 5869712)
-    if not revoke_these(lgs, ctl.device, ctl.log, float(os.environ.get('FTV2_REVOKE_WAIT_S', '10')), 'hold a lost rank',
-                        dump_path=os.path.join(ctl.out, 'ft', 'stuck', f'rank_{ctl.rank}.revoke.txt') if ctl.out else None):
-        abort_these(lgs, ctl.device, ctl.log, float(os.environ.get('FTV2_ABORT_WAIT_S', '30')), 'hold a lost rank')
+    # 1. no RCCL call yet (2026-11-07, the rule of the Decided node 'one batch of aborts, never a revoke'): on this stack RCCL's
+    #    management calls wait for the whole GPU to go idle (communicator setup: hipFree in initTransportsRank, M3C1e; an abort's
+    #    frees, M3C0c; the revoke: hipDeviceSynchronize in its proxy thread, M3R1 5872321), and a kernel the stop has cut on a
+    #    healthy communicator never ends by itself. The main threads park by polling; the kernels are ended later, all at once, by
+    #    the one batch of aborts of the lost and the cut groups (step 4). The cut time above marks what that batch cuts.
     ctl.mark(g, 'abort_done')
     # 2. the agreed instruction of my stage-replica, then wait for the main thread to park at it
     S['c_target'], sr = _positions(ctl, e, g, survivors, inst, in_inst)
