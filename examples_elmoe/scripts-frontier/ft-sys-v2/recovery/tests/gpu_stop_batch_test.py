@@ -10,6 +10,8 @@ partner (4, 5); both (6, 7). No revoke anywhere. Then, by FTV2_TEST_SHAPE:
        cut operation; rc_c_flow.abort_batch aborts the cut groups and the lost groups (A1, A2, A3, C, Q) in one batch;
   AB   rc_stop.abort_all aborts every backend of the registry in one batch, then torch's _abort_process_group clears the registry;
   ABF  the same batch, then the registry is cleared by hand and the objects stay referenced (rc_stop.forget_all: no destructor).
+  ...K the same with the keeper the controller makes at start (rc_stop.make_keeper: a one-rank communicator, never aborted, which
+       keeps the network plugin loaded when every other communicator is aborted).
 Then the next communicator setup: a new 8-rank RCCL communicator on node 0 and one all-reduce (polled, 120-s limit).
 Pass: every abort returns in under 1 s, no rank crashes, the new communicator's all-reduce returns with the right sum; with C, the
 list names the healthy pair's group on ranks 2, 3, 6, 7 and on no other rank.
@@ -77,6 +79,8 @@ def worker(rank, host, port, shape, out):
     hb.install_counter()
     hb.S['c_track'] = True
     store = dist.TCPStore(host, port, None, is_master=False, timeout=TO)
+    if shape.endswith('K'):
+        rc_stop.make_keeper(dev)                    # as the controller does at start: a one-rank communicator never aborted
     dist.init_process_group('nccl', store=dist.PrefixStore('init', store), rank=rank, world_size=16, timeout=TO, device_id=dev)
     me = rank % 8
     groups = {}
@@ -130,7 +134,7 @@ def worker(rank, host, port, shape, out):
     time.sleep(2)
     lost = [groups[n] for n in ('A1', 'A2', 'A3', 'C', 'Q')]
     t0 = time.time()
-    if shape == 'C':
+    if shape.startswith('C'):
         ctl = Ctl(rank, hb, dev, [id(g) for g in lost])
         d = cf.single_list(ctl, StoreEtcd(store), 'sb', list(range(8)), limit=120)
         keys = rc_swap.group_keys()
@@ -141,7 +145,7 @@ def worker(rank, host, port, shape, out):
         cgs = [g for g in groups.values() if keys.get(id(g)) in d['cuts']]
         secs = cf.abort_batch(cgs, lost, dev, ctl.log, 30)
     else:
-        r = rc_stop.abort_all(dev, lambda m: log(rank, m), limit_s=30, clear='forget' if shape == 'ABF' else 'torch')
+        r = rc_stop.abort_all(dev, lambda m: log(rank, m), limit_s=30, clear='forget' if shape.startswith('ABF') else 'torch')
         secs = r.get('returned_s', [])
         res['abort'] = {k: v for k, v in r.items() if k != 'returned_s'}
     res['abort_secs'] = secs
@@ -180,7 +184,11 @@ def launch():
         w = subprocess.Popen(['srun', '--overlap', '-N2', '-n16', '--ntasks-per-node=8', '--gpus-per-node=8', '--cpus-per-task=7',
                               '--kill-on-bad-exit=0',
                               'bash', '-c', f'{pre}exec {sys.executable} {me} --worker $SLURM_PROCID {host} {port} {shape} {out}'])
-        code = w.wait(timeout=600)
+        try:
+            code = w.wait(timeout=300)
+        except subprocess.TimeoutExpired:
+            w.kill()
+            code = "step limit (300 s)"
         for r in range(8):
             f = f'{out}.{shape}.{r}'
             if not os.path.exists(f):
