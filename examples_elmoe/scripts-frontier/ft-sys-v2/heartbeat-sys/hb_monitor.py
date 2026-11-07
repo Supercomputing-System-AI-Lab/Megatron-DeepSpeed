@@ -351,6 +351,9 @@ def pending_groups(settle_s=3.0, skip=()):
     return cur
 
 
+_TL = threading.local()
+
+
 def install_counter():
     """Wrap torch.distributed's communication calls so each one counts. Idempotent."""
     if S['installed']:
@@ -378,9 +381,14 @@ def install_counter():
 
                 def wrapped(*a, _f=f, _gi=gi, **k):
                     _count()
-                    if S['c_trace'] is not None:
+                    nested = getattr(_TL, 'depth', 0)
+                    if S['c_trace'] is not None and not nested:  # the outer call only (torch's recv calls irecv, batch_isend_irecv irecv)
                         _trace(_f.__name__, _gi, a, k)
-                    r = _f(*a, **k)
+                    _TL.depth = nested + 1
+                    try:
+                        r = _f(*a, **k)
+                    finally:
+                        _TL.depth = nested
                     if S['c_track']:
                         _track(_f.__name__, _gi, a, k, r)
                     return r
