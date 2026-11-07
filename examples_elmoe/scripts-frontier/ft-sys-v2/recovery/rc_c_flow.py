@@ -296,6 +296,7 @@ def c_on_failure(ctl, f):
         ctl.c_fallbacks = getattr(ctl, 'c_fallbacks', 0) + 1
         ctl.log(f'C falls back to level B ({ctl.c_fallbacks} so far in this run): {"; ".join(d["why"])[:600]}')
         ctl.c.update(fallback=True, done=True)
+        ctl.write_times(g, {'level': 'B', 'fallback_why': d['why'][:8], 'fallbacks': ctl.c_fallbacks})
         ctl.c['ready'].set()
         return 'B'
     keys = rc_swap.group_keys()
@@ -304,6 +305,7 @@ def c_on_failure(ctl, f):
     ctl.c['redo'] = {id(pg) for pg in cgs if mine.get(keys[id(pg)]) == 'redo'}
     if d['cuts']:
         ctl.log(f'C cut: {d["cuts"]} (group: index); my actions {mine}')
+    ctl.write_times(g, {'level': 'C', 'cuts': d['cuts'], 'actions': mine, 'position': [inst, in_inst], 'target': S['c_target']})
     # 4. abort the cut groups and the lost groups at once (abort_batch); before it, no blocking call on the GPU
     abort_batch(cgs, lgs, ctl.device, ctl.log, float(os.environ.get('FTV2_ABORT_WAIT_S', '30')))
     ctl.mark(g, 'cut_done')
@@ -442,6 +444,8 @@ def c_hold(ctl):
         c['done'] = True
         ctl.recovered += 1
         ctl.log(f'C recovery {c["gen"]}: my part done; this rank goes on from where it stopped')
+        ctl.first_step_wait = (c['gen'], int(S.get('step', -1)))    # first_step_done when the next iteration begins
+        ctl.write_times(c['gen'], {'where': S.get('c_where'), 'inst': S.get('c_inst')})
 
 
 def _send_state(ctl, p, plan):
@@ -539,6 +543,8 @@ def c_join(ctl, f):
     ctl.hb.begin_generation(f'{ctl.base_run}.g{g}', rank=ctl.rank, role='train')
     ctl.role = 'train'
     ctl.mark(g, 'ready')
+    ctl.first_step_wait = (g, step)
+    ctl.write_times(g, {'level': 'C', 'plan': p})
     ctl.log(f'C join {g}: rank {ctl.rank} built alone (fake backend), swapped in, state from rank {holder}, replays step {step} '
             f'from micro-batch {p["start"]} (commit {plan["J"]})')
     return [model, optimizer, sched, train_it, valid_it]
