@@ -126,13 +126,14 @@ def cut_entry(ctl, settle_s):
     """This survivor's part of the single list (non-blocking queries only; the monitor thread never waits on the GPU).
     Per tracked group: n = index of its last operation, m = its index at this rank's last commit, p = still running after the
     settle, op = its name, s = where this rank can start the group's operations again in place: a reduction it is parked in
-    (c_sync after the launch: from its last commit, m + 1), a pipeline send or receive it is parked in (from the instruction's
-    first operation on that group); None = it cannot."""
+    (c_sync after the launch: where that reduction began, which is after its last commit), a pipeline send or receive it is
+    parked in (from the instruction's first operation on that group); None = it cannot."""
     S = ctl.hb.S
     keys = rc_swap.group_keys()
     lostg = set((getattr(ctl, 'c', None) or {}).get('aborted', ()))   # groups with a lost rank: the commit positions decide
     pend = {id(gr) for gr, _, _ in ctl.hb.pending_groups(settle_s, skip=lostg)}
     mark, imark, where = dict(S.get('c_mark') or {}), dict(S.get('c_inst_mark') or {}), S.get('c_where')
+    rmark = dict(S.get('c_red_mark') or {})
     out = {}
     for i, (gr, name, n, ended) in ctl.hb.last_ops().items():
         k = keys.get(i)
@@ -141,8 +142,9 @@ def cut_entry(ctl, settle_s):
         m = mark.get(i, 0)
         p = i in pend
         s = None
-        if where == 'red' and name in RED_OPS and n > m:
-            s = m + 1
+        r0 = rmark.get(i, m)
+        if where == 'red' and name in RED_OPS and n > r0:
+            s = r0 + 1                                 # the reduction it is parked in starts again where it began
         elif where == 'p2p' and name in ('broadcast', 'send', 'recv', 'isend', 'irecv') and p:
             s = imark.get(i, n - 1) + 1
         out[k] = {'n': n, 'm': m, 'p': p, 'op': name, 's': s}
@@ -472,6 +474,27 @@ def _send_state(ctl, p, plan):
 
 
 # ---------------------------------------------------------------------- the joiner
+def _build_data_alone(ctl):
+    """The joiner's data iterators, built while its groups still have the fake backend (before the swap). Megatron's index build
+    checks that every rank of the data-parallel and the pipeline groups succeeded by summing a flag over them
+    (megatron/data/gpt_dataset.py:510-511, blendable_dataset.py:83-84), and the survivors, which keep their iterators, never join
+    that sum (M3C1f 5870896: the joiners hung there). Under the fake backend each sum is taken as if every member held the
+    joiner's own value (the fake backend leaves the tensor as it is; a SUM is multiplied by the group's size)."""
+    c10d = dist.distributed_c10d
+    orig_d, orig_c = dist.all_reduce, c10d.all_reduce
+
+    def mirrored(tensor, op=dist.ReduceOp.SUM, group=None, async_op=False):
+        r = orig_d(tensor, op=op, group=group, async_op=async_op)
+        if op == dist.ReduceOp.SUM:
+            tensor.mul_(dist.get_world_size(group))
+        return r
+    dist.all_reduce = c10d.all_reduce = mirrored
+    try:
+        return ctl.tr.build_data()
+    finally:
+        dist.all_reduce, c10d.all_reduce = orig_d, orig_c
+
+
 def c_join(ctl, f):
     """The standby process becomes the lost rank: fake-backend build, swap, state from the partner, replay. Returns the box."""
     from torch.testing._internal.distributed.fake_pg import FakeStore
@@ -492,15 +515,23 @@ def c_join(ctl, f):
     ctl._ds_fixes(adapter)
     ctl.c_pg = dist.new_group(list(range(world)))     # the commit's own group, created where the survivors created theirs
     _log_groups(ctl, 'joiner')
+    reports = _reports(e, g, survivors)
+    plan = make_plan(reports, lost, world, None)
+    p = next(x for x in plan['joiners'] if x['rank'] == ctl.rank)
+    holder = p['partner']
+    step = plan['step']
+    hrep = reports[holder]
+    base, inc = hrep['base'], hrep['inc']                      # the counters at this step's start (as in _join)
+    ctl.tr.set_counters(base['iteration'], base['samples'], base['tokens'])
+    ctl.tr.set_scheduler(sched, base['samples'], max(0, base['tokens'] - inc['tokens']))
+    adapter.set_counters(base['iteration'], base['samples'], base['iteration'] * inc.get('micro', 1))
+    train_it, valid_it, test_it = _build_data_alone(ctl)
+    ctl.mark(g, 'data_built')
     store = _world_store(ctl, g, min(survivors), world)
     rc_swap.swap_groups(dist.PrefixStore(f'ftv2/c{g}/', store), lost, ctl.device, 'nccl',
                         timedelta(seconds=float(os.environ.get('FTV2_PG_TIMEOUT_S', '1800'))), joiner=True, log=ctl.log)
     first_collectives(ctl, [dist.distributed_c10d._get_default_group(), ctl.c_pg])
     ctl.mark(g, 'world_up')
-    reports = _reports(e, g, survivors)
-    plan = make_plan(reports, lost, world, None)
-    p = next(x for x in plan['joiners'] if x['rank'] == ctl.rank)
-    holder = p['partner']
     ctl.log(f'C join {g}: plan {p}; receiving from rank {holder}')
     states = Keep.recv_state(adapter.slots(), holder, ctl.device)
     adapter.put_state(states)
@@ -519,12 +550,6 @@ def c_join(ctl, f):
     for n, i in enumerate(adapter.zero2_groups()):
         adapter.zero2_set_partial(i, None if flats is None else flats[n])
     ctl.mark(g, 'state_moved')
-    step = plan['step']
-    hrep = reports[holder]
-    base, inc = hrep['base'], hrep['inc']                      # the counters at this step's start (as in _join)
-    ctl.tr.set_counters(base['iteration'], base['samples'], base['tokens'])
-    ctl.tr.set_scheduler(sched, base['samples'], max(0, base['tokens'] - inc['tokens']))
-    adapter.set_counters(base['iteration'], base['samples'], base['iteration'] * inc.get('micro', 1))
     keep = Keep(adapter, ctl.rank, world, ctl.device, ctl.log, step,
                 out_dir=os.path.join(ctl.out, 'ft') if ctl.out else None)
     keep.seed()
@@ -532,7 +557,6 @@ def c_join(ctl, f):
     ctl.log('C join: Keep seeded')
     ctl.c_replay = (p, store, g)
     ctl._start_commit(adapter, step, plan['J'], flats)
-    train_it, valid_it, test_it = ctl.tr.build_data()
     if train_it is not None:
         for _ in range(p['start']):
             next(train_it)

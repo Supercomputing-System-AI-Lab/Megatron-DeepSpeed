@@ -218,6 +218,7 @@ class PipeC:
         self._backup()
         while True:
             try:
+                self.ctl.hb.S['c_red_mark'] = dict(self.ctl.hb.S['c_n'])   # each group's index where this reduction begins
                 st['after_bwd']()
                 break
             except CutReduction:
@@ -233,6 +234,7 @@ class PipeC:
         while True:
             t0 = time.time()
             try:
+                self.ctl.hb.S['c_red_mark'] = dict(self.ctl.hb.S['c_n'])
                 fn(eng_, *a, **kw)
                 self.ctl.hb.S['c_where'] = 'red'
                 self._sync()
