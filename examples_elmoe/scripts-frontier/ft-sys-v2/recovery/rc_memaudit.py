@@ -145,6 +145,32 @@ def audit(rank, device, out_dir, gen, log=print, intended=()):
                          f'grad_fn={type(t.grad_fn).__name__ if t.grad_fn is not None else None}')
             for ch in _chains(t, set(ignore)):
                 lines.append('     <- ' + ' <- '.join(ch))
+    # the aborted world's objects that Python still holds (2026-11-07, the coordinator: is A's leftover a cut reduction's Work
+    # inside an aborted backend?): ProcessGroup / Backend / Work objects found in Python containers, with a chain for a few
+    try:
+        import torch.distributed as dist
+        from torch._C import _distributed_c10d as c10d_c
+        kinds = tuple(t for t in (getattr(dist, 'ProcessGroup', None), getattr(c10d_c, 'Backend', None),
+                                  getattr(c10d_c, 'Work', None)) if t is not None)
+        found = {}
+        for o in objs:
+            items = (o.values() if isinstance(o, dict) else o if isinstance(o, (list, tuple)) else ())
+            for v in list(items)[:10000]:
+                if isinstance(v, kinds) and id(v) not in found:
+                    found[id(v)] = v
+        reg = set(id(g) for g in dist.distributed_c10d._world.pg_map)
+        n_pg = sum(isinstance(v, kinds[0]) for v in found.values()) if kinds else 0
+        lines.append(f'python-held distributed objects: {len(found)} ({n_pg} process groups; in torch registry now '
+                     f'{sum(1 for v in found.values() if id(v) in reg)}); types '
+                     f'{sorted(set(type(v).__name__ for v in found.values()))}')
+        if rank in walk_ranks:
+            ignore2 = {id(objs), id(stor), id(lines), id(found), id(sys._getframe())}
+            for v in list(found.values())[:6]:
+                lines.append(f'-- {type(v).__name__} (registered {id(v) in reg})')
+                for ch in _chains(v, set(ignore2), depth=6):
+                    lines.append('     <- ' + ' <- '.join(ch))
+    except Exception as ex:
+        lines.append(f'distributed census: {ex!r}')
     del objs
     try:
         snap = torch.cuda.memory._snapshot()
