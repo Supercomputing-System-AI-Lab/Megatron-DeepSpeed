@@ -98,9 +98,11 @@ def revoke_all(device, log, limit_s=10.0, groups=None):
     if lib is None or not ptrs:
         return {'revoked': 0, 'all_done': lib is not None, 'gpu_idle': None, 's': round(time.time() - t0, 3), 'no_revoke': lib is None}
     done = [False] * len(ptrs)
+    ret = [None] * len(ptrs)                   # seconds until each ncclCommRevoke call returned (None: still inside it)
 
     def one(i):
         lib.ncclCommRevoke(ctypes.c_void_p(ptrs[i]), 0)
+        ret[i] = round(time.time() - t0, 3)
         st = ctypes.c_int(-1)
         while time.time() - t0 < limit_s:
             lib.ncclCommGetAsyncError(ctypes.c_void_p(ptrs[i]), ctypes.byref(st))
@@ -112,7 +114,8 @@ def revoke_all(device, log, limit_s=10.0, groups=None):
     _THREADS.extend(ths)
     [t.start() for t in ths]
     [t.join(timeout=max(0.1, limit_s - (time.time() - t0))) for t in ths]
-    r = {'revoked': len(ptrs), 'all_done': all(done), 'alive': sum(t.is_alive() for t in ths), 's': round(time.time() - t0, 3)}
+    r = {'revoked': len(ptrs), 'all_done': all(done), 'alive': sum(t.is_alive() for t in ths), 's': round(time.time() - t0, 3),
+         'returned_s': ret}
     log(f'revoke: {r}')
     return r
 
@@ -178,7 +181,12 @@ def abort_all(device, log, limit_s=30.0, dump_path=None):
     it is: the caller must not free anything and must leave (the rank is treated as lost)."""
     t0 = time.time()
     bs = _backends(device)
-    ths = [threading.Thread(target=b.abort, daemon=True) for b in bs]
+    ret = [None] * len(bs)                     # seconds until each abort returned (None: still inside RCCL at the limit)
+
+    def one(i, b):
+        b.abort()
+        ret[i] = round(time.time() - t0, 3)
+    ths = [threading.Thread(target=one, args=(i, b), daemon=True) for i, b in enumerate(bs)]
     _THREADS.extend(ths)
     [t.start() for t in ths]
     for t in _THREADS:
@@ -191,8 +199,8 @@ def abort_all(device, log, limit_s=30.0, dump_path=None):
         if dump_path:
             dump_stuck(dump_path, log)
         log(f'abort: stuck, {len(bs)} backends, {stuck} aborts and {alive - stuck} revokes still running after {secs:.3f} s: '
-            f'nothing is freed; this rank leaves')
-        return {'abort': 'stuck', 'backends': len(bs), 'stuck': stuck, 'alive': alive, 's': secs}
+            f'nothing is freed; this rank leaves; seconds per abort {ret}')
+        return {'abort': 'stuck', 'backends': len(bs), 'stuck': stuck, 'alive': alive, 's': secs, 'returned_s': ret}
     res = 'partial'
     try:
         dist.distributed_c10d._abort_process_group()
@@ -201,5 +209,5 @@ def abort_all(device, log, limit_s=30.0, dump_path=None):
         log(f'registry clear after abort: {e!r}'[:300])
     if res != 'ok':
         forget_all()
-    log(f'abort: {res}, {len(bs)} backends, every abort returned, {time.time() - t0:.3f} s')
-    return {'abort': res, 'backends': len(bs), 'stuck': 0, 'alive': 0, 's': round(time.time() - t0, 3)}
+    log(f'abort: {res}, {len(bs)} backends, every abort returned, {time.time() - t0:.3f} s; seconds per abort {ret}')
+    return {'abort': res, 'backends': len(bs), 'stuck': 0, 'alive': 0, 's': round(time.time() - t0, 3), 'returned_s': ret}
