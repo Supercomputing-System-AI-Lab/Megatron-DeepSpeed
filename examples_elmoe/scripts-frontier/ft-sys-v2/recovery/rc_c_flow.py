@@ -263,6 +263,7 @@ def c_on_failure(ctl, f):
     ctl.c = {'gen': g, 'lost': lost, 'ready': threading.Event(), 'parked': threading.Event(), 'done': False,
              'aborted': set(), 'abort_t': None, 'redo': set(), 'fallback': False}
     inst, in_inst = ctl.hb.stop_and_position()
+    ctl.hb.trace_start(_trace_path(ctl), int(S.get('step', 0)) + 2)    # FTV2_COLL_TRACE=1: every call until 2 steps after this one
     ctl.mark(g, 'list_seen')
     if ctl.device.type == 'cuda':
         torch.cuda.set_device(ctl.device)
@@ -316,6 +317,7 @@ def c_on_failure(ctl, f):
     n = rc_swap.swap_groups(dist.PrefixStore(f'ftv2/c{g}/', store), lost, ctl.device, 'nccl',
                             timedelta(seconds=float(os.environ.get('FTV2_PG_TIMEOUT_S', '1800'))),
                             log=ctl.log if os.environ.get('FTV2_C_DEBUG') == '1' else None, extra=list(d['cuts']))
+    ctl.hb.trace_reset([pg for pg, ranks in rc_swap.groups_in_order() if set(lost) & set(ranks) or keys[id(pg)] in d['cuts']])
     first_collectives(ctl, [dist.distributed_c10d._get_default_group(), ctl.commit.pg])
     ctl.mark(g, 'world_up')
     ctl.c.update(plan=make_plan(reports, lost, world, ctl.commit.step if ctl.commit else None), store=store, swapped=n)
@@ -323,6 +325,10 @@ def c_on_failure(ctl, f):
     ctl.mark(g, 'plan_done')
     ctl.c['ready'].set()
     return None
+
+
+def _trace_path(ctl):
+    return os.path.join(ctl.out or '/tmp', 'ft', 'trace', f'rank_{ctl.rank}.jsonl')
 
 
 def first_collectives(ctl, groups, limit_s=None):
@@ -528,8 +534,10 @@ def c_join(ctl, f):
     train_it, valid_it, test_it = _build_data_alone(ctl)
     ctl.mark(g, 'data_built')
     store = _world_store(ctl, g, min(survivors), world)
+    ctl.hb.trace_start(_trace_path(ctl), int(step) + 2)
     rc_swap.swap_groups(dist.PrefixStore(f'ftv2/c{g}/', store), lost, ctl.device, 'nccl',
                         timedelta(seconds=float(os.environ.get('FTV2_PG_TIMEOUT_S', '1800'))), joiner=True, log=ctl.log)
+    ctl.hb.trace_reset([pg for pg, _ in rc_swap.groups_in_order()])
     first_collectives(ctl, [dist.distributed_c10d._get_default_group(), ctl.c_pg])
     ctl.mark(g, 'world_up')
     ctl.log(f'C join {g}: plan {p}; receiving from rank {holder}')

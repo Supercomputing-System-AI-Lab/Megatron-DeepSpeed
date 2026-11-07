@@ -48,7 +48,7 @@ S = {'calls': 0, 'step': -1, 'micro_batch': -1, 'phase': 'start', 'loss': None, 
      'role': 'train', 'started': False, 'installed': False, 'failure': None, 'card': None, 'tid': None, 'dir': None,
      'on_failure': None, 'inject': [], 'exit_written': False, 'stop': False, 'on_step': None,
      'c_track': False, 'c_last': {}, 'c_n': {}, 'c_lock': threading.Lock(), 'c_inst': 0, 'c_in_inst': False, 'c_target': None,
-     'c_where': None}
+     'c_where': None, 'c_trace': None, 'c_trace_until': None, 'c_tn': {}, 'c_tkey': {}}
 
 
 class StopForRecovery(Exception):
@@ -188,6 +188,111 @@ def stop_and_position():
         return S['c_inst'], bool(S['c_in_inst'])
 
 
+# ---------------------------------------------------------------- the collective trace (FTV2_COLL_TRACE=1, milestone 3 C)
+def trace_start(path, until_step):
+    """Log every torch.distributed call of this process to path (one JSON line each, flushed) until the iteration after
+    until_step begins (set_step). Off unless FTV2_COLL_TRACE=1."""
+    if os.environ.get('FTV2_COLL_TRACE') != '1' or S['c_trace'] is not None:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    S['c_trace'] = open(path, 'a', buffering=1)
+    S['c_trace_until'] = int(until_step)
+    _trace_line({'ev': 'start', 'until': int(until_step)})
+
+
+def trace_reset(groups, what='swap'):
+    """The groups got new backends: their trace sequence numbers start again at 1 (on every member, at its swap)."""
+    for g in groups:
+        S['c_tn'][id(g)] = 0
+    if S['c_trace'] is not None:
+        _trace_line({'ev': what, 'groups': [_tkey(g) for g in groups]})
+
+
+def _trace_line(d):
+    f = S['c_trace']
+    if f is None:
+        return
+    d.update(t=round(time.time(), 4), step=S['step'], rank=S['rank'])
+    try:
+        f.write(json.dumps(d) + '\n')
+    except Exception:
+        pass
+
+
+def _tkey(grp):
+    """'<ranks>#<order among the registered groups with the same ranks>' (the same on every member)."""
+    k = S['c_tkey'].get(id(grp))
+    if k is not None:
+        return k
+    import torch.distributed as dist
+    c = dist.distributed_c10d
+    if grp is None:
+        grp = c._get_default_group()
+    try:
+        ranks = list(c.get_process_group_ranks(grp))
+        occ = 0
+        for pg in list(c._world.pg_map.keys()):
+            if pg is grp:
+                break
+            if list(c.get_process_group_ranks(pg)) == ranks:
+                occ += 1
+        k = f'{",".join(map(str, ranks)) if len(ranks) <= 4 else f"{ranks[0]}..{ranks[-1]}({len(ranks)})"}#{occ}'
+    except Exception as e:
+        k = f'?{type(grp).__name__}'
+    S['c_tkey'][id(grp)] = k
+    return k
+
+
+def _site():
+    f = sys._getframe(3)                               # _trace <- wrapped <- the caller
+    out = []
+    for _ in range(2):
+        if f is None:
+            break
+        out.append(f'{os.path.basename(f.f_code.co_filename)}:{f.f_lineno}:{f.f_code.co_name}')
+        f = f.f_back
+    return ' < '.join(out)
+
+
+def _trace(name, gi, a, k):
+    import torch.distributed as dist
+    if S['c_trace_until'] is not None and S['step'] > S['c_trace_until']:
+        f, S['c_trace'] = S['c_trace'], None
+        try:
+            f.close()
+        except Exception:
+            pass
+        return
+    if name == 'batch_isend_irecv':
+        ops = a[0] if a else k.get('p2p_op_list', [])
+        groups = {}
+        for op in ops:
+            groups.setdefault(id(op.group), [op.group, []])[1].append(
+                f'{"send" if "send" in getattr(op.op, "__name__", "") else "recv"}:{op.peer}')
+        items = [(g, ' '.join(v)) for g, v in groups.values()]
+    elif name == 'new_group':
+        _trace_line({'fn': 'new_group', 'ranks': list(a[0]) if a else k.get('ranks'), 'site': _site()})
+        return
+    else:
+        grp = k.get('group', a[gi] if gi is not None and len(a) > gi else None)
+        extra = ''
+        if name in ('send', 'isend', 'recv', 'irecv'):
+            extra = str(k.get('dst', k.get('src', a[1] if len(a) > 1 else '')))
+        elif name in ('broadcast', 'reduce'):
+            extra = str(k.get('src', k.get('dst', a[1] if len(a) > 1 else '')))
+        items = [(grp, extra)]
+    for grp, extra in items:
+        if grp is None:
+            grp = dist.distributed_c10d._get_default_group()
+        gid = id(grp)
+        if gid in S['c_tn']:
+            S['c_tn'][gid] += 1
+            seq = f's{S["c_tn"][gid]}'
+        else:
+            seq = f'g{S["c_n"].get(gid, 0) + 1}'
+        _trace_line({'fn': name, 'g': _tkey(grp), 'seq': seq, 'x': extra, 'site': _site()})
+
+
 def _track(name, gi, a, k, r):
     """Milestone 3 C (S['c_track']): keep the last operation on each group with a handle that tells, without waiting, whether it
     has ended (the Work of an asynchronous call; else an event recorded on the current stream, which a synchronous NCCL call makes
@@ -273,6 +378,8 @@ def install_counter():
 
                 def wrapped(*a, _f=f, _gi=gi, **k):
                     _count()
+                    if S['c_trace'] is not None:
+                        _trace(_f.__name__, _gi, a, k)
                     r = _f(*a, **k)
                     if S['c_track']:
                         _track(_f.__name__, _gi, a, k, r)
@@ -281,6 +388,15 @@ def install_counter():
                 wrapped.__name__, wrapped.__doc__, wrapped.__wrapped__ = f.__name__, f.__doc__, f
                 made[id(f)] = wrapped
             setattr(mod, name, made[id(f)])
+    ng = getattr(dist, 'new_group', None)
+    if ng is not None and not getattr(ng, '_ftv2_counted', False):
+        def new_group(*a, _f=ng, **k):
+            if S['c_trace'] is not None:
+                _trace('new_group', None, a, k)
+            return _f(*a, **k)
+        new_group._ftv2_counted = True
+        new_group.__wrapped__ = ng
+        dist.new_group = c10d.new_group = new_group
     S['installed'] = True
 
 
