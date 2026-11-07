@@ -152,7 +152,24 @@ def forget_all():
     c._world.group_count = 0
 
 
-def abort_all(device, log, limit_s=30.0):
+def dump_stuck(path, log):
+    """The native stacks of every thread of this process (py-spy --native, when it is installed), written to path before a rank
+    leaves because a revoke or abort did not return: the next run names the call it waits in."""
+    import subprocess
+    exe = os.path.expanduser('~/.local/bin/py-spy')
+    if not os.path.exists(exe):
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        out = subprocess.run([exe, 'dump', '--native', '--pid', str(os.getpid())], capture_output=True, text=True, timeout=60)
+        with open(path, 'w') as f:
+            f.write(out.stdout + out.stderr)
+        log(f'stacks of the stuck stop written to {path}')
+    except Exception as e:
+        log(f'stack dump failed: {e!r}'[:200])
+
+
+def abort_all(device, log, limit_s=30.0, dump_path=None):
     """Every backend's abort() at once, one thread each (one batch: an abort frees device memory, so it waits behind any kernel on
     its GPU, and the abort that ends that kernel must run at the same time, M3C0c). Then every revoke and abort thread of the
     stop must have returned (rc_stop._THREADS) before the registry is cleared and the old engine freed: a thread still inside
@@ -171,6 +188,8 @@ def abort_all(device, log, limit_s=30.0):
     secs = round(time.time() - t0, 3)
     if alive:
         _LEFT_BEHIND.append(bs)
+        if dump_path:
+            dump_stuck(dump_path, log)
         log(f'abort: stuck, {len(bs)} backends, {stuck} aborts and {alive - stuck} revokes still running after {secs:.3f} s: '
             f'nothing is freed; this rank leaves')
         return {'abort': 'stuck', 'backends': len(bs), 'stuck': stuck, 'alive': alive, 's': secs}

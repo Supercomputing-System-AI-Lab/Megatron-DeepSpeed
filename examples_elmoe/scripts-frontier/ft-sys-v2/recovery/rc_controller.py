@@ -109,9 +109,13 @@ class Recovery:
         # milestone 3 C (rc_c_flow, rc_pipe_c): only the lost stage redoes; the survivors keep their engines
         self.c, self.pipec, self.c_replay, self.c_pg = None, None, None, None
         self.c_mode = os.environ.get('FTV2_RESUME_LEVEL', 'B').upper() == 'C' and self.commit_on
-        if self.c_mode:
+        if self.c_mode or os.environ.get('FTV2_PAIR_GROUPS', '1') == '1':
+            # before the engine is built: the pipeline's sends on DeepSpeed's per-pair groups, at every level (2026-11-07): the
+            # stop then revokes the lost pairs as groups of their own; with the sends on the world group (A and B until now) the
+            # communicators to the lost ranks lived inside the world backend (M3C12b 5872237: A's and B's aborts did not return)
             from rc_pipe_c import use_pair_groups
-            use_pair_groups()                 # before the engine is built: the pipeline's sends on DeepSpeed's per-pair groups
+            use_pair_groups()
+        if self.c_mode:
             import rc_c_flow
             self.hb.S['c_hold'] = lambda: rc_c_flow.c_hold(self)
             self.hb.S['c_track'] = True       # the last operation per group, to find the ones a stop cuts (rc_c_flow.cut_healthy_groups)
@@ -355,7 +359,15 @@ class Recovery:
             # lost peer still "commits" its partial sums; the stop's revoke later ends the cut kernel and the stream runs on.
             # Wait for the stream here; a reduction that ended because of the stop finds the stop flag set (it is set before the
             # revoke, _on_failure), and one that ended on a network error leaves an error on its communicator.
-            torch.cuda.current_stream(self.device).synchronize()
+            # Polled, never a blocking synchronize (2026-11-07, as C's c_sync): once the stop has begun the commit is refused at
+            # once and the main thread leaves the GPU alone while the stop's aborts run (M3C12b 5872237: aborts did not return on
+            # the lost node's pipeline replica; a main thread blocked in this synchronize is one candidate, not yet shown).
+            ev = torch.cuda.Event()
+            ev.record()
+            while not ev.query():
+                if self.hb.S.get('stop'):
+                    break
+                time.sleep(0.0005)
         flag = bool(self.hb.S.get('stop'))
         stopping = flag or (not last and self._reduce_comm_error())
         if stopping:
@@ -539,7 +551,9 @@ class Recovery:
         survivors = [r for r in range(self.world) if r not in lost]
         info['barrier'] = rc_stop.etcd_barrier(self.etcd(), g, self.rank, survivors, self.log)
         self.mark(g, 'barrier_done')
-        info['abort'] = rc_stop.abort_all(self.device, self.log, limit_s=float(os.environ.get('FTV2_ABORT_WAIT_S', '30')))
+        info['abort'] = rc_stop.abort_all(self.device, self.log, limit_s=float(os.environ.get('FTV2_ABORT_WAIT_S', '30')),
+                                          dump_path=os.path.join(self.out, 'ft', 'stuck', f'rank_{self.rank}.txt')
+                                          if getattr(self, 'out', None) else None)
         self.mark(g, 'abort_done')
         if info['abort'].get('abort') == 'stuck':
             why = (f'{info["abort"]["alive"]} revoke/abort thread(s) still inside RCCL after the limit: this rank\'s memory '
