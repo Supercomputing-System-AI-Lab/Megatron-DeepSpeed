@@ -259,6 +259,7 @@ class Recovery:
         self.keep.seed()
         self.keep.install()
         self._start_commit(self.adapter, int(version), 0, None)
+        self.count_pipe(self.adapter)
         stride = int(os.environ.get('FTV2_PARTNER_STRIDE', '8'))
         if self.rank < stride and rc_pairs.pp() == 1:   # the sizes a standby needs to pre-allocate its shadow while it waits
             # (under a pipeline the stages' slices differ and the standby does not know its stage before the list: no pre-allocation)
@@ -298,6 +299,37 @@ class Recovery:
                 self.pipec.set_replay(p, dist.PrefixStore(f'ftv2/c{g}/', store))
         self.log(f'commits on: every {c.k} micro-batch(es), {c.mode}, async {c.asyn}, position step {step} micro-batch {J}'
                  f'{" (pipeline: spaced ZeRO-1 reductions after the " + self.pipe_st["at"] + ", " + str(self.pipe_st["tied"]) + " tied weight(s) summed across stages before ReduceTiedGrads)" if pipe else ""}')
+
+    def count_pipe(self, adapter):
+        """Every level (milestone 3, C2): the ForwardPass and BackwardPass instructions this step has run (self.pc, reset at each
+        train_batch), recorded at a stop (the work a restart discards); without commits (level A) also the heartbeat's micro-batch,
+        which the test injections' 'after micro-batch N' reads. Wraps the engine's instance instruction map outermost."""
+        if not adapter.is_pipe():
+            return
+        from deepspeed.runtime.pipe import schedule as sch
+        eng = adapter.engine
+        self.pc = {'fwd': 0, 'bwd': 0}
+        imap = dict(eng._INSTRUCTION_MAP)
+
+        def wrap(kind, fn):
+            def run(eng_, *a, **kw):
+                out = fn(eng_, *a, **kw)
+                self.pc[kind] += 1
+                if kind == 'bwd' and not self.commit_on:
+                    self.hb.S['micro_batch'] = self.pc['bwd']
+                return out
+            return run
+        imap[sch.ForwardPass] = wrap('fwd', imap[sch.ForwardPass])
+        imap[sch.BackwardPass] = wrap('bwd', imap[sch.BackwardPass])
+        eng._INSTRUCTION_MAP = imap
+        orig = eng.train_batch
+
+        def train_batch(*a, **k):
+            self.pc['fwd'] = self.pc['bwd'] = 0
+            if not self.commit_on:
+                self.hb.S['micro_batch'] = 0
+            return orig(*a, **k)
+        eng.train_batch = train_batch
 
     def _pipe_start(self):
         """The pipeline engine's train_batch asks where its step starts: (J, drop_until) once after a recovery, else (0, 0)."""
@@ -546,6 +578,8 @@ class Recovery:
         f = self.failure
         g = f['gen']
         self.mark(g, 'main_caught')
+        if getattr(self, 'pc', None) is not None:          # the instructions this step had run when it stopped (C2)
+            self.write_times(g, {'pc': dict(self.pc), 'commit_c': self.commit.c if self.commit is not None else None})
         lost = sorted(int(r) for r in f['ranks'])
         if self.rank in lost:
             while True:                 # the monitor ends this process
@@ -832,6 +866,7 @@ class Recovery:
             reseed_s = keep.seed()
             keep.install()
             self._start_commit(adapter, s, Jown, flats if self.commit_on else None)
+            self.count_pipe(adapter)
             self.mark(g, 'reseed_done')
             rc_world.world_barrier(self.device)
             self.mark(g, 'ready')

@@ -63,10 +63,20 @@ def _parse_inject():
     return out
 
 
+def _rank_in(spec):
+    """An injection's rank field: 'all', one rank, or a range 'a-b' (a whole node's ranks at the same point)."""
+    if spec == 'all':
+        return True
+    if '-' in str(spec):
+        lo, hi = (int(x) for x in str(spec).split('-'))
+        return lo <= S['rank'] <= hi
+    return int(spec) == S['rank']
+
+
 def _inject():
     """Run before every counted call: fire any injection due at this rank and step."""
     for j in S['inject']:
-        if j['done'] or S['step'] < j['step'] or (j['rank'] != 'all' and int(j['rank']) != S['rank']):
+        if j['done'] or S['step'] < j['step'] or not _rank_in(j['rank']):
             continue
         k = j['kind']
         if k in ('kill', 'hang', 'hip', 'hipabort', 'hwfault', 'dhang', 'nodump', 'abort', 'exit') and j['arg'] and \

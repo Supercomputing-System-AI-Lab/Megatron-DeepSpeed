@@ -308,7 +308,8 @@ def c_on_failure(ctl, f):
     ctl.c['redo'] = {id(pg) for pg in cgs if mine.get(keys[id(pg)]) == 'redo'}
     if d['cuts']:
         ctl.log(f'C cut: {d["cuts"]} (group: index); my actions {mine}')
-    ctl.write_times(g, {'level': 'C', 'cuts': d['cuts'], 'actions': mine, 'position': [inst, in_inst], 'target': S['c_target']})
+    ctl.write_times(g, {'level': 'C', 'cuts': d['cuts'], 'actions': mine, 'position': [inst, in_inst], 'target': S['c_target'],
+                        'pc': dict(getattr(ctl, 'pc', None) or {})})
     # 4. abort the cut groups and the lost groups at once (abort_batch); before it, no blocking call on the GPU
     abort_batch(cgs, lgs, ctl.device, ctl.log, float(os.environ.get('FTV2_ABORT_WAIT_S', '30')))
     ctl.mark(g, 'cut_done')
@@ -565,6 +566,7 @@ def c_join(ctl, f):
     ctl.log('C join: Keep seeded')
     ctl.c_replay = (p, store, g)
     ctl._start_commit(adapter, step, plan['J'], flats)
+    ctl.count_pipe(adapter)
     if train_it is not None:
         for _ in range(p['start']):
             next(train_it)
