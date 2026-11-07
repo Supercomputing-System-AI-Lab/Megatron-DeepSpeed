@@ -10,7 +10,7 @@ rank_<r>_g<g>.txt with
   - for the largest storages and the graph tensors: chains of gc referrers up to a named holder (an attribute of an object, a
     module global, a closure cell, a frame, a traceback);
   - the active blocks of torch.cuda.memory._snapshot() summed by the Python allocation site outside torch.
-FTV2_MEM_AUDIT_RANKS (default '0') names the ranks that walk referrers (all ranks write the totals)."""
+FTV2_MEM_AUDIT_RANKS (default '0'; ';' or ',' between ranks) names the ranks that walk referrers (all ranks write the totals)."""
 import gc
 import os
 import sys
@@ -88,7 +88,7 @@ def _chains(obj, ignore, depth=8, width=2):
 def audit(rank, device, out_dir, gen, log=print):
     if os.environ.get('FTV2_MEM_AUDIT') != '1' or not torch.cuda.is_available():
         return
-    walk_ranks = {int(x) for x in os.environ.get('FTV2_MEM_AUDIT_RANKS', '0').split(',') if x.strip()}
+    walk_ranks = {int(x) for x in os.environ.get('FTV2_MEM_AUDIT_RANKS', '0').replace(';', ',').split(',') if x.strip()}
     lines = []
     gc.collect()
     alloc = torch.cuda.memory_allocated(device)
