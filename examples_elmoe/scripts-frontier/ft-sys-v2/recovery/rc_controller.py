@@ -118,7 +118,9 @@ class Recovery:
         if self.c_mode:
             import rc_c_flow
             self.hb.S['c_hold'] = lambda: rc_c_flow.c_hold(self)
-            self.hb.S['c_track'] = True       # the last operation per group, to find the ones a stop cuts (rc_c_flow.cut_healthy_groups)
+            # the last operation per group, to find the ones a stop cuts (rc_c_flow.cut_entry). FTV2_C_TRACK=0 turns it off for a
+            # cost measurement only: without it C's list cannot see a cut operation, so a failure would not be handled correctly
+            self.hb.S['c_track'] = os.environ.get('FTV2_C_TRACK', '1') == '1'
 
     @staticmethod
     def pg_timeouts():
