@@ -46,14 +46,23 @@ def abort_groups(lost, device, log, limit_s):
             pass
     lib = rc_stop.rccl()
     import ctypes
+
+    def revoke(b):
+        try:
+            p = b._comm_ptr()
+            if p:
+                lib.ncclCommRevoke(ctypes.c_void_p(p), 0)
+        except Exception:
+            pass
+    t0 = time.time()
     if lib is not None:
-        for b in bs:
-            try:
-                p = b._comm_ptr()
-                if p:
-                    lib.ncclCommRevoke(ctypes.c_void_p(p), 0)
-            except Exception:
-                pass
+        # one thread each, with a limit: ncclCommRevoke blocks on a point-to-point communicator with a send or receive in flight
+        # to the lost peer (M3C1a 5868473: the monitor thread stayed in commRevokeAsync)
+        rth = [threading.Thread(target=revoke, args=(b,), daemon=True) for b in bs]
+        [t.start() for t in rth]
+        rlim = float(os.environ.get('FTV2_REVOKE_WAIT_S', '10'))
+        for t in rth:
+            t.join(timeout=max(0.1, rlim - (time.time() - t0)))
     t0 = time.time()
     ths = [threading.Thread(target=b.abort, daemon=True) for b in bs]
     [t.start() for t in ths]
