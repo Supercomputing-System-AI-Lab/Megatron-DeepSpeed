@@ -73,7 +73,7 @@ def _backends(gs, device):
     return bs
 
 
-def revoke_these(gs, device, log, limit_s, why):
+def revoke_these(gs, device, log, limit_s, why, dump_path=None):
     """ncclCommRevoke on the current backend of each group, one thread each: the kernels in flight on it end, the resources stay
     (no device synchronization, so it returns even when another kernel keeps this GPU busy). Returns False if RCCL has no revoke."""
     lib = rc_stop.rccl()
@@ -88,6 +88,8 @@ def revoke_these(gs, device, log, limit_s, why):
     bs = _backends(gs, device)
     secs = _threads([lambda b=b: revoke(b) for b in bs], limit_s)
     log(f'C stop: {len(gs)} groups {why}: revoked {len(bs)} backends in {secs} s (None = did not return)')
+    if dump_path and any(x is None for x in secs):     # the stacks at the revoke's limit, before anything else
+        rc_stop.dump_stuck(dump_path, log)
     return True
 
 
@@ -278,7 +280,8 @@ def c_on_failure(ctl, f):
     ctl.c['abort_t'] = time.time()
     # 1. the groups with a lost rank: revoked only (their kernels end; their resources are freed after the cut groups' aborts,
     #    because an abort frees device memory and so waits for a GPU that a cut healthy operation keeps busy: M3C1e 5869712)
-    if not revoke_these(lgs, ctl.device, ctl.log, float(os.environ.get('FTV2_REVOKE_WAIT_S', '10')), 'hold a lost rank'):
+    if not revoke_these(lgs, ctl.device, ctl.log, float(os.environ.get('FTV2_REVOKE_WAIT_S', '10')), 'hold a lost rank',
+                        dump_path=os.path.join(ctl.out, 'ft', 'stuck', f'rank_{ctl.rank}.revoke.txt') if ctl.out else None):
         abort_these(lgs, ctl.device, ctl.log, float(os.environ.get('FTV2_ABORT_WAIT_S', '30')), 'hold a lost rank')
     ctl.mark(g, 'abort_done')
     # 2. the agreed instruction of my stage-replica, then wait for the main thread to park at it

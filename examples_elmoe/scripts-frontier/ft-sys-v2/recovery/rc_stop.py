@@ -80,7 +80,7 @@ def _backends(device):
     return out
 
 
-def revoke_all(device, log, limit_s=10.0, groups=None):
+def revoke_all(device, log, limit_s=10.0, groups=None, dump_path=None):
     """ncclCommRevoke on every communicator (or on those of `groups`: the groups that hold a lost rank, as C's stop does), one
     thread each. No device synchronization (2026-11-06: a thread waiting for the GPU while the old engine is freed is not
     needed; C's stop never waits for the GPU). Returns a summary dict."""
@@ -117,6 +117,8 @@ def revoke_all(device, log, limit_s=10.0, groups=None):
     r = {'revoked': len(ptrs), 'all_done': all(done), 'alive': sum(t.is_alive() for t in ths), 's': round(time.time() - t0, 3),
          'returned_s': ret}
     log(f'revoke: {r}')
+    if r['alive'] and dump_path:                 # the stacks at the revoke's limit, before any abort (the coordinator, 11-07)
+        dump_stuck(dump_path.replace('.txt', '.revoke.txt'), log)
     return r
 
 
@@ -156,17 +158,24 @@ def forget_all():
 
 
 def dump_stuck(path, log):
-    """The native stacks of every thread of this process (py-spy --native, when it is installed), written to path before a rank
-    leaves because a revoke or abort did not return: the next run names the call it waits in."""
+    """The native stacks of every thread of this process, written to path the moment a revoke or abort passes its limit (before
+    anything else happens): gdb's backtrace of every thread (names the RCCL and HIP calls a thread is inside) and py-spy --native
+    (which Python call started it). Each tool runs with its own time limit; either may be missing."""
     import subprocess
-    exe = os.path.expanduser('~/.local/bin/py-spy')
-    if not os.path.exists(exe):
-        return
+    pid = str(os.getpid())
+    tools = [('gdb', ['gdb', '-p', pid, '-batch', '-ex', 'thread apply all bt 40']),
+             ('py-spy', [os.path.expanduser('~/.local/bin/py-spy'), 'dump', '--native', '--pid', pid])]
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        out = subprocess.run([exe, 'dump', '--native', '--pid', str(os.getpid())], capture_output=True, text=True, timeout=60)
-        with open(path, 'w') as f:
-            f.write(out.stdout + out.stderr)
+        with open(path, 'a') as f:
+            for name, cmd in tools:
+                t0 = time.time()
+                try:
+                    out = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+                    f.write(f'===== {name} ({time.time() - t0:.1f} s)\n{out.stdout}\n{out.stderr[-2000:]}\n')
+                except Exception as e:
+                    f.write(f'===== {name}: {e!r}\n')
+                f.flush()
         log(f'stacks of the stuck stop written to {path}')
     except Exception as e:
         log(f'stack dump failed: {e!r}'[:200])

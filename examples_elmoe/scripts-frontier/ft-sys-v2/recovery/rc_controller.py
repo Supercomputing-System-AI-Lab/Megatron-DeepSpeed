@@ -545,8 +545,9 @@ class Recovery:
         """The communicators' stop of levels A and B (the monitor thread), C's stop ported. Sets freed only when every revoke and
         abort thread has returned; otherwise this rank leaves (EXIT_FAILED) and is treated as lost."""
         import rc_c_flow
+        dump = os.path.join(self.out, 'ft', 'stuck', f'rank_{self.rank}.txt') if getattr(self, 'out', None) else None
         info['revoke'] = rc_stop.revoke_all(self.device, self.log, limit_s=float(os.environ.get('FTV2_REVOKE_WAIT_S', '10')),
-                                            groups=rc_c_flow.lost_groups(lost))
+                                            groups=rc_c_flow.lost_groups(lost), dump_path=dump)
         self.mark(g, 'revoke_done')
         survivors = [r for r in range(self.world) if r not in lost]
         info['barrier'] = rc_stop.etcd_barrier(self.etcd(), g, self.rank, survivors, self.log)

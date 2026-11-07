@@ -106,7 +106,7 @@ def main():
     hold4 = threading.Event()
     bs = [Backend(block=hold4)]
     rc_stop._backends = lambda device: bs
-    rc_stop.revoke_all = lambda device, log, limit_s=10.0, groups=None: {'revoked': 0}
+    rc_stop.revoke_all = lambda device, log, limit_s=10.0, groups=None, dump_path=None: {'revoked': 0}
     rc_stop.etcd_barrier = lambda *a, **k: {'arrived': 3, 'of': 3}
     import rc_c_flow
     rc_c_flow.lost_groups = lambda lost: []
