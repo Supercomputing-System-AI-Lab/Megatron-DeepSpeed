@@ -119,8 +119,11 @@ class Recovery:
             import rc_c_flow
             self.hb.S['c_hold'] = lambda: rc_c_flow.c_hold(self)
             # the last operation per group, to find the ones a stop cuts (rc_c_flow.cut_entry). FTV2_C_TRACK=0 turns it off for a
-            # cost measurement only: without it C's list cannot see a cut operation, so a failure would not be handled correctly
-            self.hb.S['c_track'] = os.environ.get('FTV2_C_TRACK', '1') == '1'
+            # cost measurement only: without it C's list cannot see a cut operation, so a failure would not be handled correctly.
+            # On from the first training step (train) or the join (standby_join), not from here (2026-11-07, P1b 5873196): the
+            # start-up has no operation C could redo, and every rank starts counting at the same call, so the per-group indices
+            # still agree among the members
+            self.c_track_on = os.environ.get('FTV2_C_TRACK', '1') == '1'
 
     @staticmethod
     def pg_timeouts():
@@ -578,6 +581,8 @@ class Recovery:
 
     # ------------------------------------------------------------------ the training loop wrapper
     def train(self, train_fn, box, forward_step_func, process_non_loss_data_func):
+        if self.c_mode:
+            self.hb.S['c_track'] = self.c_track_on
         while True:
             try:
                 return train_fn(forward_step_func, box[0], box[1], box[2], box[3], box[4], process_non_loss_data_func)
@@ -747,6 +752,7 @@ class Recovery:
         self.hb.S['rank'] = self.rank
         if self.c_mode:
             import rc_c_flow
+            self.hb.S['c_track'] = self.c_track_on            # the joiner tracks from its join (the survivors from their start)
             d = rc_c_flow.wait_list(self.etcd(), g)          # the survivors' single list says C, or B (a fall-back)
             if d['mode'] == 'C':
                 try:

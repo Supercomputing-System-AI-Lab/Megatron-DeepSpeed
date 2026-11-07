@@ -303,23 +303,47 @@ def _trace(name, gi, a, k):
         _trace_line({'fn': name, 'g': _tkey(grp), 'seq': seq, 'x': extra, 'site': _site()})
 
 
+def _sync_as_async(f, ai, a, k):
+    """C tracking (2026-11-07, P1b 5873196): a synchronous call is made as torch makes it, async_op=True and then Work.wait() (the
+    same semantics: distributed_c10d's synchronous path is `work = ...; work.wait()`), so the tracking holds torch's own Work as the
+    handle and makes no HIP call of its own on the main thread after a collective. Until then it recorded a new CUDA event after
+    every synchronous call; in P1b, the first C run with RCCL's default algorithms, that record stayed for minutes in hipEventRecord
+    (rocr InterruptSignal::WaitRelaxed) on 4 of rank 0's node's ranks right after a start-up barrier. Returns (the synchronous
+    call's return value, None), [the Work] or [] (no handle: not a member of the group, or inside a coalescing context, where
+    torch returns no Work to wait for)."""
+    import torch.distributed.distributed_c10d as c10d
+    if len(a) > ai:
+        a = a[:ai] + (True,) + a[ai + 1:]
+    else:
+        k = dict(k, async_op=True)
+    w = f(*a, **k)
+    if w is None or isinstance(w, getattr(c10d, '_IllegalWork', ())):
+        return None, []
+    w.wait()
+    return None, [w]
+
+
+def _asked_async(a, k, ai):
+    return bool(k['async_op'] if 'async_op' in k else (a[ai] if len(a) > ai else False))
+
+
 def _track(name, gi, a, k, r):
     """Milestone 3 C (S['c_track']): keep the last operation on each group with a handle that tells, without waiting, whether it
-    has ended (the Work of an asynchronous call; else an event recorded on the current stream, which a synchronous NCCL call makes
-    wait for the operation). After a C stop, an operation still not ended once every survivor is parked can never end: a member
-    of its group parked before entering it. Its group must be aborted and swapped too (pending_groups, rc_c_flow)."""
-    import torch
+    has ended: the Work of the call (an asynchronous call's own; a synchronous one is made asynchronous and waited for,
+    _sync_as_async). A call with no Work (an object collective, which ends on the host; a coalescing context) counts as ended.
+    send / recv are not tracked themselves: torch makes them with isend / irecv, which are. No CUDA event is made or recorded
+    (P1b 5873196). After a C stop, an operation still not ended once every survivor is parked can never end: a member of its
+    group parked before entering it. Its group must be aborted and swapped too (pending_groups, rc_c_flow)."""
     import torch.distributed as dist
+    if name in ('send', 'recv'):
+        return
     if name == 'batch_isend_irecv':
         groups = {id(op.group): op.group for op in (a[0] if a else k.get('p2p_op_list', []))}
     else:
         grp = k.get('group', a[gi] if gi is not None and len(a) > gi else None)
         groups = {id(grp): grp}
-    works = r if isinstance(r, (list, tuple)) else ([r] if r is not None and hasattr(r, 'is_completed') else [])
+    works = list(r) if isinstance(r, (list, tuple)) else ([r] if r is not None and hasattr(r, 'is_completed') else [])
     ev = None
-    if not works and torch.cuda.is_available():
-        ev = torch.cuda.Event()
-        ev.record()
     for key, grp in groups.items():
         if grp is None:
             grp = dist.distributed_c10d._get_default_group()
@@ -385,22 +409,28 @@ def install_counter():
                 continue
             if id(f) not in made:
                 try:
-                    gi = list(inspect.signature(f).parameters).index('group')
+                    params = list(inspect.signature(f).parameters)
                 except (ValueError, TypeError):
-                    gi = None
+                    params = []
+                gi = params.index('group') if 'group' in params else None
+                ai = params.index('async_op') if 'async_op' in params else None
 
-                def wrapped(*a, _f=f, _gi=gi, **k):
+                def wrapped(*a, _f=f, _gi=gi, _ai=ai, **k):
                     _count()
                     nested = getattr(_TL, 'depth', 0)
                     if S['c_trace'] is not None and not nested:  # the outer call only (torch's recv calls irecv, batch_isend_irecv irecv)
                         _trace(_f.__name__, _gi, a, k)
                     _TL.depth = nested + 1
+                    held = None
                     try:
-                        r = _f(*a, **k)
+                        if S['c_track'] and _ai is not None and not _asked_async(a, k, _ai):
+                            r, held = _sync_as_async(_f, _ai, a, k)
+                        else:
+                            r = _f(*a, **k)
                     finally:
                         _TL.depth = nested
                     if S['c_track']:
-                        _track(_f.__name__, _gi, a, k, r)
+                        _track(_f.__name__, _gi, a, k, r if held is None else held)
                     return r
                 wrapped._ftv2_counted = True
                 wrapped.__name__, wrapped.__doc__, wrapped.__wrapped__ = f.__name__, f.__doc__, f
