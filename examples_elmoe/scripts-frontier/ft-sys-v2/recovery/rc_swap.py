@@ -84,6 +84,12 @@ def swap_groups(store, lost, device, backend='nccl', timeout=None, joiner=False,
             old = c._world.pg_map.get(pg)
             if old is not None:
                 c._world.pg_map[pg] = (backend, old[1])
+            if device is not None and device.type != 'cpu':
+                # a group built with the fake backend also serves the CPU device type, so torch runs its barrier (and object
+                # collectives) on the CPU, that is on the fake backend: a barrier that waits for no one (M3C1g 5871073: the
+                # joiners passed Megatron's timer barriers that the survivors waited in). Bound to this GPU, barrier() runs on
+                # the new backend, as on the survivors (distributed_c10d.barrier: bound_device_id before the object device).
+                pg.bound_device_id = device
         n += 1
         if log:
             log(f'swap: group of {len(ranks)} ranks ({key[:-1]}) has a new {backend} backend (type {t})')

@@ -94,6 +94,28 @@ class MegatronTrainer:
         from megatron.training import build_train_valid_test_data_iterators
         return build_train_valid_test_data_iterators(self.data_provider)
 
+    def skip_train_entry_barriers(self):
+        """Milestone 3 C, the joiner only: megatron's train() starts with two world barriers (timers('interval-time').start(barrier=
+        True) and print_datetime, megatron/training.py:1870-1871) that the survivors, which stay inside the step, never make; the
+        joiner's next world collectives must be the survivors' (the step's end: training_log's two timer barriers). Both run once
+        without their barrier, then are what they were."""
+        import megatron.training as mt
+        from megatron import get_timers
+        orig_pd = mt.print_datetime
+
+        def print_datetime_once(string):
+            mt.print_datetime = orig_pd
+            from megatron import print_rank_0
+            print_rank_0(f'[{string}] (joiner: no barrier)')
+        mt.print_datetime = print_datetime_once
+        t = get_timers()('interval-time', log_level=0)
+        cls_start = type(t).start
+
+        def start_once(barrier=False):
+            del t.start
+            cls_start(t, barrier=False)
+        t.start = start_once
+
     def reset_timers(self):
         """Timers left running by the interrupted step (train() starts 'interval-time' again; start() asserts it is stopped)."""
         from megatron import get_timers

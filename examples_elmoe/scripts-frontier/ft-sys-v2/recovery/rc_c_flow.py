@@ -564,6 +564,7 @@ def c_join(ctl, f):
     ctl.hb.S['on_step'] = ctl._on_step
     ctl.recovered += 1
     ctl.tr.reset_timers()
+    ctl.tr.skip_train_entry_barriers()       # its next world collectives are the survivors' (the step's end), not train()'s start
     ctl.hb.begin_generation(f'{ctl.base_run}.g{g}', rank=ctl.rank, role='train')
     ctl.role = 'train'
     ctl.mark(g, 'ready')
