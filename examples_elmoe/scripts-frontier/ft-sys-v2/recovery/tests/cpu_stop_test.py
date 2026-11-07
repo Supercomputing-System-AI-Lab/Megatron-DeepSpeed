@@ -78,6 +78,7 @@ def main():
     rc_stop._backends = lambda device: bs
     r = rc_stop.abort_all(dev, log, limit_s=0.5)
     checks['3 a revoke still running: stuck'] = r['abort'] == 'stuck' and r['stuck'] == 0 and r['alive'] == 1
+    checks['3 no abort is started while a revoke runs'] = not bs[0].aborted
     hold3.set()
     time.sleep(0.2)
 

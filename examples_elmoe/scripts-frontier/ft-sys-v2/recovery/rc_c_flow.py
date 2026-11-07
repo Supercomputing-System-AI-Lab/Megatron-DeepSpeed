@@ -311,7 +311,12 @@ def c_on_failure(ctl, f):
         ctl.log(f'C cut: {d["cuts"]} (group: index); my actions {mine}')
     ctl.write_times(g, {'level': 'C', 'cuts': d['cuts'], 'actions': mine, 'position': [inst, in_inst], 'target': S['c_target'],
                         'pc': dict(getattr(ctl, 'pc', None) or {})})
-    # 4. abort the cut groups and the lost groups at once (abort_batch); before it, no blocking call on the GPU
+    # 4. abort the cut groups and the lost groups at once (abort_batch); before it, no blocking call on the GPU, and no revoke
+    #    still inside RCCL (an abort would free its communicator under it: M3C12c 5872275)
+    if rc_stop.threads_alive():
+        why = f'{rc_stop.threads_alive()} revoke(s) still inside RCCL: nothing is aborted or freed; this rank leaves (lost)'
+        ctl.write_times(g, {'exit': why})
+        ctl._exit(77, f'recovery: {why}')
     abort_batch(cgs, lgs, ctl.device, ctl.log, float(os.environ.get('FTV2_ABORT_WAIT_S', '30')))
     if rc_stop.threads_alive():                # the same rule as B's stop: nothing goes on while a thread is inside RCCL
         why = f'{rc_stop.threads_alive()} revoke/abort thread(s) still inside RCCL after the limit: this rank leaves (lost)'

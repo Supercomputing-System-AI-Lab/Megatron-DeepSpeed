@@ -180,6 +180,15 @@ def abort_all(device, log, limit_s=30.0, dump_path=None):
     error code', after the recovery went on past aborts that had not returned). Returns 'ok', or 'stuck' with the registry left as
     it is: the caller must not free anything and must leave (the rank is treated as lost)."""
     t0 = time.time()
+    if threads_alive():
+        # a revoke still inside ncclCommRevoke: aborting its communicator now frees it under that thread (M3C12c 5872275: ranks
+        # 8-15 died in glibc, 'The futex facility returned an unexpected error code', right after their one-batch abort while
+        # every one of their revokes had not returned). No abort at all: the rank leaves, nothing is freed.
+        alive = threads_alive()
+        if dump_path:
+            dump_stuck(dump_path, log)
+        log(f'abort: stuck, not started: {alive} revoke(s) still inside RCCL; nothing is aborted or freed; this rank leaves')
+        return {'abort': 'stuck', 'backends': 0, 'stuck': 0, 'alive': alive, 's': 0.0, 'returned_s': []}
     bs = _backends(device)
     ret = [None] * len(bs)                     # seconds until each abort returned (None: still inside RCCL at the limit)
 
