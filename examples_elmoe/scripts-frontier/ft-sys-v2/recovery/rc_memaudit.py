@@ -136,7 +136,7 @@ def _census_into(objs, kinds, limit, found):
                 continue
 
 
-def audit(rank, device, out_dir, gen, log=print, intended=()):
+def audit(rank, device, out_dir, gen, log=print, intended=(), streams=None):
     if os.environ.get('FTV2_MEM_AUDIT') != '1' or not torch.cuda.is_available():
         return
     walk_ranks = {int(x) for x in os.environ.get('FTV2_MEM_AUDIT_RANKS', '0').replace(';', ',').split(',') if x.strip()}
@@ -202,6 +202,27 @@ def audit(rank, device, out_dir, gen, log=print, intended=()):
     try:
         snap = torch.cuda.memory._snapshot()
         sites, n = {}, 0
+        by_state, pending = {}, {}                  # (2026-11-07, the coordinator: A's leftover in blocks freed but waiting on a
+        for seg in snap.get('segments', []):        # stream's events, e.g. record_stream on an aborted NCCL stream?)
+            if seg.get('device') not in (None, device.index):
+                continue
+            for b in seg.get('blocks', []):
+                st = b.get('state')
+                by_state[st] = by_state.get(st, 0) + b.get('size', 0)
+                if st == 'active_pending_free':
+                    k = seg.get('stream')
+                    pending[k] = pending.get(k, 0) + b.get('size', 0)
+        cur = torch.cuda.current_stream(device).cuda_stream
+        names = {cur: 'current'}
+        for nm, stv in (streams or {}).items():
+            try:
+                names[int(stv.cuda_stream)] = nm
+            except Exception:
+                pass
+        lines.append('snapshot by block state: ' + ', '.join(f'{k} {v / 1e9:.3f} GB' for k, v in sorted(by_state.items(), key=str)))
+        lines.append(f'pending-free by allocation stream (the current stream is {cur:#x}): '
+                     + (', '.join((f'{k:#x} ({names.get(k, "not ours: an NCCL or other side stream")}): {v / 1e9:.3f} GB'
+                                   if isinstance(k, int) else f'{k}: {v / 1e9:.3f} GB') for k, v in pending.items()) or 'none'))
         for seg in snap.get('segments', []):
             if seg.get('device') not in (None, device.index):
                 continue

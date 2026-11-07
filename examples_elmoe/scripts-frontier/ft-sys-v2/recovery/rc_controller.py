@@ -663,7 +663,8 @@ class Recovery:
                  f'(kept state {sum(4 * s["fp32"].numel() * 3 for s in kept) / 1e9:.2f} GB, GPU shadow {shadow_b / 1e9:.2f} GB)')
         import rc_memaudit
         rc_memaudit.audit(self.rank, self.device, self.out or '/tmp', g, self.log,
-                          intended=(kept, old_keep.shadow, old_keep.gpu_opt))   # FTV2_MEM_AUDIT=1 only (L2 5874149)
+                          intended=(kept, old_keep.shadow, old_keep.gpu_opt),   # FTV2_MEM_AUDIT=1 only (L2 5874149)
+                          streams={'keep side': getattr(old_keep, 'side', None)})
         self.log(f'release: {n_pg} old process group(s) held for a background release after the rebuild')
         try:
             new = self._join(g, f, 'survivor', kept=kept, old_keep=old_keep)
