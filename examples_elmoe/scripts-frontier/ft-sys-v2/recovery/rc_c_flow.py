@@ -100,6 +100,20 @@ def abort_these(gs, device, log, limit_s, why):
     return gs
 
 
+def abort_batch(cgs, lgs, device, log, limit_s):
+    """The cut groups and the lost groups aborted all at the same moment, one thread each (each abort's time logged). An abort
+    frees device memory (hipFree, which waits for an idle GPU), so it waits behind any kernel still running on that GPU; in one
+    batch the abort that ends that kernel runs too. One after the other, a rank whose GPU a lost group's kernel keeps busy (a
+    revoke does not end it) waits in the cut groups' abort until its limit (M3C0c 5870764: ranks 6, 7, 30 s)."""
+    gs = list(cgs) + [pg for pg in lgs if pg not in cgs]
+    bs = _backends(gs, device)
+    rc_stop._LEFT_BEHIND.append(bs)
+    secs = _threads([b.abort for b in bs], limit_s)
+    log(f'C: {len(cgs)} cut and {len(gs) - len(cgs)} lost groups aborted at once; seconds per abort {secs} (None = did not '
+        f'return)')
+    return secs
+
+
 def abort_groups(lost, device, log, limit_s):
     """Revoke and abort the backend of every registered group that holds a lost rank, except the world group. Returns the groups."""
     gs = lost_groups(lost)
@@ -116,9 +130,9 @@ def cut_entry(ctl, settle_s):
     first operation on that group); None = it cannot."""
     S = ctl.hb.S
     keys = rc_swap.group_keys()
-    pend = {id(gr) for gr, _, _ in ctl.hb.pending_groups(settle_s)}
-    mark, imark, where = dict(S.get('c_mark') or {}), dict(S.get('c_inst_mark') or {}), S.get('c_where')
     lostg = set((getattr(ctl, 'c', None) or {}).get('aborted', ()))   # groups with a lost rank: the commit positions decide
+    pend = {id(gr) for gr, _, _ in ctl.hb.pending_groups(settle_s, skip=lostg)}
+    mark, imark, where = dict(S.get('c_mark') or {}), dict(S.get('c_inst_mark') or {}), S.get('c_where')
     out = {}
     for i, (gr, name, n, ended) in ctl.hb.last_ops().items():
         k = keys.get(i)
@@ -254,18 +268,20 @@ def c_on_failure(ctl, f):
     world = ctl.world
     survivors = [r for r in range(world) if r not in lost]
     lgs = lost_groups(lost)
+    # the cut time first: an operation on these groups that began before it is cut (a kernel ended by the revoke below must
+    # never be taken for a finished one)
+    ctl.c['aborted'] = {id(pg) for pg in lgs}
+    ctl.c['abort_t'] = time.time()
     # 1. the groups with a lost rank: revoked only (their kernels end; their resources are freed after the cut groups' aborts,
     #    because an abort frees device memory and so waits for a GPU that a cut healthy operation keeps busy: M3C1e 5869712)
     if not revoke_these(lgs, ctl.device, ctl.log, float(os.environ.get('FTV2_REVOKE_WAIT_S', '10')), 'hold a lost rank'):
         abort_these(lgs, ctl.device, ctl.log, float(os.environ.get('FTV2_ABORT_WAIT_S', '30')), 'hold a lost rank')
-    ctl.c['aborted'] = {id(pg) for pg in lgs}
-    ctl.c['abort_t'] = time.time()
     ctl.mark(g, 'abort_done')
     # 2. the agreed instruction of my stage-replica, then wait for the main thread to park at it
     S['c_target'], sr = _positions(ctl, e, g, survivors, inst, in_inst)
     ctl.log(f'C stop: my position {inst}{" (inside)" if in_inst else ""}; my stage-replica parks after instruction '
             f'{S["c_target"]} ({sr})')
-    if not ctl.c['parked'].wait(timeout=float(os.environ.get('FTV2_C_PARK_WAIT_S', '120'))):
+    if not ctl.c['parked'].wait(timeout=float(os.environ.get('FTV2_C_PARK_WAIT_S', '60'))):
         ctl.log('C stop: the main thread did not park in time')
     ctl.mark(g, 'main_caught')
     rep = dict(ctl.commit.report() if ctl.commit is not None else {}, c=ctl.pipec.report() if ctl.pipec else None,
@@ -288,10 +304,8 @@ def c_on_failure(ctl, f):
     ctl.c['redo'] = {id(pg) for pg in cgs if mine.get(keys[id(pg)]) == 'redo'}
     if d['cuts']:
         ctl.log(f'C cut: {d["cuts"]} (group: index); my actions {mine}')
-    # 4. abort the cut groups first, all at once; then free the lost groups' resources
-    if cgs:
-        abort_these(cgs, ctl.device, ctl.log, float(os.environ.get('FTV2_ABORT_WAIT_S', '30')), 'hold a cut operation')
-    abort_these(lgs, ctl.device, ctl.log, float(os.environ.get('FTV2_ABORT_WAIT_S', '30')), 'hold a lost rank')
+    # 4. abort the cut groups and the lost groups at once (abort_batch); before it, no blocking call on the GPU
+    abort_batch(cgs, lgs, ctl.device, ctl.log, float(os.environ.get('FTV2_ABORT_WAIT_S', '30')))
     ctl.mark(g, 'cut_done')
     store = _world_store(ctl, g, min(survivors), world)
     _log_groups(ctl, 'survivor')

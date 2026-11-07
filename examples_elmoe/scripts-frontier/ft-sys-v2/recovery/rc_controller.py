@@ -344,12 +344,16 @@ class Recovery:
         import rc_c_flow
         ev = torch.cuda.Event()
         ev.record()
+        seen = None
+        grace = float(os.environ.get('FTV2_C_SETTLE_S', '3'))
         while not ev.query():
             if self.hb.S.get('stop') and self.c is not None and not self.c['done'] and not self.hb.S.get('c_repairing'):
-                rc_c_flow.c_hold(self)
+                # park only for an operation that does not end after the stop began (cut, or waiting on a parked peer); one
+                # that ends lets the instruction finish, and the rank parks at the stage-replica's agreed boundary
+                seen = seen or time.time()
+                if time.time() - seen > grace:
+                    rc_c_flow.c_hold(self)
             time.sleep(0.0005)
-        if self.hb.S.get('stop') and self.c is not None and not self.c['done'] and not self.hb.S.get('c_repairing'):
-            rc_c_flow.c_hold(self)
 
     def cut(self, group, t0):
         """Was an operation on `group` that began at t0 cut by the latest C stop (its backend aborted after it began)?"""

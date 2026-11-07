@@ -226,11 +226,14 @@ def last_ops():
     return {i: (grp, name, n, _ended(works, ev)) for i, (grp, works, ev, name, n) in list(S['c_last'].items())}
 
 
-def pending_groups(settle_s=3.0):
+def pending_groups(settle_s=3.0, skip=()):
     """[(group, name, index)] whose last tracked operation has not ended, after waiting up to settle_s for the set to stop
-    shrinking. Only non-blocking queries."""
+    shrinking. Only non-blocking queries; groups whose id is in skip are not asked."""
+    skip = set(skip)
+
     def busy():
-        return [(grp, name, n) for grp, works, ev, name, n in list(S['c_last'].values()) if not _ended(works, ev)]
+        return [(grp, name, n) for i, (grp, works, ev, name, n) in list(S['c_last'].items())
+                if i not in skip and not _ended(works, ev)]
     t0 = time.time()
     cur = busy()
     while cur and time.time() - t0 < settle_s:

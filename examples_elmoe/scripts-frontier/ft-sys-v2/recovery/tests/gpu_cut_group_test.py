@@ -248,9 +248,9 @@ def worker(rank, host, port, role, out):
         check('my actions', all(a == want for a in acts.values()) if want else not acts)
         cgs = [groups[n] for n in cuts if rank in dict(ORDER)[n]]
         ctl.c['redo'] = {id(groups[n]) for n, a in acts.items() if a == 'redo'}
-        if cgs:
-            step('abort cut groups', lambda: cf.abort_these(cgs, dev, ctl.log, 30, 'hold a cut operation'), 60)
-        step('abort lost groups', lambda: cf.abort_these(lgs, dev, ctl.log, 30, 'hold a lost rank'), 60)
+        secs = step('abort cut and lost groups at once', lambda: cf.abort_batch(cgs, lgs, dev, ctl.log, 30), 60)
+        res['abort_secs'] = secs
+        check(f'every abort returned in under 5 s {secs}', all(x is not None and x < 5 for x in secs))
         if rank in (4, 5):
             dth.join(timeout=30)
             diag['ended_after_abort'] = not dth.is_alive()
@@ -337,7 +337,8 @@ def launch():
         bad = [k for k, ok in r['checks'].items() if not ok]
         fails += len(bad)
         print(f'rank {r["rank"]} ({r["role"]}): {len(r["checks"]) - len(bad)}/{len(r["checks"])} checks pass {bad if bad else ""}')
-        print(f'    times {r.get("t")}; list {r.get("list")}; diag {r.get("diag")}; swapped {r.get("swapped")}')
+        print(f'    times {r.get("t")}; list {r.get("list")}; diag {r.get("diag")}; swapped {r.get("swapped")}; '
+              f'aborts {r.get("abort_secs")}')
     for f in sorted(x for x in os.listdir(d) if x.startswith(os.path.basename(out)) and '.stacks.' in x):
         print(f'stacks: {os.path.join(d, f)}')
     print(f'srun exit codes {codes}; {"all passed" if not fails and not any(codes) else f"{fails} failed"}')
