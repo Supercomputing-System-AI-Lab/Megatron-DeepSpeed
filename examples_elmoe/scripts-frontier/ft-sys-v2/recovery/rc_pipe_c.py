@@ -144,6 +144,14 @@ class PipeC:
         me = self
 
         def run(eng_, *a, **kw):
+            hb = me.ctl.hb
+            hb.inst_begin()                          # after a stop: run on to the stage-replica's agreed instruction, then park
+            try:
+                return body(eng_, *a, **kw)
+            finally:
+                hb.inst_end()
+
+        def body(eng_, *a, **kw):
             mb = me.cnt.get(kind)
             if mb is not None and me._skip(kind, mb):
                 me.cnt[kind] += 1
@@ -176,6 +184,7 @@ class PipeC:
                 out = fn(eng_, *a, **kw)
                 if pair is None:
                     break
+                me.ctl.hb.S['c_where'] = 'p2p'
                 me._sync()
                 g = me._pair(*pair)
                 if not me.ctl.cut(g, t0):
@@ -225,6 +234,7 @@ class PipeC:
             t0 = time.time()
             try:
                 fn(eng_, *a, **kw)
+                self.ctl.hb.S['c_where'] = 'red'
                 self._sync()
                 if not any(self.ctl.cut(g, t0) for g in self._dp_groups()):
                     break

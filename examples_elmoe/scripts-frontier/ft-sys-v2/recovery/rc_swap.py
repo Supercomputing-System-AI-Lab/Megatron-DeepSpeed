@@ -51,18 +51,30 @@ def groups_in_order():
     return [(pg, list(c.get_process_group_ranks(pg))) for pg in list(c._world.pg_map.keys())]
 
 
-def swap_groups(store, lost, device, backend='nccl', timeout=None, joiner=False, log=None):
-    me = dist.get_rank()
-    lost = set(int(r) for r in lost)
-    seen = {}
-    n = 0
+def group_keys():
+    """{id(group): '<hash of its global ranks>/<its creation order among the groups with the same ranks>'}: the same on every
+    member (both sides create their groups in the same order)."""
+    seen, out = {}, {}
     for pg, ranks in groups_in_order():
         h = hashlib.md5(','.join(map(str, sorted(ranks))).encode()).hexdigest()[:12]
         occ = seen.get(h, 0)
         seen[h] = occ + 1
-        if not joiner and not (lost & set(ranks)):
-            continue                                   # no lost member: its communicators are intact, keep them
-        key = f'{h}/{occ}/'
+        out[id(pg)] = f'{h}/{occ}'
+    return out
+
+
+def swap_groups(store, lost, device, backend='nccl', timeout=None, joiner=False, log=None, extra=()):
+    """extra: keys (group_keys) of groups without a lost rank that get a new backend as well (survivors: a group whose last
+    operation was cut because one of its members parked before entering it, rc_c_flow.cut_healthy_groups)."""
+    me = dist.get_rank()
+    lost = set(int(r) for r in lost)
+    extra = set(extra)
+    keys = group_keys()
+    n = 0
+    for pg, ranks in groups_in_order():
+        if not joiner and not (lost & set(ranks)) and keys[id(pg)] not in extra:
+            continue                                   # no lost member and nothing cut: its communicators are intact, keep them
+        key = keys[id(pg)] + '/'
         b = _new_backend(backend, dist.PrefixStore(key, store), ranks.index(me), len(ranks), timeout)
         t = _free_type(pg)
         pg._register_backend(device, t, b)
@@ -74,5 +86,5 @@ def swap_groups(store, lost, device, backend='nccl', timeout=None, joiner=False,
                 c._world.pg_map[pg] = (backend, old[1])
         n += 1
         if log:
-            log(f'swap: group of {len(ranks)} ranks ({h}/{occ}) has a new {backend} backend (type {t})')
+            log(f'swap: group of {len(ranks)} ranks ({key[:-1]}) has a new {backend} backend (type {t})')
     return n

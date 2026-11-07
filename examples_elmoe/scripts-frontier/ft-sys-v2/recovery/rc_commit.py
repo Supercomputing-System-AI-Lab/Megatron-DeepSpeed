@@ -61,6 +61,7 @@ class Commit:
         # copy_of() read them without a device wait: under the pipeline a healthy reduction can keep the GPU busy while the
         # monitor thread reports (M3C1b 5868846: rank 16's report hung in tok_cur.tolist())
         self.tok_cur_h, self.tok_prev_h = [-1, -1], [-1, -1]
+        self.tok_pin = [torch.empty(2, dtype=torch.float64, pin_memory=True) for _ in range(2)] if self.cuda else None
         self.done_ev, self.inflight = None, None
         self.ms = []                                         # host time of each commit's launch
         # the transport (FTV2_COMMIT_MODE): under the pipeline (spaced reductions) the default is "keep" (all-reduce + keep; the
@@ -150,8 +151,34 @@ class Commit:
         else:
             for w in works:
                 w.wait()
+            if self.cuda:                                    # the round's end on the current stream, for _tok_host's query
+                ev = torch.cuda.Event()
+                ev.record()
+                self.done_ev = ev
         self.snap_prev, self.snap_cur, self.c = self.snap_cur, flats, self.added
         self.ms.append(round(1000 * (time.time() - t0), 2))
+
+    def _tok_host(self, i, t, mirror, limit_s=2.0):
+        """A token's value without waiting on the GPU (the monitor thread may ask while a cut healthy reduction keeps it busy:
+        M3C1b, M3C1e): the host copy; else (p2p mode) once the round has ended (done_ev, an event query), a copy on the side
+        stream into a pinned buffer made at the start, polled by an event; [-1, -1] while unknown."""
+        if mirror is not None:
+            return list(mirror)
+        if not self.cuda:
+            return [int(x) for x in t.tolist()]
+        if self.done_ev is not None and not self.done_ev.query():
+            return [-1, -1]
+        h = self.tok_pin[i]
+        with torch.cuda.stream(self.side):
+            h.copy_(t, non_blocking=True)
+            ev = torch.cuda.Event()
+            ev.record(self.side)
+        t0 = time.time()
+        while not ev.query():
+            if time.time() - t0 > limit_s:
+                return [-1, -1]
+            time.sleep(0.001)
+        return [int(x) for x in h.tolist()]
 
     def _keep_commit(self):
         """keep mode, after micro-batch `added`: my own snapshot (as in p2p mode), and my owner's sums folded in from the piece
@@ -209,15 +236,13 @@ class Commit:
     # ------------------------------------------------------------------ recovery
     def report(self):
         """After a stop (GPU idle): my last commit, and my owner's last two commits as their tokens say."""
-        cur = self.tok_cur_h if self.tok_cur_h is not None else self.tok_cur.tolist()
-        prv = self.tok_prev_h if self.tok_prev_h is not None else self.tok_prev.tolist()
+        cur, prv = self._tok_host(0, self.tok_cur, self.tok_cur_h), self._tok_host(1, self.tok_prev, self.tok_prev_h)
         return {'commit_step': self.step, 'commit_c': self.c, 'commit_k': self.k,
                 'copy_cur': [int(cur[0]), int(cur[1])], 'copy_prev': [int(prv[0]), int(prv[1])]}
 
     def copy_of(self, step, J):
         """The owner's sums at (step, J) from my copies, or None."""
-        cur = self.tok_cur_h if self.tok_cur_h is not None else self.tok_cur.tolist()
-        prv = self.tok_prev_h if self.tok_prev_h is not None else self.tok_prev.tolist()
+        cur, prv = self._tok_host(0, self.tok_cur, self.tok_cur_h), self._tok_host(1, self.tok_prev, self.tok_prev_h)
         if (int(cur[0]), int(cur[1])) == (step, J):
             return self.copy_cur
         if (int(prv[0]), int(prv[1])) == (step, J):

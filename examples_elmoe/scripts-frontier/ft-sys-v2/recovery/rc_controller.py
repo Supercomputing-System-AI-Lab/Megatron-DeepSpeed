@@ -114,6 +114,7 @@ class Recovery:
             use_pair_groups()                 # before the engine is built: the pipeline's sends on DeepSpeed's per-pair groups
             import rc_c_flow
             self.hb.S['c_hold'] = lambda: rc_c_flow.c_hold(self)
+            self.hb.S['c_track'] = True       # the last operation per group, to find the ones a stop cuts (rc_c_flow.cut_healthy_groups)
 
     @staticmethod
     def pg_timeouts():
@@ -306,6 +307,7 @@ class Recovery:
     def _commit_after(self, last):
         st = getattr(self, 'pipe_st', None)
         if self.c_mode and st is not None and not last:
+            self.hb.S['c_where'] = 'red'
             self.c_sync()
             if any(self.cut(g, st.get('red_t0', 0)) for g in (getattr(self.adapter.zero, 'real_dp_process_group', None) or [])):
                 from rc_pipe_c import CutReduction
@@ -313,6 +315,7 @@ class Recovery:
                 raise CutReduction('the reduction was cut by the loss')
             self.commit.after_epilogue(False, last, pos=st['pos'])
             self.hb.S['micro_batch'] = self.commit.added
+            self.hb.S['c_mark'] = dict(self.hb.S['c_n'])      # each group's operation index at this commit (rc_c_flow.cut_entry)
             return
         if not last and os.environ.get('FTV2_COMMIT_VERIFY', '1') == '1' and self.device.type == 'cuda':
             # A commit is valid only if its reduction really ended on the GPU with every peer (M3P4 5867778): the host enqueues
@@ -351,8 +354,8 @@ class Recovery:
     def cut(self, group, t0):
         """Was an operation on `group` that began at t0 cut by the latest C stop (its backend aborted after it began)?"""
         c = self.c
-        return bool(c is not None and group is not None and id(group) in c['aborted'] and c['abort_t'] is not None
-                    and t0 < c['abort_t'])
+        return bool(c is not None and group is not None and (id(group) in c['aborted'] or id(group) in c.get('redo', ()))
+                    and c['abort_t'] is not None and t0 < c['abort_t'])
 
     def wait_resumed(self):
         import rc_c_flow
@@ -394,6 +397,7 @@ class Recovery:
         if self.commit is not None and self.commit.step != iteration:
             self.commit.begin_step(iteration)
             self.hb.S['micro_batch'] = 0
+            self.hb.S['c_mark'] = dict(self.hb.S['c_n'])      # commit 0 of the step (milestone 3 C)
         try:
             self.step_snap = {'iteration': iteration, 'counters': self.tr.counters(), 'inc': self.tr.increments(),
                               'rng': self.tr.rng_snapshot()}
@@ -444,8 +448,9 @@ class Recovery:
             self.mark(g, 'list_written')
             self.T[g]['list_written'] = f.get('t')
             import rc_c_flow
-            rc_c_flow.c_on_failure(self, f)
-            return
+            if rc_c_flow.c_on_failure(self, f) != 'B':
+                return
+            self.log(f'list {g}: level B for this failure (C fell back)')
         self.freed.clear()
         self.failure = f
         self.mark(g, 'list_written')
@@ -672,7 +677,10 @@ class Recovery:
         self.hb.S['rank'] = self.rank
         if self.c_mode:
             import rc_c_flow
-            return rc_c_flow.c_join(self, f)
+            d = rc_c_flow.wait_list(self.etcd(), g)          # the survivors' single list says C, or B (a fall-back)
+            if d['mode'] == 'C':
+                return rc_c_flow.c_join(self, f)
+            self.log(f'C join {g}: the survivors fell back to level B: {"; ".join(d["why"])[:300]}')
         return self._join(g, f, 'joiner', kept=None, old_keep=None)
 
     # ------------------------------------------------------------------ DECIDE + REBUILD + RE-SEED (every rank, same calls)

@@ -29,6 +29,7 @@ Each fires before a communication call of that step; an injection fires once per
 again)."""
 import atexit
 import json
+import inspect
 import os
 import signal
 import sys
@@ -45,7 +46,9 @@ COLLECTIVES = ['all_reduce', 'all_gather', 'all_gather_into_tensor', '_all_gathe
 
 S = {'calls': 0, 'step': -1, 'micro_batch': -1, 'phase': 'start', 'loss': None, 'step_s': None, 'rank': -1, 'local_rank': -1,
      'role': 'train', 'started': False, 'installed': False, 'failure': None, 'card': None, 'tid': None, 'dir': None,
-     'on_failure': None, 'inject': [], 'exit_written': False, 'stop': False, 'on_step': None}
+     'on_failure': None, 'inject': [], 'exit_written': False, 'stop': False, 'on_step': None,
+     'c_track': False, 'c_last': {}, 'c_n': {}, 'c_lock': threading.Lock(), 'c_inst': 0, 'c_in_inst': False, 'c_target': None,
+     'c_where': None}
 
 
 class StopForRecovery(Exception):
@@ -133,11 +136,111 @@ def _count():
         h = S.get('c_hold')
         if h is None:
             raise StopForRecovery('a failure list arrived: stopping for the recovery')
-        if not S.get('c_repairing'):
-            h()                                        # milestone 3 C: park here until this rank's part of the repair is done
+        if not S.get('c_repairing') and not S['c_in_inst']:
+            # milestone 3 C: park here (a call outside the pipeline's instructions) until this rank's part of the repair is done.
+            # Inside an instruction the rank runs on to the instruction's end (inst_begin parks at the boundary), so that the
+            # ranks of one stage-replica never stop inside a forward or backward with a peer waiting in an all-to-all.
+            S['c_where'] = 'call'
+            h()
     if S['inject']:
         _inject()
     S['calls'] += 1
+
+
+def inst_begin():
+    """Milestone 3 C, at the start of every pipeline instruction (rc_pipe_c). Without a stop: count it. After a stop (the flag
+    and this rank's position are read together under c_lock by the monitor thread, rc_c_flow): run on until this rank has
+    started the agreed instruction of its stage-replica (c_target = the largest position any of its ranks had reached; they run
+    the same schedule), then park at the next boundary until the repair is done."""
+    lock = S['c_lock']
+    S['c_inst_mark'] = dict(S['c_n'])                  # each group's operation index at this instruction's start
+    with lock:
+        if not S['stop'] or S.get('c_repairing') or S.get('c_hold') is None:
+            S['c_inst'] += 1
+            S['c_in_inst'] = True
+            return
+    t0 = time.time()
+    while S['stop'] and S['c_target'] is None and time.time() - t0 < 600:
+        time.sleep(0.002)
+    with lock:
+        if S['stop'] and S['c_target'] is not None and S['c_inst'] < S['c_target']:
+            S['c_inst'] += 1
+            S['c_in_inst'] = True
+            return
+    if S['stop'] and not S.get('c_repairing'):
+        S['c_where'] = 'boundary'
+        S['c_hold']()
+    with lock:
+        S['c_inst'] += 1
+        S['c_in_inst'] = True
+
+
+def inst_end():
+    S['c_in_inst'] = False
+
+
+def stop_and_position():
+    """The monitor thread, milestone 3 C: set the stop flag and read the main thread's position in one step (c_lock): the number
+    of instructions it has started, and whether it is inside one. After this the main thread starts no instruction of its own."""
+    with S['c_lock']:
+        S['c_target'] = None
+        S['stop'] = True
+        return S['c_inst'], bool(S['c_in_inst'])
+
+
+def _track(name, gi, a, k, r):
+    """Milestone 3 C (S['c_track']): keep the last operation on each group with a handle that tells, without waiting, whether it
+    has ended (the Work of an asynchronous call; else an event recorded on the current stream, which a synchronous NCCL call makes
+    wait for the operation). After a C stop, an operation still not ended once every survivor is parked can never end: a member
+    of its group parked before entering it. Its group must be aborted and swapped too (pending_groups, rc_c_flow)."""
+    import torch
+    import torch.distributed as dist
+    if name == 'batch_isend_irecv':
+        groups = {id(op.group): op.group for op in (a[0] if a else k.get('p2p_op_list', []))}
+    else:
+        grp = k.get('group', a[gi] if gi is not None and len(a) > gi else None)
+        groups = {id(grp): grp}
+    works = r if isinstance(r, (list, tuple)) else ([r] if r is not None and hasattr(r, 'is_completed') else [])
+    ev = None
+    if not works and torch.cuda.is_available():
+        ev = torch.cuda.Event()
+        ev.record()
+    for key, grp in groups.items():
+        if grp is None:
+            grp = dist.distributed_c10d._get_default_group()
+        n = S['c_n'].get(id(grp), 0) + 1               # the operation's index on this group (the same on every member)
+        S['c_n'][id(grp)] = n
+        S['c_last'][id(grp)] = (grp, works, ev, name, n)
+
+
+def _ended(works, ev):
+    """Non-blocking: Work.is_completed() / an event query. Never a synchronize (the monitor thread must not wait on a busy GPU)."""
+    try:
+        return all(w.is_completed() for w in works) if works else (ev is None or ev.query())
+    except Exception:
+        return False
+
+
+def last_ops():
+    """{id(group): (group, name, index, ended)} of every tracked group (non-blocking)."""
+    return {i: (grp, name, n, _ended(works, ev)) for i, (grp, works, ev, name, n) in list(S['c_last'].items())}
+
+
+def pending_groups(settle_s=3.0):
+    """[(group, name, index)] whose last tracked operation has not ended, after waiting up to settle_s for the set to stop
+    shrinking. Only non-blocking queries."""
+    def busy():
+        return [(grp, name, n) for grp, works, ev, name, n in list(S['c_last'].values()) if not _ended(works, ev)]
+    t0 = time.time()
+    cur = busy()
+    while cur and time.time() - t0 < settle_s:
+        time.sleep(0.2)
+        nxt = busy()
+        if len(nxt) == len(cur) and time.time() - t0 > 1.0:
+            cur = nxt
+            break
+        cur = nxt
+    return cur
 
 
 def install_counter():
@@ -160,9 +263,17 @@ def install_counter():
             if f is None or getattr(f, '_ftv2_counted', False):
                 continue
             if id(f) not in made:
-                def wrapped(*a, _f=f, **k):
+                try:
+                    gi = list(inspect.signature(f).parameters).index('group')
+                except (ValueError, TypeError):
+                    gi = None
+
+                def wrapped(*a, _f=f, _gi=gi, **k):
                     _count()
-                    return _f(*a, **k)
+                    r = _f(*a, **k)
+                    if S['c_track']:
+                        _track(_f.__name__, _gi, a, k, r)
+                    return r
                 wrapped._ftv2_counted = True
                 wrapped.__name__, wrapped.__doc__, wrapped.__wrapped__ = f.__name__, f.__doc__, f
                 made[id(f)] = wrapped
