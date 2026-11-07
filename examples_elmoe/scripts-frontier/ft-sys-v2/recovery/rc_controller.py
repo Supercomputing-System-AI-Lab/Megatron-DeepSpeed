@@ -583,6 +583,10 @@ class Recovery:
     def train(self, train_fn, box, forward_step_func, process_non_loss_data_func):
         if self.c_mode:
             self.hb.S['c_track'] = self.c_track_on
+        if not getattr(self, '_memaudit_on', False):          # FTV2_MEM_AUDIT=1 (a test setting): allocation history from here
+            import rc_memaudit
+            rc_memaudit.start()
+            self._memaudit_on = True
         while True:
             try:
                 return train_fn(forward_step_func, box[0], box[1], box[2], box[3], box[4], process_non_loss_data_func)
@@ -647,6 +651,8 @@ class Recovery:
         self.mark(g, 'released')
         self.log(f'released the old engine: {torch.cuda.memory_allocated(self.device) / 1e9:.2f} GB still allocated '
                  f'(kept state {sum(4 * s["fp32"].numel() * 3 for s in kept) / 1e9:.2f} GB)')
+        import rc_memaudit
+        rc_memaudit.audit(self.rank, self.device, self.out or '/tmp', g, self.log)   # FTV2_MEM_AUDIT=1 only (L2 5874149)
         new = self._join(g, f, 'survivor', kept=kept, old_keep=old_keep)
         box[:] = new
 
