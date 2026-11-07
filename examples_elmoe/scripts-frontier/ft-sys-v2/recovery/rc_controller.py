@@ -749,7 +749,20 @@ class Recovery:
             import rc_c_flow
             d = rc_c_flow.wait_list(self.etcd(), g)          # the survivors' single list says C, or B (a fall-back)
             if d['mode'] == 'C':
-                return rc_c_flow.c_join(self, f)
+                try:
+                    return rc_c_flow.c_join(self, f)
+                except SystemExit:
+                    raise
+                except BaseException as ex:            # the survivors' watch ends them (rc_c_flow.c_on_failure, P1 5872744)
+                    self.log(f'C join {g} failed: {ex!r}'[:400])
+                    try:
+                        self.etcd().put(f'rc/{g}/failed/{self.rank}', json.dumps({'t': round(time.time(), 3), 'err': repr(ex)[:300]}))
+                    except Exception:
+                        pass
+                    import traceback
+                    traceback.print_exc()
+                    self.write_times(g, {'exit': repr(ex)[:300], 'code': EXIT_FAILED})
+                    self._exit(EXIT_FAILED, f'exception: C join failed: {ex!r}'[:200])
             self.log(f'C join {g}: the survivors fell back to level B: {"; ".join(d["why"])[:300]}')
         return self._join(g, f, 'joiner', kept=None, old_keep=None)
 

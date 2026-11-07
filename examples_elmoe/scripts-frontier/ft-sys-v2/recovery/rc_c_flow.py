@@ -210,9 +210,20 @@ def decide_cut(entries, can_redo_last=False):
     return {'mode': 'B' if why else 'C', 'cuts': cuts, 'actions': actions, 'why': why}
 
 
-def single_list(ctl, e, g, survivors, limit=300):
+def decide_list(entries, feasible=None):
+    """Pure: decide_cut on the survivors' entries; a C decision falls back to B when feasible() names why C cannot resume."""
+    d = decide_cut(entries)
+    why = feasible() if (feasible is not None and d['mode'] == 'C') else None
+    if why:
+        d['mode'], d['why'] = 'B', list(d['why']) + [why]
+    return d
+
+
+def single_list(ctl, e, g, survivors, limit=300, feasible=None):
     """Each survivor writes its entry; the lowest survivor decides (decide_cut) and writes the one list rc/<g>/cutlist; every
-    survivor and the joiner read that list."""
+    survivor and the joiner read that list. feasible() (2026-11-07, P1 5872744) returns why C cannot resume, or None: it runs
+    here, before any rank swaps, so that every rank falls back to B together (the joiners used to find it only in make_plan,
+    after the survivors had entered the swap, and the survivors waited in the world store until the job ended)."""
     e.put(f'rc/{g}/cut/{ctl.rank}', json.dumps(cut_entry(ctl, float(os.environ.get('FTV2_C_SETTLE_S', '3')))))
     t0 = time.time()
     if ctl.rank == min(survivors):
@@ -224,7 +235,7 @@ def single_list(ctl, e, g, survivors, limit=300):
             if time.time() - t0 > limit:
                 raise RuntimeError(f'C: list entries from {sorted(reps)} only')
             time.sleep(0.05)
-        d = decide_cut({r: reps[r] for r in survivors})
+        d = decide_list({r: reps[r] for r in survivors}, feasible)
         e.put(f'rc/{g}/cutlist', json.dumps(d))
         return d
     return wait_list(e, g, limit)
@@ -298,7 +309,8 @@ def c_on_failure(ctl, f):
     ctl.mark(g, 'reported')
     reports = _reports(e, g, survivors)                        # every survivor is parked from here on
     # 3. the single list of operations the stop cut on groups without a lost rank (M3C1e: ranks 16-23's stage-1 reduction)
-    d = single_list(ctl, e, g, survivors)
+    step0 = ctl.commit.step if ctl.commit else None
+    d = single_list(ctl, e, g, survivors, feasible=lambda: plan_why(reports, lost, world, step0))
     if d['mode'] == 'B':
         ctl.c_fallbacks = getattr(ctl, 'c_fallbacks', 0) + 1
         ctl.log(f'C falls back to level B ({ctl.c_fallbacks} so far in this run): {"; ".join(d["why"])[:600]}')
@@ -326,6 +338,10 @@ def c_on_failure(ctl, f):
         ctl.write_times(g, {'exit': why})
         ctl._exit(77, f'recovery: {why}')
     ctl.mark(g, 'cut_done')
+    # a joiner that fails ends every survivor at once (P1 5872744: the survivors waited in the swap's world store for joiners
+    # that had raised; the B path has the same watch, rc_controller._join_watch)
+    joined = threading.Event()
+    threading.Thread(target=ctl._join_watch, args=(g, joined), daemon=True).start()
     store = _world_store(ctl, g, min(survivors), world)
     _log_groups(ctl, 'survivor')
     n = rc_swap.swap_groups(dist.PrefixStore(f'ftv2/c{g}/', store), lost, ctl.device, 'nccl',
@@ -337,6 +353,7 @@ def c_on_failure(ctl, f):
     ctl.c.update(plan=make_plan(reports, lost, world, ctl.commit.step if ctl.commit else None), store=store, swapped=n)
     ctl.log(f'C plan {g}: {json.dumps(ctl.c["plan"])[:400]}')
     ctl.mark(g, 'plan_done')
+    joined.set()
     ctl.c['ready'].set()
     return None
 
@@ -411,6 +428,16 @@ def _reports(e, g, survivors, limit=300):
             return reps
         time.sleep(0.1)
     raise RuntimeError(f'C: reports from {sorted(reps)} only')
+
+
+def plan_why(reports, lost, world, step):
+    """Pure: None if make_plan can plan this failure, else why not (a lost stage without a surviving replica has no commit to
+    resume from, P1 5872744)."""
+    try:
+        make_plan(reports, lost, world, step)
+        return None
+    except Exception as ex:
+        return f'C cannot plan: {ex}'
 
 
 def make_plan(reports, lost, world, step):

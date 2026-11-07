@@ -53,6 +53,27 @@ def part1():
     d = cf.decide_cut(e, can_redo_last=True)
     checks['b: with taking a commit back: C, G1 and G2 cut at 2'] = d['mode'] == 'C' and d['cuts'] == {'G1': 2, 'G2': 2}
     checks['b: actions'] = d['actions'] == {'2': {'G1': 'redo', 'G2': 'redo'}, '3': {'G1': 'redo_last'}, '0': {'G2': 'none'}}
+    # a2 (2026-11-07, P1 5872744): the deciding survivor checks that C can plan before anyone swaps
+    ea = {16: {'where': 'red', 'groups': {'G': g(5, 4, True, 'all_reduce', 5)}},          # case a's entries (a C list)
+          17: {'where': 'red', 'groups': {'G': g(5, 4, True, 'all_reduce', 5)}},
+          24: {'where': 'p2p', 'groups': {'G': g(4, 4, False, 'all_reduce', None)}},
+          25: {'where': 'boundary', 'groups': {'G': g(4, 4, False, 'all_reduce', None)}}}
+    d = cf.decide_list(ea, lambda: 'C cannot plan: no commit to resume from')
+    checks['a2: a C list falls back to B when C cannot plan'] = d['mode'] == 'B' and d['why'][-1].startswith('C cannot plan')
+    d = cf.decide_list(ea, lambda: None)
+    checks['a2: a plannable C list stays C'] = d['mode'] == 'C' and d['cuts'] == {'G': 5}
+    asked = []
+    cf.decide_list(e, lambda: asked.append(1))                       # case b's entries: already B, the plan is not asked
+    checks['a2: a B list does not ask for the plan'] = asked == []
+    old_pp = os.environ.get('FTV2_PP')
+    os.environ['FTV2_PP'] = '2'
+    rep = {'commit_step': 7, 'commit_c': 3, 'commit_k': 1, 'copy_cur': [7, 3], 'copy_prev': [7, 2]}
+    why = cf.plan_why({0: dict(rep), 1: dict(rep)}, [2, 3], 4, 7)   # one replica: stage 1 = ranks 2, 3, all lost
+    checks['a2: plan_why names a lost stage without a surviving replica'] = bool(why) and 'no survivor report from stage(s) [1]' in why
+    if old_pp is None:
+        os.environ.pop('FTV2_PP', None)
+    else:
+        os.environ['FTV2_PP'] = old_pp
     # c: an all-to-all inside a forward
     e = {16: {'where': 'boundary', 'groups': {'E': g(40, 30, True, 'all_to_all_single', None)}},
          17: {'where': 'boundary', 'groups': {'E': g(39, 30, False, 'all_to_all_single', None)}}}
