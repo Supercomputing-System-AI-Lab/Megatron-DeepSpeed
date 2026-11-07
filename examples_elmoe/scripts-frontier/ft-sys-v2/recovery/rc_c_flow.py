@@ -103,12 +103,33 @@ def c_on_failure(ctl, f):
     n = rc_swap.swap_groups(dist.PrefixStore(f'ftv2/c{g}/', store), lost, ctl.device, 'nccl',
                             timedelta(seconds=float(os.environ.get('FTV2_PG_TIMEOUT_S', '1800'))),
                             log=ctl.log if os.environ.get('FTV2_C_DEBUG') == '1' else None)
+    first_collectives(ctl, [dist.distributed_c10d._get_default_group(), ctl.commit.pg])
     ctl.mark(g, 'world_up')
     reports = _reports(e, g, survivors)
     ctl.c.update(plan=make_plan(reports, lost, world, ctl.commit.step if ctl.commit else None), store=store, swapped=n)
     ctl.log(f'C plan {g}: {json.dumps(ctl.c["plan"])[:400]}')
     ctl.mark(g, 'plan_done')
     ctl.c['ready'].set()
+
+
+def first_collectives(ctl, groups):
+    """One all-reduce on each swapped group that batched point-to-point rounds use (the world: Keep and the state transfer; the
+    commit's group: the copies), every member at once, before any such round: torch's batch_isend_irecv needs the group's
+    first operation to involve every rank (M3C1d 5869419: rank 0 and its joiner hung in RCCL's bootstrap, each pair having read
+    another pair's unique id under the counter-based store key). On a stream of its own, so that an operation still pending on a
+    survivor's main stream cannot hold it back."""
+    S = ctl.hb.S
+    prev = S.get('c_repairing')
+    S['c_repairing'] = True
+    try:
+        st = torch.cuda.Stream(device=ctl.device)
+        with torch.cuda.stream(st):
+            for g in groups:
+                t = torch.ones(1, device=ctl.device)
+                dist.all_reduce(t, group=g)
+        st.synchronize()
+    finally:
+        S['c_repairing'] = prev
 
 
 def _log_groups(ctl, who):
@@ -249,6 +270,7 @@ def c_join(ctl, f):
     store = _world_store(ctl, g, min(survivors), world)
     rc_swap.swap_groups(dist.PrefixStore(f'ftv2/c{g}/', store), lost, ctl.device, 'nccl',
                         timedelta(seconds=float(os.environ.get('FTV2_PG_TIMEOUT_S', '1800'))), joiner=True, log=ctl.log)
+    first_collectives(ctl, [dist.distributed_c10d._get_default_group(), ctl.c_pg])
     ctl.mark(g, 'world_up')
     reports = _reports(e, g, survivors)
     plan = make_plan(reports, lost, world, None)
