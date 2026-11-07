@@ -57,6 +57,10 @@ class Commit:
         self.tok_cur = torch.full((2,), -1.0, dtype=torch.float64, device=device)
         self.tok_prev = torch.full((2,), -1.0, dtype=torch.float64, device=device)
         self.tok_send = torch.zeros(2, dtype=torch.float64, device=device)
+        # host mirrors of the two tokens (None = only the GPU knows: a token in flight from the owner, p2p mode). report() and
+        # copy_of() read them without a device wait: under the pipeline a healthy reduction can keep the GPU busy while the
+        # monitor thread reports (M3C1b 5868846: rank 16's report hung in tok_cur.tolist())
+        self.tok_cur_h, self.tok_prev_h = [-1, -1], [-1, -1]
         self.done_ev, self.inflight = None, None
         self.ms = []                                         # host time of each commit's launch
         # the transport (FTV2_COMMIT_MODE): under the pipeline (spaced reductions) the default is "keep" (all-reduce + keep; the
@@ -84,6 +88,7 @@ class Commit:
                 t.zero_()
             self.tok_cur[0].fill_(float(step)); self.tok_cur[1].fill_(0.0)
             self.tok_prev.fill_(-1.0)
+            self.tok_cur_h, self.tok_prev_h = [int(step), 0], [-1, -1]
 
     def set_position(self, step, c, snap):
         """After a restore at (step, c): the sums are S_c."""
@@ -127,6 +132,7 @@ class Commit:
         self.copy_prev, self.copy_cur = self.copy_cur, self.copy_prev
         self.tok_prev, self.tok_cur = self.tok_cur, self.tok_prev
         self.tok_cur.fill_(-1.0)
+        self.tok_prev_h, self.tok_cur_h = self.tok_cur_h, None
         self.tok_send[0].fill_(float(self.step)); self.tok_send[1].fill_(float(self.added))     # on the GPU: no host wait
         works = dist.batch_isend_irecv([dist.P2POp(dist.isend, f, self.partner, group=self.pg) for f in flats] +
                                        [dist.P2POp(dist.irecv, c, self.owner, group=self.pg) for c in self.copy_cur])
@@ -161,6 +167,7 @@ class Commit:
                 torch.add(prv, pc, out=cur)                  # the owner's accumulated_grad.add_(new) (stage_1_and_2.py:802)
             pc.zero_()
         self.tok_cur[0].fill_(float(self.step)); self.tok_cur[1].fill_(float(self.added))
+        self.tok_prev_h, self.tok_cur_h = self.tok_cur_h, [int(self.step), int(self.added)]
         self.snap_prev, self.snap_cur, self.c = self.snap_cur, flats, self.added
         self.ms.append(round(1000 * (time.time() - t0), 2))
 
@@ -197,19 +204,23 @@ class Commit:
         self.tok_prev.fill_(-1.0)
         if self.cuda:
             torch.cuda.synchronize(self.device)
+        self.tok_cur_h, self.tok_prev_h = [int(x) for x in self.tok_cur.tolist()], [-1, -1]
 
     # ------------------------------------------------------------------ recovery
     def report(self):
         """After a stop (GPU idle): my last commit, and my owner's last two commits as their tokens say."""
-        cur, prv = self.tok_cur.tolist(), self.tok_prev.tolist()
+        cur = self.tok_cur_h if self.tok_cur_h is not None else self.tok_cur.tolist()
+        prv = self.tok_prev_h if self.tok_prev_h is not None else self.tok_prev.tolist()
         return {'commit_step': self.step, 'commit_c': self.c, 'commit_k': self.k,
                 'copy_cur': [int(cur[0]), int(cur[1])], 'copy_prev': [int(prv[0]), int(prv[1])]}
 
     def copy_of(self, step, J):
         """The owner's sums at (step, J) from my copies, or None."""
-        if (int(self.tok_cur[0]), int(self.tok_cur[1])) == (step, J):
+        cur = self.tok_cur_h if self.tok_cur_h is not None else self.tok_cur.tolist()
+        prv = self.tok_prev_h if self.tok_prev_h is not None else self.tok_prev.tolist()
+        if (int(cur[0]), int(cur[1])) == (step, J):
             return self.copy_cur
-        if (int(self.tok_prev[0]), int(self.tok_prev[1])) == (step, J):
+        if (int(prv[0]), int(prv[1])) == (step, J):
             return self.copy_prev
         return None
 
