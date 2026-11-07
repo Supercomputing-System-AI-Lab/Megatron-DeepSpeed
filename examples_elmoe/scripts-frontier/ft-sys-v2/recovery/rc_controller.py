@@ -524,13 +524,28 @@ class Recovery:
         # exchange with the lost node neither finish the revoke nor return from the abort (M3P1 5867020: ranks 24-31 waited
         # 13 s + 30.9 s, the network plugin could not close its receive endpoints, 'Device or resource busy'); the recovery goes on
         # after the limit (the registry is cleared by hand, rc_stop.forget_all) and the new world worked, so the limit is the cost.
-        info['revoke'] = rc_stop.revoke_all(self.device, self.log, limit_s=float(os.environ.get('FTV2_REVOKE_WAIT_S', '10')))
+        # C's stop, ported (2026-11-06, after M3C12 b_lost): revoke only the groups that hold a lost rank (their kernels wait for
+        # peers that are gone; a revoke of a healthy communicator with work in flight can block), then abort every backend in one
+        # batch, and free nothing while any revoke or abort thread is still inside RCCL: such a rank leaves and is treated as lost
+        self.stop_comms(g, sorted(lost), info)
+
+    def stop_comms(self, g, lost, info):
+        """The communicators' stop of levels A and B (the monitor thread), C's stop ported. Sets freed only when every revoke and
+        abort thread has returned; otherwise this rank leaves (EXIT_FAILED) and is treated as lost."""
+        import rc_c_flow
+        info['revoke'] = rc_stop.revoke_all(self.device, self.log, limit_s=float(os.environ.get('FTV2_REVOKE_WAIT_S', '10')),
+                                            groups=rc_c_flow.lost_groups(lost))
         self.mark(g, 'revoke_done')
         survivors = [r for r in range(self.world) if r not in lost]
         info['barrier'] = rc_stop.etcd_barrier(self.etcd(), g, self.rank, survivors, self.log)
         self.mark(g, 'barrier_done')
         info['abort'] = rc_stop.abort_all(self.device, self.log, limit_s=float(os.environ.get('FTV2_ABORT_WAIT_S', '30')))
         self.mark(g, 'abort_done')
+        if info['abort'].get('abort') == 'stuck':
+            why = (f'{info["abort"]["alive"]} revoke/abort thread(s) still inside RCCL after the limit: this rank\'s memory '
+                   f'cannot be reused safely; it leaves and is treated as lost')
+            self.write_times(g, {'exit': why})
+            self._exit(EXIT_FAILED, f'recovery: {why}')
         self.freed.set()
 
     def wait_stop(self, limit_s):

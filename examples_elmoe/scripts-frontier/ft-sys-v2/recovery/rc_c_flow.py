@@ -55,6 +55,7 @@ def _threads(fns, limit_s):
             pass
         out[i] = round(time.time() - t0, 3)
     ths = [threading.Thread(target=run, args=(i, fn), daemon=True) for i, fn in enumerate(fns)]
+    rc_stop._THREADS.extend(ths)
     t0 = time.time()
     [t.start() for t in ths]
     for t in ths:
@@ -312,6 +313,10 @@ def c_on_failure(ctl, f):
                         'pc': dict(getattr(ctl, 'pc', None) or {})})
     # 4. abort the cut groups and the lost groups at once (abort_batch); before it, no blocking call on the GPU
     abort_batch(cgs, lgs, ctl.device, ctl.log, float(os.environ.get('FTV2_ABORT_WAIT_S', '30')))
+    if rc_stop.threads_alive():                # the same rule as B's stop: nothing goes on while a thread is inside RCCL
+        why = f'{rc_stop.threads_alive()} revoke/abort thread(s) still inside RCCL after the limit: this rank leaves (lost)'
+        ctl.write_times(g, {'exit': why})
+        ctl._exit(77, f'recovery: {why}')
     ctl.mark(g, 'cut_done')
     store = _world_store(ctl, g, min(survivors), world)
     _log_groups(ctl, 'survivor')

@@ -25,6 +25,13 @@ import torch.distributed as dist
 _LIB = []
 _LEFT_BEHIND = []          # old groups kept referenced when an abort did not return: no destructor runs on a stuck communicator
 _KEEPER = []
+_THREADS = []              # every revoke and abort thread of the stops (2026-11-06, M3C12 b_lost): none may be alive when the
+                           # old engine and communicators are freed
+
+
+def threads_alive():
+    """How many revoke or abort threads are still running (inside RCCL)."""
+    return sum(t.is_alive() for t in _THREADS)
 
 
 def _now():
@@ -73,12 +80,15 @@ def _backends(device):
     return out
 
 
-def revoke_all(device, log, limit_s=10.0):
-    """ncclCommRevoke on every communicator, one thread each; then wait for the GPU in a thread. Returns a summary dict."""
+def revoke_all(device, log, limit_s=10.0, groups=None):
+    """ncclCommRevoke on every communicator (or on those of `groups`: the groups that hold a lost rank, as C's stop does), one
+    thread each. No device synchronization (2026-11-06: a thread waiting for the GPU while the old engine is freed is not
+    needed; C's stop never waits for the GPU). Returns a summary dict."""
     t0 = time.time()
     lib = rccl()
     ptrs = []
-    for b in _backends(device):
+    bs = _backends(device) if groups is None else [b for b in (_backend_of(pg, device) for pg in groups) if b is not None]
+    for b in bs:
         try:
             p = b._comm_ptr()
             if p:
@@ -99,14 +109,19 @@ def revoke_all(device, log, limit_s=10.0):
                 return
             time.sleep(0.01)
     ths = [threading.Thread(target=one, args=(i,), daemon=True) for i in range(len(ptrs))]
+    _THREADS.extend(ths)
     [t.start() for t in ths]
     [t.join(timeout=max(0.1, limit_s - (time.time() - t0))) for t in ths]
-    gpu = threading.Thread(target=torch.cuda.synchronize, args=(device,), daemon=True)
-    gpu.start()
-    gpu.join(timeout=max(0.5, limit_s + 3 - (time.time() - t0)))
-    r = {'revoked': len(ptrs), 'all_done': all(done), 'gpu_idle': not gpu.is_alive(), 's': round(time.time() - t0, 3)}
+    r = {'revoked': len(ptrs), 'all_done': all(done), 'alive': sum(t.is_alive() for t in ths), 's': round(time.time() - t0, 3)}
     log(f'revoke: {r}')
     return r
+
+
+def _backend_of(pg, device):
+    try:
+        return pg._get_backend(device)
+    except Exception:
+        return None
 
 
 def etcd_barrier(etcd, g, rank, survivors, log, limit_s=60.0):
@@ -138,22 +153,34 @@ def forget_all():
 
 
 def abort_all(device, log, limit_s=30.0):
-    """Every backend's abort() at once, one thread each, then the registry cleared. Returns 'ok' or 'partial'."""
+    """Every backend's abort() at once, one thread each (one batch: an abort frees device memory, so it waits behind any kernel on
+    its GPU, and the abort that ends that kernel must run at the same time, M3C0c). Then every revoke and abort thread of the
+    stop must have returned (rc_stop._THREADS) before the registry is cleared and the old engine freed: a thread still inside
+    RCCL would touch freed memory (M3C12 5872105 b_lost: four ranks died in glibc, 'The futex facility returned an unexpected
+    error code', after the recovery went on past aborts that had not returned). Returns 'ok', or 'stuck' with the registry left as
+    it is: the caller must not free anything and must leave (the rank is treated as lost)."""
     t0 = time.time()
     bs = _backends(device)
     ths = [threading.Thread(target=b.abort, daemon=True) for b in bs]
+    _THREADS.extend(ths)
     [t.start() for t in ths]
-    for t in ths:
+    for t in _THREADS:
         t.join(timeout=max(0.1, limit_s - (time.time() - t0)))
     stuck = sum(t.is_alive() for t in ths)
+    alive = threads_alive()
+    secs = round(time.time() - t0, 3)
+    if alive:
+        _LEFT_BEHIND.append(bs)
+        log(f'abort: stuck, {len(bs)} backends, {stuck} aborts and {alive - stuck} revokes still running after {secs:.3f} s: '
+            f'nothing is freed; this rank leaves')
+        return {'abort': 'stuck', 'backends': len(bs), 'stuck': stuck, 'alive': alive, 's': secs}
     res = 'partial'
-    if stuck == 0:
-        try:
-            dist.distributed_c10d._abort_process_group()
-            res = 'ok'
-        except Exception as e:
-            log(f'registry clear after abort: {e!r}'[:300])
+    try:
+        dist.distributed_c10d._abort_process_group()
+        res = 'ok'
+    except Exception as e:
+        log(f'registry clear after abort: {e!r}'[:300])
     if res != 'ok':
         forget_all()
-    log(f'abort: {res}, {len(bs)} backends, {stuck} did not return, {time.time() - t0:.3f} s')
-    return {'abort': res, 'backends': len(bs), 'stuck': stuck, 's': round(time.time() - t0, 3)}
+    log(f'abort: {res}, {len(bs)} backends, every abort returned, {time.time() - t0:.3f} s')
+    return {'abort': res, 'backends': len(bs), 'stuck': 0, 'alive': 0, 's': round(time.time() - t0, 3)}
