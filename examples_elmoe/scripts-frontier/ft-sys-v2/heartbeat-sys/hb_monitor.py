@@ -541,6 +541,15 @@ def _find_card(local_rank):
     return None
 
 
+def list_applies(f, my_run, role):
+    """Does failure list f concern this process? A training process takes the lists of its own run (its generation: a recovery
+    renames the run <base>.g<gen>, rc_controller begin_generation). A standby still waiting keeps the run it started under, so it
+    also takes the lists of every later generation of that run (2026-11-07, M3MA4 5875028: the second standby ignored list 0002,
+    written by run '<base>.g0001', and the second recovery never formed its world)."""
+    run, mine = str(f.get('run')), str(my_run)
+    return run == mine or (role == 'standby' and run.startswith(mine + '.g'))
+
+
 def _loop():
     fpath = failed_path(S['dir'])
     next_beat, seen = 0.0, None
@@ -558,7 +567,7 @@ def _loop():
                 seen = (st.st_mtime, st.st_size)
                 f = read_json(fpath)
                 my_run = os.environ.get('FTV2_RUN') or os.environ.get('SLURM_STEP_ID', '0')
-                if f and str(f.get('run')) != str(my_run):
+                if f and not list_applies(f, my_run, S['role']):
                     f = None                                   # a list of an earlier run on this node: not ours
                 if f and f != S['failure']:
                     S['failure'] = f

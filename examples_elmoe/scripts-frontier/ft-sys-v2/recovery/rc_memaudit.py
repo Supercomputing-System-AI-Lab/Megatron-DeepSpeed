@@ -104,6 +104,31 @@ def _ptrs(obj, out, depth=0):
         _ptrs(obj.state, out, depth + 1)
 
 
+def census(objs, kinds, limit=10000):
+    """{id: object} of every object of the given types found as an item of a dict, list or tuple among objs. Each container is read
+    on its own and never fails the census: a dict subclass whose values() is not the plain one (M3MA4 5875028: 'dictionary update
+    sequence element #0 has length 22; 2 is required' ended the whole census), a container that changes while it is read
+    (RuntimeError), or any other error skips that container only. dict.values is called unbound, so an override is not used."""
+    found = {}
+    for o in objs:
+        try:
+            if isinstance(o, dict):
+                items = list(dict.values(o))[:limit]
+            elif isinstance(o, (list, tuple)):
+                items = list(o)[:limit]
+            else:
+                continue
+        except Exception:
+            continue
+        for v in items:
+            try:
+                if isinstance(v, kinds) and id(v) not in found:
+                    found[id(v)] = v
+            except Exception:
+                continue
+    return found
+
+
 def audit(rank, device, out_dir, gen, log=print, intended=()):
     if os.environ.get('FTV2_MEM_AUDIT') != '1' or not torch.cuda.is_available():
         return
@@ -152,12 +177,7 @@ def audit(rank, device, out_dir, gen, log=print, intended=()):
         from torch._C import _distributed_c10d as c10d_c
         kinds = tuple(t for t in (getattr(dist, 'ProcessGroup', None), getattr(c10d_c, 'Backend', None),
                                   getattr(c10d_c, 'Work', None)) if t is not None)
-        found = {}
-        for o in objs:
-            items = (o.values() if isinstance(o, dict) else o if isinstance(o, (list, tuple)) else ())
-            for v in list(items)[:10000]:
-                if isinstance(v, kinds) and id(v) not in found:
-                    found[id(v)] = v
+        found = census(objs, kinds)
         reg = set(id(g) for g in dist.distributed_c10d._world.pg_map)
         n_pg = sum(isinstance(v, kinds[0]) for v in found.values()) if kinds else 0
         lines.append(f'python-held distributed objects: {len(found)} ({n_pg} process groups; in torch registry now '
