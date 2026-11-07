@@ -641,6 +641,7 @@ class Recovery:
         self.old_commit, self.commit = self.commit, None
         old_keep = self.keep
         old_keep.gpu_recv = [None] * len(old_keep.gpu_recv)
+        self._drop_old_engine(old_keep, self.old_commit)
         self.adapter.release()
         self.adapter = self.keep = None
         for k in range(len(box)):
@@ -649,12 +650,43 @@ class Recovery:
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
         self.mark(g, 'released')
+        shadow_b = sum(t.numel() * t.element_size() for tr in (old_keep.shadow or []) if tr for t in tr
+                       if getattr(t, 'is_cuda', False))
         self.log(f'released the old engine: {torch.cuda.memory_allocated(self.device) / 1e9:.2f} GB still allocated '
-                 f'(kept state {sum(4 * s["fp32"].numel() * 3 for s in kept) / 1e9:.2f} GB)')
+                 f'(kept state {sum(4 * s["fp32"].numel() * 3 for s in kept) / 1e9:.2f} GB, GPU shadow {shadow_b / 1e9:.2f} GB)')
         import rc_memaudit
         rc_memaudit.audit(self.rank, self.device, self.out or '/tmp', g, self.log)   # FTV2_MEM_AUDIT=1 only (L2 5874149)
         new = self._join(g, f, 'survivor', kept=kept, old_keep=old_keep)
+        self.old_commit = None                      # its copies served the joiner and the restore; it held the old adapter too
         box[:] = new
+
+    def _drop_old_engine(self, old_keep, old_commit):
+        """Every reference that kept the old engine (model, ZeRO optimizer, flat buffers, the last step's autograd graphs) alive
+        after its release (2026-11-07, M3MA1 5874426, rc_memaudit's referrer chains; L2 5874149 ran out of memory in B's redone
+        step at 16k with 12-15.7 GB kept beyond the kept state on stages 0-2):
+          - DeepSpeed's debug registries, deepspeed.utils.debug.param_names / module_names (module globals: every parameter and
+            module of the old model; the MoE layers' l_aux keeps the last forward's autograd graph);
+          - this controller's pipe_st (the pipeline commits' closures over the old ZeRO optimizer: bit16_groups_flat ...) and pipec;
+          - the old Keep's adapter and slots (the old optimizer's fp32 partitions) and the old Commit's adapter; the Keep keeps
+            only its own buffers (the GPU shadow it reuses, send_shadow), the Commit only its snapshots and copies (copy_of,
+            target), and neither reads the adapter after this point;
+          - the C tracking's last operations (their Work objects hold the tensors of the last call on each group)."""
+        try:
+            from deepspeed.utils import debug as ds_debug
+            for name in ('param_names', 'module_names'):
+                d = getattr(ds_debug, name, None)
+                if isinstance(d, dict):
+                    d.clear()
+        except Exception as ex:
+            self.log(f'release: the DeepSpeed debug registries were not cleared: {ex!r}')
+        self.pipe_st, self.pipec = None, None
+        if old_keep is not None:
+            old_keep.ad = None
+            old_keep.slots = [(gi, None) for gi, _ in (old_keep.slots or [])]
+            old_keep.index = {}
+        if old_commit is not None:
+            old_commit.ad = None
+        self.hb.S['c_last'].clear()
 
     # ------------------------------------------------------------------ the standby
     def standby_wait(self):
