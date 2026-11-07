@@ -109,7 +109,15 @@ def census(objs, kinds, limit=10000):
     on its own and never fails the census: a dict subclass whose values() is not the plain one (M3MA4 5875028: 'dictionary update
     sequence element #0 has length 22; 2 is required' ended the whole census), a container that changes while it is read
     (RuntimeError), or any other error skips that container only. dict.values is called unbound, so an override is not used."""
+    import warnings
     found = {}
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')          # isinstance on some module attributes warns (torch.distributed.reduce_op)
+        _census_into(objs, kinds, limit, found)
+    return found
+
+
+def _census_into(objs, kinds, limit, found):
     for o in objs:
         try:
             if isinstance(o, dict):
@@ -126,7 +134,6 @@ def census(objs, kinds, limit=10000):
                     found[id(v)] = v
             except Exception:
                 continue
-    return found
 
 
 def audit(rank, device, out_dir, gen, log=print, intended=()):

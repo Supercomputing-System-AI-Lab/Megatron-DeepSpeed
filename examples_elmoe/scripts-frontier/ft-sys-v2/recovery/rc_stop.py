@@ -25,6 +25,7 @@ import torch.distributed as dist
 _LIB = []
 _LEFT_BEHIND = []          # old groups kept referenced when an abort did not return: no destructor runs on a stuck communicator
 _KEEPER = []
+_GRAVEYARD = []            # the old world's process groups, released off the main thread (bury)
 _THREADS = []              # every revoke and abort thread of the stops (2026-11-06, M3C12 b_lost): none may be alive when the
                            # old engine and communicators are freed
 
@@ -232,3 +233,38 @@ def abort_all(device, log, limit_s=30.0, dump_path=None, clear='torch'):
         res = 'ok' if clear == 'forget' else res
     log(f'abort: {res}, {len(bs)} backends, every abort returned, {time.time() - t0:.3f} s; seconds per abort {ret}')
     return {'abort': res, 'backends': len(bs), 'stuck': 0, 'alive': 0, 's': round(time.time() - t0, 3), 'returned_s': ret}
+
+
+def old_process_groups():
+    """Every torch ProcessGroup object Python still references after a stop's aborts (module globals, attributes, lists, dicts:
+    rc_memaudit.census over gc's objects), except the keeper's."""
+    import gc
+    import rc_memaudit
+    keep = {id(pg) for pg, _ in _KEEPER}
+    found = rc_memaudit.census(gc.get_objects(), (dist.ProcessGroup,))
+    return [pg for i, pg in found.items() if i not in keep]
+
+
+def bury(pgs, after, log, wait_s=600.0):
+    """Keep the old world's process groups referenced until `after` is set (the rebuild is ready), then drop them on a thread of
+    their own (2026-11-07, M3ST1 5875211): torch's ProcessGroupNCCL destructor joins its watchdog thread (Watchdog::join), which
+    took 41-49 s on the 4 ranks of the lost node's partner node whose groups had a cut operation, and it ran on the main thread
+    when Megatron's destroy_model_parallel dropped the last reference (parallel_state.py:837), every other rank waiting for those 4.
+    Holding one more reference here makes the main thread's drop not the last; the destructor then runs on this thread (pybind's
+    holder releases the GIL around it). Their communicators are already aborted, so what stays alive meanwhile is host objects
+    and whatever their unfinished Work still holds."""
+    holder = list(pgs)
+    _GRAVEYARD.append(holder)
+
+    def drop():
+        after.wait(timeout=wait_s)
+        t0 = time.time()
+        n = len(holder)
+        holder.clear()
+        try:
+            _GRAVEYARD.remove(holder)
+        except ValueError:
+            pass
+        log(f'the old world\'s {n} process group(s) released off the main thread in {time.time() - t0:.1f} s')
+    threading.Thread(target=drop, daemon=True, name='ftv2-pg-graveyard').start()
+    return len(holder)

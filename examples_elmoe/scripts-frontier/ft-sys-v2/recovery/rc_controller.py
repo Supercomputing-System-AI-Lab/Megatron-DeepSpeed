@@ -642,6 +642,11 @@ class Recovery:
         old_keep = self.keep
         old_keep.gpu_recv = [None] * len(old_keep.gpu_recv)
         self._drop_old_engine(old_keep, self.old_commit)
+        rebuilt = threading.Event()
+        try:                                        # the old groups' destructors off the main thread (M3ST1 5875211)
+            n_pg = rc_stop.bury(rc_stop.old_process_groups(), rebuilt, self.log)
+        except Exception as ex:
+            n_pg = f'not buried: {ex!r}'
         self.adapter.release(self.log)
         self.adapter = self.keep = None
         for k in range(len(box)):
@@ -659,7 +664,11 @@ class Recovery:
         import rc_memaudit
         rc_memaudit.audit(self.rank, self.device, self.out or '/tmp', g, self.log,
                           intended=(kept, old_keep.shadow, old_keep.gpu_opt))   # FTV2_MEM_AUDIT=1 only (L2 5874149)
-        new = self._join(g, f, 'survivor', kept=kept, old_keep=old_keep)
+        self.log(f'release: {n_pg} old process group(s) held for a background release after the rebuild')
+        try:
+            new = self._join(g, f, 'survivor', kept=kept, old_keep=old_keep)
+        finally:
+            rebuilt.set()
         self.old_commit = None                      # its copies served the joiner and the restore; it held the old adapter too
         box[:] = new
 
