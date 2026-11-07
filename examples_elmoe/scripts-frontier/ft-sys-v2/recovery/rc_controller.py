@@ -642,11 +642,13 @@ class Recovery:
         old_keep = self.keep
         old_keep.gpu_recv = [None] * len(old_keep.gpu_recv)
         self._drop_old_engine(old_keep, self.old_commit)
-        self.adapter.release()
+        self.adapter.release(self.log)
         self.adapter = self.keep = None
         for k in range(len(box)):
             box[k] = None
-        gc.collect()
+        for _ in range(3):                          # M3MA2 5874600: a second pass freed 1.5 GB more (cycles freed by the first)
+            if not gc.collect():
+                break
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
         self.mark(g, 'released')
@@ -655,7 +657,8 @@ class Recovery:
         self.log(f'released the old engine: {torch.cuda.memory_allocated(self.device) / 1e9:.2f} GB still allocated '
                  f'(kept state {sum(4 * s["fp32"].numel() * 3 for s in kept) / 1e9:.2f} GB, GPU shadow {shadow_b / 1e9:.2f} GB)')
         import rc_memaudit
-        rc_memaudit.audit(self.rank, self.device, self.out or '/tmp', g, self.log)   # FTV2_MEM_AUDIT=1 only (L2 5874149)
+        rc_memaudit.audit(self.rank, self.device, self.out or '/tmp', g, self.log,
+                          intended=(kept, old_keep.shadow, old_keep.gpu_opt))   # FTV2_MEM_AUDIT=1 only (L2 5874149)
         new = self._join(g, f, 'survivor', kept=kept, old_keep=old_keep)
         self.old_commit = None                      # its copies served the joiner and the restore; it held the old adapter too
         box[:] = new

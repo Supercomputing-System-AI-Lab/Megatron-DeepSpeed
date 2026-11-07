@@ -85,7 +85,26 @@ def _chains(obj, ignore, depth=8, width=2):
     return out
 
 
-def audit(rank, device, out_dir, gen, log=print):
+def _ptrs(obj, out, depth=0):
+    """Storage pointers of every CUDA tensor inside obj (tensors, dicts, lists, tuples, objects with a shadow / state)."""
+    if depth > 6 or obj is None:
+        return
+    if isinstance(obj, torch.Tensor):
+        if obj.is_cuda:
+            out.add(obj.untyped_storage().data_ptr())
+        return
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            _ptrs(k, out, depth + 1)
+            _ptrs(v, out, depth + 1)
+    elif isinstance(obj, (list, tuple, set)):
+        for v in obj:
+            _ptrs(v, out, depth + 1)
+    elif hasattr(obj, 'state') and isinstance(getattr(obj, 'state'), dict):      # an optimizer: its state
+        _ptrs(obj.state, out, depth + 1)
+
+
+def audit(rank, device, out_dir, gen, log=print, intended=()):
     if os.environ.get('FTV2_MEM_AUDIT') != '1' or not torch.cuda.is_available():
         return
     walk_ranks = {int(x) for x in os.environ.get('FTV2_MEM_AUDIT_RANKS', '0').replace(';', ',').split(',') if x.strip()}
@@ -105,11 +124,17 @@ def audit(rank, device, out_dir, gen, log=print):
             continue
     py = sum(v[0] for v in stor.values())
     graph = [v[1] for v in stor.values() if v[1].grad_fn is not None]
+    keep_ptrs = set()                                  # what the recovery keeps on purpose (the kept state, the GPU shadow)
+    for obj in intended:
+        _ptrs(obj, keep_ptrs)
+    rest = {k: v for k, v in stor.items() if k not in keep_ptrs}
     lines.append(f'rank {rank} gen {gen}: allocated {alloc / 1e9:.3f} GB; live Python CUDA tensors {len(stor)} storages '
                  f'{py / 1e9:.3f} GB; without a Python owner {(alloc - py) / 1e9:.3f} GB; tensors with a graph {len(graph)}; '
-                 f'sys.last_traceback {getattr(sys, "last_traceback", None) is not None}; exc_info {sys.exc_info()[0]}')
+                 f'sys.last_traceback {getattr(sys, "last_traceback", None) is not None}; exc_info {sys.exc_info()[0]}; '
+                 f'kept on purpose {sum(stor[k][0] for k in keep_ptrs if k in stor) / 1e9:.3f} GB; the rest {len(rest)} storages '
+                 f'{sum(v[0] for v in rest.values()) / 1e9:.3f} GB')
     if rank in walk_ranks:
-        top = sorted(stor.values(), key=lambda v: -v[0])[:12]
+        top = sorted(rest.values(), key=lambda v: -v[0])[:16]     # the largest storages not kept on purpose
         seen = {id(v[1]) for v in top}
         top += [[t.untyped_storage().nbytes(), t] for t in graph[:6] if id(t) not in seen]
         ignore = {id(objs), id(stor), id(top), id(graph), id(lines), id(sys._getframe())}

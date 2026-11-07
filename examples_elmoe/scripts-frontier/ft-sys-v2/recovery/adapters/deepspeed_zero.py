@@ -120,11 +120,24 @@ class ZeroAdapter:
         e = self.engine
         e.global_steps, e.global_samples, e.micro_steps, e.skipped_steps = int(steps), int(samples), int(micro), 0
 
-    def release(self):
+    def release(self, log=None):
+        """Release the engine: DeepSpeed's destroy (removes ZeRO's gradient-accumulation hooks, clears its debug registries); the
+        hooks are removed again here if destroy raised (2026-11-07, M3MA2 5874600: a parameter of the old model stayed alive,
+        held from C++, which is what a hook on its AccumulateGrad node does), and destroy's error is reported, not swallowed."""
         try:
             self.engine.destroy()
-        except Exception:
-            pass
+        except Exception as ex:
+            if log:
+                log(f'release: engine.destroy raised {ex!r}')
+        for h in list(getattr(self.zero, '_grad_acc_hooks', None) or []):
+            try:
+                h.remove()
+            except Exception:
+                pass
+        if self.zero is not None and hasattr(self.zero, '_grad_acc_hooks'):
+            self.zero._grad_acc_hooks = []
+        if self.zero is not None and hasattr(self.zero, 'grad_accs'):
+            self.zero.grad_accs = []
         self.engine = self.zero = self.inner = None
         self._groups = []
 
