@@ -162,8 +162,11 @@ class PipeC:
                 return None
             if kind == 'sact':
                 me._keep('act', mb, eng_.pipe_buffers['outputs'][kw.get('buffer_id', a[0] if a else None)])
+            saved_inputs = None
             if kind == 'sgrad':
-                ins = eng_.pipe_buffers['inputs'][kw.get('buffer_id', a[0] if a else None)]
+                bid = kw.get('buffer_id', a[0] if a else None)
+                ins = eng_.pipe_buffers['inputs'][bid]
+                saved_inputs = (bid, ins)            # SendGrad frees the input buffer after sending (pipe/engine.py:1124)
                 ts = [ins] if torch.is_tensor(ins) else list(ins)
                 me._keep('grad', mb, [t.grad for t in ts if t.is_floating_point() and t.grad is not None])
             pair = {'sact': (eng_.stage_id, eng_.stage_id + 1), 'ract': (eng_.stage_id - 1, eng_.stage_id),
@@ -179,6 +182,8 @@ class PipeC:
                     break
                 me.log(f'C: {kind} of micro-batch {mb} was cut by the loss: runs again after the repair')
                 me.ctl.wait_resumed()
+                if saved_inputs is not None:
+                    eng_.pipe_buffers['inputs'][saved_inputs[0]] = saved_inputs[1]
             if mb is not None:
                 me.cnt[kind] += 1
             return out
