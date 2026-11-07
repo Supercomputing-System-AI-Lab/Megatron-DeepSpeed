@@ -136,6 +136,75 @@ def _census_into(objs, kinds, limit, found):
                 continue
 
 
+HP_ATTRS = ('get_full_hp_param', 'get_full_hp_grad', 'set_full_hp_param', 'set_full_hp_grad')
+
+
+def break_hp_cycles(objs=None):
+    """Clear DeepSpeed's per-parameter links on every live Parameter that has them (2026-11-07, M3MA6 5875594 / M3MA7): ZeRO's
+    link_hp_params gives each low-precision parameter p a tensor_fragment (p._hp_mapping) whose lp_fragment is a view made with
+    autograd on (p.flatten().narrow(...), deepspeed/utils/tensor_fragment.py:327), so its grad_fn chain ends in p's AccumulateGrad
+    node, which holds p from C++: p -> _hp_mapping -> lp_fragment -> grad_fn -> AccumulateGrad -> p. gc cannot see through the
+    C++ nodes, so the cycle (with the flat bf16 buffers and the gradient_dict it reaches) is never freed unless DeepSpeed's own
+    destroy() clears _hp_mapping, which it does only for the parameters of its bit16 groups. Returns the number cleared."""
+    import gc
+    import warnings
+    if objs is None:
+        objs = gc.get_objects()
+    n = 0
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')          # isinstance on some module attributes warns (torch.distributed.reduce_op)
+        return n + _break_into(objs)
+
+
+def _break_into(objs):
+    n = 0
+    for o in objs:
+        try:
+            if isinstance(o, torch.nn.Parameter) and o.__dict__.get('_hp_mapping') is not None:
+                o._hp_mapping = None
+                for nm in HP_ATTRS:
+                    o.__dict__.pop(nm, None)
+                n += 1
+        except Exception:
+            continue
+    return n
+
+
+def _hp_holders(objs, lines, limit=4):
+    """The C++ holder test (the coordinator, 11-07): for live Parameters that still carry _hp_mapping, does lp_fragment's grad_fn
+    chain end in an AccumulateGrad holding that same Parameter (a cycle through C++)? Also its refcount against its Python
+    referrers, its hooks, any live optimizer that lists it, and the Python referrers of the fragment view and of its _base."""
+    import gc
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        params = [o for o in objs if isinstance(o, torch.nn.Parameter) and o.__dict__.get('_hp_mapping') is not None]
+        opts = [o for o in objs if isinstance(o, torch.optim.Optimizer)]
+    lines.append(f'parameters still carrying _hp_mapping: {len(params)}, '
+                 f'{sum(p.untyped_storage().nbytes() for p in params if p.is_cuda) / 1e9:.3f} GB of storages (shared ones counted '
+                 f'once each per parameter); live optimizers: {len(opts)} ({sorted(set(type(o).__name__ for o in opts))})')
+    for p in params[:limit]:
+        frag = p.__dict__.get('_hp_mapping')
+        lf = getattr(frag, 'lp_fragment', None)
+        node, closes, hops = getattr(lf, 'grad_fn', None), False, 0
+        while node is not None and hops < 8:
+            if type(node).__name__ == 'AccumulateGrad':
+                closes = getattr(node, 'variable', None) is p
+                break
+            nxt = [f for f, _ in node.next_functions if f is not None]
+            node, hops = (nxt[0] if nxt else None), hops + 1
+        refs = [r for r in gc.get_referrers(p) if r is not params and r is not objs and not isinstance(r, type(sys._getframe()))]
+        in_opt = [type(o).__name__ for o in opts if any(p is q for g in o.param_groups for q in g.get('params', [])) or p in o.state]
+        bref = gc.get_referrers(lf._base) if (lf is not None and getattr(lf, '_base', None) is not None) else []
+        lines.append(f'-- held Parameter {tuple(p.shape)} {p.dtype}: refcount {sys.getrefcount(p) - 1}, Python referrers '
+                     f'{len(refs)} ({sorted(set(type(r).__name__ for r in refs))}); lp_fragment grad_fn '
+                     f'{type(getattr(lf, "grad_fn", None)).__name__} -> AccumulateGrad holding this Parameter: {closes} '
+                     f'({hops} hops); hooks: backward {len(getattr(p, "_backward_hooks", None) or {})}, post-accumulate '
+                     f'{len(getattr(p, "_post_accumulate_grad_hooks", None) or {})}; in a live optimizer: {in_opt}; '
+                     f'Python referrers of the fragment view {len(gc.get_referrers(lf)) if lf is not None else None}, '
+                     f'of its _base {len(bref)}')
+
+
 def audit(rank, device, out_dir, gen, log=print, intended=(), streams=None):
     if os.environ.get('FTV2_MEM_AUDIT') != '1' or not torch.cuda.is_available():
         return
@@ -156,6 +225,10 @@ def audit(rank, device, out_dir, gen, log=print, intended=(), streams=None):
             continue
     py = sum(v[0] for v in stor.values())
     graph = [v[1] for v in stor.values() if v[1].grad_fn is not None]
+    try:
+        _hp_holders(objs, lines)
+    except Exception as ex:
+        lines.append(f'C++ holder test: {ex!r}')
     keep_ptrs = set()                                  # what the recovery keeps on purpose (the kept state, the GPU shadow)
     for obj in intended:
         _ptrs(obj, keep_ptrs)

@@ -693,6 +693,11 @@ class Recovery:
         except Exception as ex:
             self.log(f'release: the DeepSpeed debug registries were not cleared: {ex!r}')
         self.pipe_st, self.pipec = None, None
+        if os.environ.get('FTV2_RELEASE_HP', '1') == '1':     # ZeRO's per-parameter links: a cycle through C++ (M3MA6, M3MA7)
+            import rc_memaudit
+            n_hp = rc_memaudit.break_hp_cycles()
+            if n_hp:
+                self.log(f'release: cleared DeepSpeed\'s fragment links on {n_hp} parameter(s) that destroy() had left')
         if old_keep is not None:
             old_keep.ad = None
             old_keep.slots = [(gi, None) for gi, _ in (old_keep.slots or [])]
