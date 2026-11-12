@@ -405,7 +405,7 @@ class ZeroAdapter:
             if ta is not None:
                 tb = torch.cuda.Event(enable_timing=True)
                 tb.record()
-                st['trace']['ev'].append(('red', st['trace']['step'], ta, tb))
+                st['trace']['ev'].append(('red', st['trace']['step'], ta, tb, None, None))
 
         def reduce_on_side():
             overlap['before']()                           # the previous commit promoted (or the stop raised)

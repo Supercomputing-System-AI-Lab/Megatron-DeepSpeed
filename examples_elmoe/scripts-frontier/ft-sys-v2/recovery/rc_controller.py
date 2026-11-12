@@ -363,7 +363,21 @@ class Recovery:
         first, last = (int(x) for x in spec.split(':'))
         from deepspeed.runtime.pipe import schedule as sch
         eng = adapter.engine
-        tr = {'on': False, 'step': None, 'ev': []}
+        tr = {'on': False, 'step': None, 'ev': [], 'cur': None, 'samples': {}, 'sampler': None}
+        sample_ranks = {int(x) for x in os.environ.get('FTV2_EVENT_TRACE_SAMPLE_RANKS', '0').split(';') if x.strip().isdigit()}
+        main_ident = threading.get_ident()
+
+        def sampler():
+            # the main thread's Python stack every 2 ms while the window is on, keyed by the instruction it is inside
+            while tr['on']:
+                fr = sys._current_frames().get(main_ident)
+                st_ = []
+                while fr is not None and len(st_) < 10:
+                    st_.append(f'{os.path.basename(fr.f_code.co_filename)}:{fr.f_lineno}:{fr.f_code.co_name}')
+                    fr = fr.f_back
+                key = (tr['cur'] or '-', '|'.join(st_))
+                tr['samples'][key] = tr['samples'].get(key, 0) + 1
+                time.sleep(0.002)
         if getattr(self, 'pipe_st', None) is not None:
             self.pipe_st['trace'] = tr
         kinds = {sch.ForwardPass: 'F', sch.BackwardPass: 'B', sch.SendActivation: 'sA', sch.RecvActivation: 'rA',
@@ -377,12 +391,16 @@ class Recovery:
                     return fn(eng_, *a, **kw)
                 e0 = torch.cuda.Event(enable_timing=True)
                 e0.record()
+                h0 = time.perf_counter()
+                tr['cur'] = kind
                 try:
                     return fn(eng_, *a, **kw)
                 finally:
+                    tr['cur'] = None
+                    h1 = time.perf_counter()
                     e1 = torch.cuda.Event(enable_timing=True)
                     e1.record()
-                    tr['ev'].append((kind, tr['step'], e0, e1))
+                    tr['ev'].append((kind, tr['step'], e0, e1, h0, h1))
             return run
         for cls, kind in kinds.items():
             if cls in imap:
@@ -393,10 +411,14 @@ class Recovery:
         def train_batch(*a, **k):
             s_ = int(eng.global_steps) + 1                 # Megatron's iteration number of this step
             tr['on'], tr['step'] = first <= s_ <= last, s_
+            if tr['on'] and self.rank in sample_ranks and tr['sampler'] is None:
+                tr['sampler'] = threading.Thread(target=sampler, daemon=True, name='ftv2-evtrace-sampler')
+                tr['sampler'].start()
             if tr['on']:
                 e = torch.cuda.Event(enable_timing=True)
                 e.record()
-                tr['ev'].append(('step', s_, e, e))
+                h = time.perf_counter()
+                tr['ev'].append(('step', s_, e, e, h, h))
             try:
                 return orig(*a, **k)
             finally:
@@ -409,16 +431,23 @@ class Recovery:
     def _dump_trace(self, tr):
         try:
             torch.cuda.synchronize(self.device)
-            base = {}
-            for kind, st_, a, b in tr['ev']:
+            base, hbase = {}, {}
+            for kind, st_, a, b, h0, h1 in tr['ev']:
                 if kind == 'step':
-                    base[st_] = a
-            rows = [{'k': kind, 's': st_, 't0': round(base[st_].elapsed_time(a), 3), 't1': round(base[st_].elapsed_time(b), 3)}
-                    for kind, st_, a, b in tr['ev'] if st_ in base]
+                    base[st_], hbase[st_] = a, h0
+            # t0/t1: GPU times (ms from the step's first event); h0/h1: the host's entry to and exit from the instruction (ms)
+            rows = [{'k': kind, 's': st_, 't0': round(base[st_].elapsed_time(a), 3), 't1': round(base[st_].elapsed_time(b), 3),
+                     'h0': round(1000 * (h0 - hbase[st_]), 3) if h0 is not None else None,
+                     'h1': round(1000 * (h1 - hbase[st_]), 3) if h1 is not None else None}
+                    for kind, st_, a, b, h0, h1 in tr['ev'] if st_ in base]
             d = os.path.join(self.out, 'ft', 'evtrace')
             os.makedirs(d, exist_ok=True)
             with open(os.path.join(d, f'rank_{self.rank}.json'), 'w') as f:
                 json.dump(rows, f)
+            if tr['samples']:
+                top = sorted(tr['samples'].items(), key=lambda kv: -kv[1])[:60]
+                with open(os.path.join(d, f'samples_rank_{self.rank}.json'), 'w') as f:
+                    json.dump([{'k': k, 'n': n, 'stack': stk} for (k, stk), n in top], f, indent=0)
             self.log(f'event trace written: {len(rows)} intervals')
         except Exception as e:
             self.log(f'event trace failed: {e!r}'[:200])
