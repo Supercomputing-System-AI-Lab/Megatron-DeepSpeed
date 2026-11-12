@@ -269,6 +269,7 @@ class Recovery:
         self.keep.install()
         self._start_commit(self.adapter, int(version), 0, None)
         self.count_pipe(self.adapter)
+        self.trace_pipe(self.adapter)
         stride = int(os.environ.get('FTV2_PARTNER_STRIDE', '8'))
         if self.rank < stride and rc_pairs.pp() == 1:   # the sizes a standby needs to pre-allocate its shadow while it waits
             # (under a pipeline the stages' slices differ and the standby does not know its stage before the list: no pre-allocation)
@@ -348,6 +349,80 @@ class Recovery:
                 self.hb.S['micro_batch'] = 0
             return orig(*a, **k)
         eng.train_batch = train_batch
+
+    def trace_pipe(self, adapter):
+        """FTV2_EVENT_TRACE=<first>:<last> (2026-11-12, after P4 5911996: the torch profiler records no GPU activity on the new stack):
+        a pair of GPU timing events on the current stream around every pipeline instruction of steps first..last (forward,
+        backward, the four sends and receives, the micro-batch load, the step-end reductions, the optimizer step), and around each
+        commit's reduction on the stream it runs on (the adapter appends those, install_pipe_commits); after step `last` ONE host
+        synchronize, then <arm>/ft/evtrace/rank_<r>.json holds every interval in ms from the step's first event. Off by default;
+        inside the window the host never waits (events are only recorded). Wraps the instruction map and train_batch outermost."""
+        spec = os.environ.get('FTV2_EVENT_TRACE')
+        if not spec or not adapter.is_pipe() or not self.out or self.device.type != 'cuda':
+            return
+        first, last = (int(x) for x in spec.split(':'))
+        from deepspeed.runtime.pipe import schedule as sch
+        eng = adapter.engine
+        tr = {'on': False, 'step': None, 'ev': []}
+        if getattr(self, 'pipe_st', None) is not None:
+            self.pipe_st['trace'] = tr
+        kinds = {sch.ForwardPass: 'F', sch.BackwardPass: 'B', sch.SendActivation: 'sA', sch.RecvActivation: 'rA',
+                 sch.SendGrad: 'sG', sch.RecvGrad: 'rG', sch.LoadMicroBatch: 'load', sch.ReduceTiedGrads: 'tied',
+                 sch.ReduceGrads: 'redG', sch.OptimizerStep: 'opt'}
+        imap = dict(eng._INSTRUCTION_MAP)
+
+        def wrap(kind, fn):
+            def run(eng_, *a, **kw):
+                if not tr['on']:
+                    return fn(eng_, *a, **kw)
+                e0 = torch.cuda.Event(enable_timing=True)
+                e0.record()
+                try:
+                    return fn(eng_, *a, **kw)
+                finally:
+                    e1 = torch.cuda.Event(enable_timing=True)
+                    e1.record()
+                    tr['ev'].append((kind, tr['step'], e0, e1))
+            return run
+        for cls, kind in kinds.items():
+            if cls in imap:
+                imap[cls] = wrap(kind, imap[cls])
+        eng._INSTRUCTION_MAP = imap
+        orig = eng.train_batch
+
+        def train_batch(*a, **k):
+            s_ = int(eng.global_steps) + 1                 # Megatron's iteration number of this step
+            tr['on'], tr['step'] = first <= s_ <= last, s_
+            if tr['on']:
+                e = torch.cuda.Event(enable_timing=True)
+                e.record()
+                tr['ev'].append(('step', s_, e, e))
+            try:
+                return orig(*a, **k)
+            finally:
+                if tr['on'] and s_ == last:
+                    tr['on'] = False
+                    self._dump_trace(tr)
+        eng.train_batch = train_batch
+        self.log(f'event trace on for steps {first}-{last}')
+
+    def _dump_trace(self, tr):
+        try:
+            torch.cuda.synchronize(self.device)
+            base = {}
+            for kind, st_, a, b in tr['ev']:
+                if kind == 'step':
+                    base[st_] = a
+            rows = [{'k': kind, 's': st_, 't0': round(base[st_].elapsed_time(a), 3), 't1': round(base[st_].elapsed_time(b), 3)}
+                    for kind, st_, a, b in tr['ev'] if st_ in base]
+            d = os.path.join(self.out, 'ft', 'evtrace')
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, f'rank_{self.rank}.json'), 'w') as f:
+                json.dump(rows, f)
+            self.log(f'event trace written: {len(rows)} intervals')
+        except Exception as e:
+            self.log(f'event trace failed: {e!r}'[:200])
+        tr['ev'] = []
 
     def _pipe_start(self):
         """The pipeline engine's train_batch asks where its step starts: (J, drop_until) once after a recovery, else (0, 0)."""

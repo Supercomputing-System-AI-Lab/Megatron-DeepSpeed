@@ -384,12 +384,28 @@ class ZeroAdapter:
             st['spaced'] = True
             try:
                 if overlap is None:
+                    ta = trace_ev()
                     z.reduce_gradients(pipeline_parallel=True)
+                    trace_add(ta)
                 else:
                     reduce_on_side()
             finally:
                 st['spaced'] = False
                 z.is_gradient_accumulation_boundary = prev
+
+        def trace_ev():                                   # FTV2_EVENT_TRACE (rc_controller.trace_pipe): an event on the current stream
+            tr = st.get('trace')
+            if tr is None or not tr.get('on'):
+                return None
+            e = torch.cuda.Event(enable_timing=True)
+            e.record()
+            return e
+
+        def trace_add(ta):
+            if ta is not None:
+                tb = torch.cuda.Event(enable_timing=True)
+                tb.record()
+                st['trace']['ev'].append(('red', st['trace']['step'], ta, tb))
 
         def reduce_on_side():
             overlap['before']()                           # the previous commit promoted (or the stop raised)
@@ -409,7 +425,9 @@ class ZeroAdapter:
                 t0 = torch.cuda.Event(enable_timing=True)
                 t0.record()
                 st['side_t0'] = t0                        # the reduction's start on the side stream (rc_controller reads it)
+                ta = trace_ev()
                 z.reduce_gradients(pipeline_parallel=True)
+                trace_add(ta)
 
         def settle_side():
             if overlap is not None:
