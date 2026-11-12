@@ -288,11 +288,20 @@ class Recovery:
             return
         pg = self.c_pg if self.c_pg is not None else dist.new_group(list(range(self.world)))
         self.c_pg = None
-        c = Commit(adapter, self.rank, self.world, self.device, self.log, group=pg, spaced=pipe)
+        # FTV2_COMMIT_OVERLAP=1 (2026-11-12): the spaced reductions on a side stream (rc_commit's docstring, "Overlap")
+        ov = pipe and os.environ.get('FTV2_COMMIT_OVERLAP', '0') == '1' and self.device.type == 'cuda'
+        if ov and self.c_mode:
+            self.log('FTV2_COMMIT_OVERLAP=1 is not built for level C (its cut checks wait on the stream at every commit): '
+                     'the reductions stay on the compute stream')
+            ov = False
+        c = Commit(adapter, self.rank, self.world, self.device, self.log, group=pg, spaced=pipe, overlap=ov)
         c.set_position(step, J, flats)
         c.seed(step, J, flats)
         if pipe:                                             # milestone 3: ZeRO-1 reduces every k micro-batches (spaced)
-            self.pipe_st = adapter.install_pipe_commits(c.k, self._pipe_start)
+            self.ov_wait = []                                # overlap: the host's waits for the commit in flight, this step
+            self.pipe_st = adapter.install_pipe_commits(
+                c.k, self._pipe_start,
+                overlap={'side': c.side, 'before': self._overlap_before, 'end': self._overlap_end} if c.overlap else None)
             adapter.wrap_epilogue(self._commit_after, last_fn=lambda: not self.pipe_st['spaced'])
         else:
             self.pipe_st = None
@@ -306,7 +315,7 @@ class Recovery:
                 p, store, g = self.c_replay
                 self.c_replay = None
                 self.pipec.set_replay(p, dist.PrefixStore(f'ftv2/c{g}/', store))
-        self.log(f'commits on: every {c.k} micro-batch(es), {c.mode}, async {c.asyn}, position step {step} micro-batch {J}'
+        self.log(f'commits on: every {c.k} micro-batch(es), {c.mode}, async {c.asyn}, overlap {c.overlap}, position step {step} micro-batch {J}'
                  f'{" (pipeline: spaced ZeRO-1 reductions after the " + self.pipe_st["at"] + ", " + str(self.pipe_st["tied"]) + " tied weight(s) summed across stages before ReduceTiedGrads)" if pipe else ""}')
 
     def count_pipe(self, adapter):
@@ -358,7 +367,10 @@ class Recovery:
             self.hb.S['micro_batch'] = self.commit.added
             self.hb.S['c_mark'] = dict(self.hb.S['c_n'])      # each group's operation index at this commit (rc_c_flow.cut_entry)
             return
-        if not last and os.environ.get('FTV2_COMMIT_VERIFY', '1') == '1' and self.device.type == 'cuda':
+        ov = self.commit is not None and self.commit.overlap
+        if ov and not last:                                  # overlap: the reduction's start on the side stream, for the timing
+            self.commit.side_t0 = st.get('side_t0') if st is not None else None
+        if not last and not ov and os.environ.get('FTV2_COMMIT_VERIFY', '1') == '1' and self.device.type == 'cuda':
             # A commit is valid only if its reduction really ended on the GPU with every peer (M3P4 5867778): the host enqueues
             # the reduction, the epilogue's adds and the commit's snapshot and token without waiting, so a reduction cut by a
             # lost peer still "commits" its partial sums; the stop's revoke later ends the cut kernel and the stream runs on.
@@ -374,7 +386,7 @@ class Recovery:
                     break
                 time.sleep(0.0005)
         flag = bool(self.hb.S.get('stop'))
-        stopping = flag or (not last and self._reduce_comm_error())
+        stopping = flag or (not last and not ov and self._reduce_comm_error())   # overlap: checked in promote()
         if stopping:
             # a counter for the tests: this micro-batch's sums are not committed (back to the last commit)
             self.refused = getattr(self, 'refused', 0) + 1
@@ -385,6 +397,46 @@ class Recovery:
         self.hb.S['micro_batch'] = self.commit.added           # the heartbeat line's micro-batch (and the tests' injection point)
         if stopping:
             raise self.hb.StopForRecovery('a stop began during a micro-batch epilogue')
+
+    # ------------------------------------------------------------------ FTV2_COMMIT_OVERLAP=1 (rc_commit, "Overlap")
+    def _overlap_ok(self):
+        return not self.hb.S.get('stop') and not self._reduce_comm_error()
+
+    def _overlap_before(self):
+        """Before the next commit's reduction is enqueued on the side stream: the commit in flight is promoted first (the host
+        waits only if the side stream is a whole commit interval behind). A stop, or an error on a reduction communicator,
+        refuses it: back to the last promoted commit and leave, as _commit_after does for a synchronous commit."""
+        t0 = time.time()
+        r = self.commit.promote(True, lambda: bool(self.hb.S.get('stop')), self._overlap_ok)
+        self.ov_wait.append(time.time() - t0)
+        if r != 'refused':
+            return
+        flag = bool(self.hb.S.get('stop'))
+        self.refused = getattr(self, 'refused', 0) + 1
+        self.log(f'commit refused: step {self.commit.step} micro-batch {self.commit.pend["c"] if self.commit.pend else "?"} (in '
+                 f'flight; {"the stop flag was set" if flag else "a reduction communicator reports an error"}); back to commit '
+                 f'{self.commit.c}; refused so far {self.refused}')
+        self.commit.after_epilogue(True, False)
+        raise self.hb.StopForRecovery('a stop began while a commit was in flight')
+
+    def _overlap_end(self):
+        """The step's end (before ReduceTiedGrads and ReduceGrads): the last commit in flight promoted (a refusal is left to the
+        last reduction's epilogue, which finds the stop flag), and one line with this step's side-stream times. Called twice
+        per step (both instructions); the second call finds nothing to do."""
+        if self.commit.pend is None and not self.commit.ov_ms:
+            return
+        t0 = time.time()
+        r = self.commit.promote(True, lambda: bool(self.hb.S.get('stop')), self._overlap_ok)
+        self.ov_wait.append(time.time() - t0)
+        ms, w = self.commit.ov_ms, self.ov_wait
+        if r != 'pending' and (ms or w):
+            red = [a for a, _ in ms if a is not None]
+            body = [b for _, b in ms]
+            f = lambda xs: (f'{sum(xs) / len(xs):.1f} mean, {min(xs):.1f}-{max(xs):.1f}' if xs else '-')
+            self.log(f'commit overlap step {self.commit.step}: {len(ms)} commits promoted ({r} at the end); side stream ms per '
+                     f'commit: reduction + ZeRO epilogue {f(red)}, commit work {f(body)}; the host waited {1000 * sum(w):.0f} ms '
+                     f'in all for commits in flight (max {1000 * max(w) if w else 0:.0f})')
+        self.commit.ov_ms, self.ov_wait = [], []
 
     # ------------------------------------------------------------------ milestone 3 C hooks (rc_pipe_c, rc_c_flow)
     def c_sync(self):

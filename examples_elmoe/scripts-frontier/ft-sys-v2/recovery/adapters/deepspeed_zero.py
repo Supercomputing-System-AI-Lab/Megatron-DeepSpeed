@@ -332,7 +332,7 @@ class ZeroAdapter:
         except Exception:
             return 0
 
-    def install_pipe_commits(self, k, start):
+    def install_pipe_commits(self, k, start, overlap=None):
         """Reduce the stage's gradients after every k-th backward pass, with ZeRO-1's own code, in place of the one reduction
         after the last backward. Why it is DeepSpeed's code and nothing else (stage_1_and_2.py, DeepSpeed 0.15.5):
           - under the pipeline DeepSpeed turns overlap_comm off (engine.py:1711), so ZeRO-1 has no gradient hooks and the
@@ -348,7 +348,21 @@ class ZeroAdapter:
         start() is called at every train_batch and returns (J, drop_until): the step runs micro-batches J..m-1 (the engine's
         micro_batches set to m - J for this call; the loss scale stays 1/m, DeepSpeedEngine.backward), and a stage whose
         sums already hold micro-batches J..drop_until-1 drops their gradients instead of reducing them.
-        Returns the state dict {'pos': micro-batches of this step done here, 'spaced': True inside a spaced reduction}."""
+        Returns the state dict {'pos': micro-batches of this step done here, 'spaced': True inside a spaced reduction}.
+
+        overlap (FTV2_COMMIT_OVERLAP=1; None otherwise): {'side': a stream, 'before': fn, 'end': fn}. The reduction then runs on
+        the side stream and the host goes on to the gradient send and the next forward without waiting for it:
+          - 'before'() first (the controller promotes the commit still in flight, or raises the stop): one in flight at a time;
+          - an event on the compute stream at the backward's end; every gradient handed to the reduction is marked as used by the
+            side stream (record_stream), because ZeRO frees it on the host as soon as it is copied into its bucket
+            (stage_1_and_2.py:965-966) and the next backward's allocations on the compute stream must not reuse its memory
+            before the side stream has read it; the side stream waits for the event, then ZeRO's own reduce_gradients and its
+            epilogue (with the commit's work, rc_commit) are enqueued there: DeepSpeed takes the current stream for its
+            buckets, collectives and copies when overlap_comm is off (stage_1_and_2.py:1054-1061, :1384-1392, :1531-1538), so nothing of
+            DeepSpeed changes. After it every .grad is None (the epilogue's zero_grad), so the next backward writes new tensors;
+          - the step's end (ReduceTiedGrads, ReduceGrads) calls 'end'() and makes the compute stream wait for the side stream
+            before anything reads the partition sums (the tied exchange, the last reduction's adds, the optimizer step).
+        FTV2_COMMIT_AT=send is ignored with overlap (nothing is kept waiting for a reduction)."""
         import os
         from deepspeed.runtime.pipe import schedule as pipe_sched
         eng, z = self.engine, self.zero
@@ -356,7 +370,7 @@ class ZeroAdapter:
         # instruction that sends this micro-batch's input gradient to the previous stage (SendGrad, issued at the stage's next
         # forward step, pipe/schedule.py:213-216), so the previous stage is not kept waiting for its gradient while this stage
         # reduces. The first stage sends no gradient: it reduces right after its backward either way.
-        at = os.environ.get('FTV2_COMMIT_AT', 'backward')
+        at = os.environ.get('FTV2_COMMIT_AT', 'backward') if overlap is None else 'backward'
         defer = at == 'send' and not eng.is_first_stage()
         st = {'pos': 0, 'drop_until': 0, 'm': int(eng.micro_batches), 'spaced': False, 'k': int(k), 'pending': False,
               'at': 'send' if defer else 'backward'}
@@ -369,10 +383,38 @@ class ZeroAdapter:
             z.is_gradient_accumulation_boundary = True
             st['spaced'] = True
             try:
-                z.reduce_gradients(pipeline_parallel=True)
+                if overlap is None:
+                    z.reduce_gradients(pipeline_parallel=True)
+                else:
+                    reduce_on_side()
             finally:
                 st['spaced'] = False
                 z.is_gradient_accumulation_boundary = prev
+
+        def reduce_on_side():
+            overlap['before']()                           # the previous commit promoted (or the stop raised)
+            side = overlap['side']
+            ev = torch.cuda.Event()
+            ev.record()                                   # the compute stream, after this backward
+            n = 0
+            for g in z.bit16_groups:
+                for p in g:
+                    for t in (p.grad, getattr(p, 'grad_accum', None)):
+                        if t is not None:
+                            t.record_stream(side)
+                            n += 1
+            st['side_marked'] = n
+            with torch.cuda.stream(side):
+                side.wait_event(ev)
+                t0 = torch.cuda.Event(enable_timing=True)
+                t0.record()
+                st['side_t0'] = t0                        # the reduction's start on the side stream (rc_controller reads it)
+                z.reduce_gradients(pipeline_parallel=True)
+
+        def settle_side():
+            if overlap is not None:
+                overlap['end']()
+                torch.cuda.current_stream().wait_stream(overlap['side'])
 
         def after_bwd():
             p = st['pos']
@@ -440,15 +482,24 @@ class ZeroAdapter:
         orig_tied = type(eng)._INSTRUCTION_MAP[pipe_sched.ReduceTiedGrads]
 
         def reduce_tied(self_):
+            settle_side()
             if tied and st['k'] < st['m']:
                 tied_exchange()
             orig_tied(self_)
+        orig_reduce = type(eng)._INSTRUCTION_MAP[pipe_sched.ReduceGrads]
+
+        def reduce_grads(self_):
+            settle_side()
+            orig_reduce(self_)
+        reduce_grads._ftv2_wrapped = True
         reduce_tied._ftv2_wrapped = True
         backward._ftv2_wrapped = True
         send_grad._ftv2_wrapped = True
         imap = dict(type(eng)._INSTRUCTION_MAP)
         imap[pipe_sched.BackwardPass] = backward
         imap[pipe_sched.ReduceTiedGrads] = reduce_tied
+        if overlap is not None:
+            imap[pipe_sched.ReduceGrads] = reduce_grads
         if defer:
             imap[pipe_sched.SendGrad] = send_grad
         eng._INSTRUCTION_MAP = imap

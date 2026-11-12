@@ -28,7 +28,24 @@ Two transports for the copy (FTV2_COMMIT_MODE; the user's comparison, the lead 1
         data-parallel group, so the partner receives its owner's reduced slices and drops them. The adapter's
         wrap_reduce_keep copies them into `piece` (the owner's partition layout) instead; after each micro-batch's epilogue the
         partner adds the piece to its copy, as the owner adds it to its sums (the same bf16 additions, in the same order). No
-        network; k = 1 only (every micro-batch is folded in). After a rebuild the copy is seeded once by p2p, as in p2p mode."""
+        network; k = 1 only (every micro-batch is folded in). After a rebuild the copy is seeded once by p2p, as in p2p mode.
+
+Overlap (FTV2_COMMIT_OVERLAP=1, under the pipeline only; 2026-11-12, the user's verdict on V1 of the overnight campaign: "please do
+it asynchronously"). Without it a commit's reduction runs on the compute stream between the stage's backward pass and its gradient
+send, and the stages' reductions follow one another (63B PP 4: 0.45 s per commit, the step 186.6 -> 415.6 s at k = 1). With it the
+adapter enqueues the reduction, ZeRO's epilogue and this commit's work on self.side, after an event recorded on the compute stream at
+the backward's end; the host goes on to the gradient send and the next forward at once. What changes here:
+  - the work is written into spare buffers (copy_spare, tok_spare; the snapshot is a fresh tensor as before) and kept in self.pend;
+    the rank's position (c, snapshots, copies, tokens) moves only in promote(), when the host sees the work's end event complete
+    and the stop flag still clear and no reduction communicator in error: the check FTV2_COMMIT_VERIFY made by waiting on the
+    stream after every commit, made when the commit's end is seen instead. Until then the last two promoted commits stay intact,
+    so decide_microbatch's rules (J or J + k; the copy at J or J - k) hold unchanged;
+  - one commit in flight: the adapter promotes the previous one before it enqueues the next reduction (the host waits there only
+    when the side stream is a whole commit interval behind); that also bounds the memory to one reduction's gradients;
+  - settle() before any use of the sums outside the side stream (a stop, the recovery's report, restore, target, copy, seed): a
+    commit still in flight is dropped (conservative: it may hold a cut reduction) and the current stream waits for the side one.
+Not built for level C (its cut checks wait on the stream at every commit): the controller keeps the reductions on the compute
+stream there."""
 import os
 import time
 
@@ -37,7 +54,7 @@ import torch.distributed as dist
 
 
 class Commit:
-    def __init__(self, adapter, rank, world, device, log, group=None, spaced=False):
+    def __init__(self, adapter, rank, world, device, log, group=None, spaced=False, overlap=False):
         self.ad, self.rank, self.world, self.device, self.log = adapter, rank, world, device, log
         self.spaced = spaced                                 # milestone 3: one reduction (and one epilogue) every k micro-batches
         self.stride = int(os.environ.get('FTV2_PARTNER_STRIDE', '8'))
@@ -64,6 +81,15 @@ class Commit:
         self.tok_pin = [torch.empty(2, dtype=torch.float64, pin_memory=True) for _ in range(2)] if self.cuda else None
         self.done_ev, self.inflight = None, None
         self.ms = []                                         # host time of each commit's launch
+        # overlap (FTV2_COMMIT_OVERLAP=1, the controller decides): the commit in flight (self.pend) writes into the spare buffers
+        self.overlap = bool(overlap and spaced and self.cuda)
+        self.pend, self.side_t0 = None, None
+        self.ov_ms = []                                      # per promoted commit: (reduction ms, commit work ms) on the side stream
+        if self.overlap:
+            self.copy_spare = [torch.zeros_like(t) for t in self.copy_cur]
+            self.tok_spare = torch.full((2,), -1.0, dtype=torch.float64, device=device)
+            self.tok_stream = torch.cuda.Stream(device=device)        # token reads that never queue behind a reduction
+            self.tok_pin_p = torch.empty(2, dtype=torch.float64, pin_memory=True)
         # the transport (FTV2_COMMIT_MODE): under the pipeline (spaced reductions) the default is "keep" (all-reduce + keep; the
         # user, 2026-11-06: "Alright for 2", m3_map question 4), when ZeRO's all-reduce path is configured; otherwise p2p
         # (milestone 2's default, and the only transport on the reduce path)
@@ -83,6 +109,7 @@ class Commit:
 
     def begin_step(self, step):
         """The top of an iteration: no micro-batch of this step is summed or committed yet."""
+        self.settle()                                        # overlap: the buffers below are zeroed on this stream
         self.step, self.added, self.c, self.snap_cur, self.snap_prev = int(step), 0, 0, None, None
         if self.mode == 'keep':                              # the owner's sums at micro-batch 0 of this step are zeros
             for t in self.copy_cur + self.copy_prev + self.piece:
@@ -120,6 +147,9 @@ class Commit:
             if self.piece is not None:
                 for t in self.piece:
                     t.zero_()
+            return
+        if self.overlap:
+            self._launch_overlap()
             return
         if self.mode == 'keep':
             self._keep_commit()
@@ -169,10 +199,13 @@ class Commit:
         if self.done_ev is not None and not self.done_ev.query():
             return [-1, -1]
         h = self.tok_pin[i]
-        with torch.cuda.stream(self.side):
+        s = self.tok_stream if self.overlap else self.side         # overlap: never behind a reduction on the side stream
+        with torch.cuda.stream(s):
+            if self.overlap and self.done_ev is not None:
+                s.wait_event(self.done_ev)
             h.copy_(t, non_blocking=True)
             ev = torch.cuda.Event()
-            ev.record(self.side)
+            ev.record(s)
         t0 = time.time()
         while not ev.query():
             if time.time() - t0 > limit_s:
@@ -198,8 +231,106 @@ class Commit:
         self.snap_prev, self.snap_cur, self.c = self.snap_cur, flats, self.added
         self.ms.append(round(1000 * (time.time() - t0), 2))
 
+    # ------------------------------------------------------------------ overlap (FTV2_COMMIT_OVERLAP=1)
+    def _launch_overlap(self):
+        """This commit's work after micro-batch `added`, enqueued on the caller's current stream (the side stream: the adapter runs
+        the reduction and ZeRO's epilogue there), into the spare buffers. The work is the same as the synchronous commit's (the
+        snapshot; keep: the owner's piece folded into its copy; p2p: the sums and the token sent to the partner, the owner's
+        received); only where it is written differs. The position moves in promote()."""
+        assert self.pend is None, 'a commit is in flight: the adapter promotes or drops it before the next reduction'
+        t0 = time.time()
+        step, pos = int(self.step), int(self.added)
+        mid = torch.cuda.Event(enable_timing=True)
+        mid.record()                                         # the reduction and ZeRO's epilogue end here on the side stream
+        flats = [self.ad.zero2_flat_partial(i) for i in self.groups]         # fresh copies: the snapshot S_pos
+        new, tok = self.copy_spare, self.tok_spare
+        if self.mode == 'keep':
+            for cur, base, pc in zip(new, self.copy_cur, self.piece):
+                if pos == self.k:
+                    cur.copy_(pc)                            # the owner's first commit of the step: its sums ARE the piece
+                else:
+                    torch.add(base, pc, out=cur)             # the owner's previous commit (promoted) + this interval's piece
+                pc.zero_()
+            tok[0].fill_(float(step)); tok[1].fill_(float(pos))
+            tok_h = [step, pos]
+        else:
+            tok.fill_(-1.0)
+            self.tok_send[0].fill_(float(step)); self.tok_send[1].fill_(float(pos))
+            works = dist.batch_isend_irecv([dist.P2POp(dist.isend, f, self.partner, group=self.pg) for f in flats] +
+                                           [dist.P2POp(dist.irecv, c, self.owner, group=self.pg) for c in new])
+            works += dist.batch_isend_irecv([dist.P2POp(dist.isend, self.tok_send, self.partner, group=self.pg),
+                                             dist.P2POp(dist.irecv, tok, self.owner, group=self.pg)])
+            for w in works:
+                w.wait()                                     # the side stream waits for the transfers (not the host)
+            tok_h = None                                     # read once the round is seen complete (promote)
+        ev = torch.cuda.Event(enable_timing=True)
+        ev.record()
+        self.pend = {'c': pos, 'flats': flats, 'copy': new, 'tok': tok, 'tok_h': tok_h, 'ev': ev, 'mid': mid,
+                     't0': self.side_t0}
+        self.side_t0 = None
+        self.ms.append(round(1000 * (time.time() - t0), 2))
+
+    def promote(self, block, stop_fn, ok_fn):
+        """The commit in flight becomes this rank's position once the host sees its end event complete and ok_fn() holds (no stop
+        begun, no reduction communicator in error): a reduction that ended because of a stop finds the stop flag set (it is set
+        before the revoke), as the synchronous check found it. block: poll until the end, giving up when stop_fn() turns true.
+        Returns 'none' (nothing in flight), 'done' (promoted), 'pending' (not ended, block False) or 'refused'."""
+        p = self.pend
+        if p is None:
+            return 'none'
+        while not p['ev'].query():
+            if not block:
+                return 'pending'
+            if stop_fn():
+                return 'refused'
+            time.sleep(0.0002)
+        if not ok_fn():
+            return 'refused'
+        if p['tok_h'] is None:                               # p2p: the owner's token arrived with its sums
+            p['tok_h'] = self._tok_read(p['tok'], p['ev'])
+        try:
+            red = p['t0'].elapsed_time(p['mid']) if p['t0'] is not None else None
+            self.ov_ms.append((round(red, 1) if red is not None else None, round(p['mid'].elapsed_time(p['ev']), 1)))
+        except Exception:
+            pass
+        self.copy_prev, self.copy_cur, self.copy_spare = self.copy_cur, p['copy'], self.copy_prev
+        self.tok_prev, self.tok_cur, self.tok_spare = self.tok_cur, p['tok'], self.tok_prev
+        self.tok_prev_h, self.tok_cur_h = self.tok_cur_h, p['tok_h']
+        self.snap_prev, self.snap_cur, self.c = self.snap_cur, p['flats'], p['c']
+        self.done_ev, self.pend = p['ev'], None
+        return 'done'
+
+    def _tok_read(self, t, ev, limit_s=2.0):
+        """A token's value once its round has ended (ev complete), copied on a stream of its own; None if not read in time."""
+        with torch.cuda.stream(self.tok_stream):
+            self.tok_stream.wait_event(ev)
+            self.tok_pin_p.copy_(t, non_blocking=True)
+            e2 = torch.cuda.Event()
+            e2.record(self.tok_stream)
+        t0 = time.time()
+        while not e2.query():
+            if time.time() - t0 > limit_s:
+                return None
+            time.sleep(0.0002)
+        return [int(x) for x in self.tok_pin_p.tolist()]
+
+    def rollback(self):
+        """Drop the commit in flight (a stop came before its end was seen): the position stays at the last promoted commit, whose
+        buffers it never touched; the spare buffers are spare again."""
+        if self.pend is not None:
+            self.log(f'commit in flight dropped: step {self.step} micro-batch {self.pend["c"]}; the position stays at {self.c}')
+            self.pend = None
+
+    def settle(self):
+        """Before the sums or the copies are used outside the side stream: the commit in flight is dropped and the current stream
+        waits for the side stream's work (a wait on the GPU; the host goes on)."""
+        if self.overlap:
+            self.rollback()
+            torch.cuda.current_stream().wait_stream(self.side)
+
     def restore_own(self, c):
         """Set my partial sums to my snapshot at commit position c (c = 0: zeros)."""
+        self.settle()
         snap = None if c == 0 else (self.snap_cur if c == self.c else self.snap_prev if c == self.c - self.k else 'missing')
         if snap == 'missing':
             raise RuntimeError(f'no snapshot of commit {c} (mine {self.c}, k {self.k})')
@@ -209,6 +340,7 @@ class Commit:
 
     def target(self, J):
         """My own sums at commit position J (flat per group; None = zeros)."""
+        self.settle()
         if J == 0:
             return None
         if J == self.c:
@@ -220,6 +352,7 @@ class Commit:
     def seed(self, step, J, flats):
         """After a rebuild at (step, J): every rank sends its sums S_J (flats, None = zeros) and the token to its partner, and
         receives its owner's (collective: new pairs after a join)."""
+        self.settle()
         send = flats if flats is not None else [torch.zeros_like(c) for c in self.copy_cur]
         self.tok_send[0].fill_(float(step)); self.tok_send[1].fill_(float(J))
         for w in dist.batch_isend_irecv([dist.P2POp(dist.isend, f, self.partner, group=self.pg) for f in send] +
@@ -236,12 +369,14 @@ class Commit:
     # ------------------------------------------------------------------ recovery
     def report(self):
         """After a stop (GPU idle): my last commit, and my owner's last two commits as their tokens say."""
+        self.settle()
         cur, prv = self._tok_host(0, self.tok_cur, self.tok_cur_h), self._tok_host(1, self.tok_prev, self.tok_prev_h)
         return {'commit_step': self.step, 'commit_c': self.c, 'commit_k': self.k,
                 'copy_cur': [int(cur[0]), int(cur[1])], 'copy_prev': [int(prv[0]), int(prv[1])]}
 
     def copy_of(self, step, J):
         """The owner's sums at (step, J) from my copies, or None."""
+        self.settle()
         cur, prv = self._tok_host(0, self.tok_cur, self.tok_cur_h), self._tok_host(1, self.tok_prev, self.tok_prev_h)
         if (int(cur[0]), int(cur[1])) == (step, J):
             return self.copy_cur
