@@ -99,8 +99,13 @@ def worker(rank, port, k, out, mode, scenario, record):
     g_start.record()
     g = [None] * len(SIZES)
     last_c = 0
+    iv_main, iv_side = [], []                                          # GPU intervals (events) of the compute and the side work
     for mb in range(M):
+        e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        e0.record()
         torch.cuda._sleep(int(main_ms * cyc_ms))                         # the backward's compute
+        e1.record()
+        iv_main.append((e0, e1))
         for i, n in enumerate(SIZES):
             p = torch.full((n,), val(rank, mb, i), device=dev)
             g[i] = p if g[i] is None else g[i] + p                       # autograd's accumulation: a new tensor
@@ -122,9 +127,12 @@ def worker(rank, port, k, out, mode, scenario, record):
             side.wait_event(ev)
             st = torch.cuda.Event(enable_timing=True)
             st.record()
+            ta1 = time.time()
             torch.cuda._sleep(int(side_ms * cyc_ms))                     # the reduction
+            ta2 = time.time()
             for i in range(len(SIZES)):                                  # ZeRO's epilogue: the reduced gradient into the sums
                 ad.avg[i] = [g[i].clone()] if not ad.avg.get(i) else [ad.avg[i][0] + g[i]]
+            ta3 = time.time()
             if mode == 'keep':                                           # the all-reduce hands the owner's piece of the interval
                 o = ad.keep[0]
                 for i in range(len(SIZES)):
@@ -132,13 +140,14 @@ def worker(rank, port, k, out, mode, scenario, record):
             c.side_t0 = st
             tb = time.time()
             c.after_epilogue(False, False, pos=pos)
+            iv_side.append((st, c.pend['ev']))
         tc = time.time()
         g = [None] * len(SIZES)                                          # ZeRO's zero_grad: the host lets the gradient go
         x = torch.ones(1 << 18, device=dev)
         dist.all_reduce(x, group=pg_main)                                # the pipeline's traffic on the compute stream
         td = time.time()
         res['launch_ms'].append(round(1000 * (td - t1), 1))
-        res['parts_ms'].append([round(1000 * v, 1) for v in (ta - t1, tb - ta, tc - tb, td - tc)])
+        res['parts_ms'].append([round(1000 * v, 1) for v in (ta - t1, ta1 - ta, ta2 - ta1, ta3 - ta2, tb - ta3, tc - tb, td - tc)])
         res['n_commits'] += 1
         last_c = pos
         if scenario == 'stop' and pos == STOP_AT:
@@ -156,6 +165,13 @@ def worker(rank, port, k, out, mode, scenario, record):
         res['gpu_total_ms'] = round(g_start.elapsed_time(g_end), 1)
         res['main_ms'], res['side_ms'] = main_ms, side_ms
         res['side_meas'] = [b for b in c.ov_ms]
+        T = lambda e: g_start.elapsed_time(e)
+        M_ = [(T(a), T(b)) for a, b in iv_main]
+        S_ = [(T(a), T(b)) for a, b in iv_side]
+        both = sum(max(0.0, min(b, d) - max(a, c_)) for a, b in M_ for c_, d in S_)
+        res['side_total'] = round(sum(d - c_ for c_, d in S_), 1)
+        res['concurrent'] = round(both, 1)
+        res['main_total'] = round(sum(b - a for a, b in M_), 1)
         for i in range(len(SIZES)):                                      # the engine's last reduction, on the compute stream
             if g[i] is not None:
                 ad.avg[i] = [ad.avg[i][0] + g[i]]
@@ -221,11 +237,13 @@ def overlap_line(rs):
         serial = M * r['main_ms'] + side
         frac = (serial - r['gpu_total_ms']) / side if side else 0.0
         best = (serial - max(M * r['main_ms'], r['main_ms'] + side)) / side if side else 0.0   # the most the streams can hide
-        out.append(f'r{r["rank"]} {r["gpu_total_ms"]:.0f} ms (serial {serial:.0f}): hidden {frac:.2f} of {best:.2f}')
+        out.append(f'r{r["rank"]} total {r["gpu_total_ms"]:.0f} ms, compute {r["main_total"]:.0f}, side work {r["side_total"]:.0f}, '
+                   f'side work concurrent with compute {r["concurrent"]:.0f} ({r["concurrent"] / max(r["side_total"], 1e-9):.2f})')
     parts = [p for r in rs for p in r['parts_ms']]
     worst = max(parts, key=sum) if parts else []
-    return (f'hw queues {rs[0]["hwq"]}; GPU time: ' + '; '.join(out) +
-            f'; slowest launch parts (record_stream, side enqueue, commit work, compute-stream all-reduce) ms {worst}')
+    return (f'hw queues {rs[0]["hwq"]}; ' + '; '.join(out) +
+            f'; slowest launch parts ms (record_stream, wait_event+record, sleep launch, epilogue adds, keep fill, commit work, '
+            f'all-reduce) {worst}')
 
 
 def main():
@@ -268,7 +286,7 @@ def main():
               f'{[r["exact"] for r in rs]}')
         if not good:
             fails.append(f'stop {mode} k={k}')
-    for hwq in ('8', '16'):                                           # the GPU's hardware queues per process (ROCm default 4)
+    for hwq in ('1', '8', '16'):                                           # the GPU's hardware queues per process (ROCm default 4)
         for mode, k in (('keep', 1), ('keep', 2)):
             n += 1
             codes, rs = run(mode, k, 'clean', True, n, {'GPU_MAX_HW_QUEUES': hwq})
