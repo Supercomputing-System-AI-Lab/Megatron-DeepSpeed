@@ -64,7 +64,15 @@ class Commit:
         self.asyn = os.environ.get('FTV2_COMMIT_ASYNC', '1') == '1'
         self.pg = group
         self.cuda = device.type == 'cuda'
-        self.side = torch.cuda.Stream(device=device) if self.cuda else None
+        # overlap: the side stream at high priority (FTV2_COMMIT_SIDE_PRIORITY=high, the default; 'normal' for the test's control).
+        # torch.cuda.Stream() hands out one of 32 shared pool streams, and ROCm maps streams onto GPU_MAX_HW_QUEUES hardware queues
+        # (default 4) per priority: a normal-priority side stream can share a hardware queue with the compute stream, and the GPU
+        # then runs the two one after the other (tests/gpu_commit_overlap_test.py, T1c 5911701: 0.40 of the side work concurrent
+        # with 8 queues, 0.00 with 1). High-priority streams take queues of their own; the synchronous collectives ZeRO issues
+        # (async_op=False) run on the current stream, so the reduction's RCCL kernels run there too.
+        self.side_prio = -1 if (overlap and spaced and self.cuda and
+                                os.environ.get('FTV2_COMMIT_SIDE_PRIORITY', 'high') == 'high') else 0
+        self.side = torch.cuda.Stream(device=device, priority=self.side_prio) if self.cuda else None
         self.groups = adapter.zero2_groups()
         self.step, self.added, self.c = None, 0, 0           # step; micro-batches added; last commit (micro-batches)
         self.snap_cur, self.snap_prev = None, None           # my S_c and S_{c-k} (flat per group), None = zeros
@@ -88,7 +96,7 @@ class Commit:
         if self.overlap:
             self.copy_spare = [torch.zeros_like(t) for t in self.copy_cur]
             self.tok_spare = torch.full((2,), -1.0, dtype=torch.float64, device=device)
-            self.tok_stream = torch.cuda.Stream(device=device)        # token reads that never queue behind a reduction
+            self.tok_stream = torch.cuda.Stream(device=device, priority=self.side_prio)   # token reads never behind a reduction
             self.tok_pin_p = torch.empty(2, dtype=torch.float64, pin_memory=True)
         # the transport (FTV2_COMMIT_MODE): under the pipeline (spaced reductions) the default is "keep" (all-reduce + keep; the
         # user, 2026-11-06: "Alright for 2", m3_map question 4), when ZeRO's all-reduce path is configured; otherwise p2p

@@ -72,6 +72,18 @@ def worker(rank, port, k, out, mode, scenario, record):
     dev = torch.device('cuda', torch.cuda.current_device())
     store = dist.TCPStore('127.0.0.1', port, 4, is_master=(rank == 0))
     dist.init_process_group('nccl', store=store, rank=rank, world_size=4, device_id=dev)
+    if os.environ.get('TEST_CROWD') == '1':      # like training: many pool streams and communicators exist before the commit's
+        crowd = [torch.cuda.Stream() for _ in range(40)]
+        for s_ in crowd:
+            with torch.cuda.stream(s_):
+                torch.ones(8, device=dev).add_(1)
+        for _ in range(6):
+            g_ = dist.new_group(list(range(4)))
+            y = torch.ones(1 << 10, device=dev)
+            dist.all_reduce(y, group=g_)
+            h_ = torch.ones(1 << 10, device=dev)
+            dist.all_reduce(h_, group=g_, async_op=True).wait()
+        torch.cuda.synchronize()
     pg = dist.new_group(list(range(4)))          # the commit's own communicator (the controller makes one)
     pg_main = dist.new_group(list(range(4)))     # the compute stream's traffic while the side stream works
     logs = []
@@ -286,16 +298,23 @@ def main():
               f'{[r["exact"] for r in rs]}')
         if not good:
             fails.append(f'stop {mode} k={k}')
-    for hwq in ('1', '8', '16'):                                           # the GPU's hardware queues per process (ROCm default 4)
-        for mode, k in (('keep', 1), ('keep', 2)):
+    variants = [({'GPU_MAX_HW_QUEUES': '1', 'FTV2_COMMIT_SIDE_PRIORITY': 'normal'}, 'hwq 1, normal side (serial control)')]
+    for crowd in ('0', '1'):
+        for hwq in ('4', '8'):
+            for prio in ('normal', 'high'):
+                variants.append(({'GPU_MAX_HW_QUEUES': hwq, 'FTV2_COMMIT_SIDE_PRIORITY': prio, 'TEST_CROWD': crowd},
+                                 f'hwq {hwq}, {prio} side, crowd {crowd}'))
+    for extra, name in variants:                                      # the GPU's hardware queues per process (ROCm default 4)
+        for mode, k in (('keep', 2), ('p2p', 2)):
+            hwq = name
             n += 1
-            codes, rs = run(mode, k, 'clean', True, n, {'GPU_MAX_HW_QUEUES': hwq})
+            codes, rs = run(mode, k, 'clean', True, n, extra)
             if codes != [0] * 4 or len(rs) != 4:
-                print(f'FAIL  clean {mode} k={k} GPU_MAX_HW_QUEUES={hwq}: exit codes {codes}')
+                print(f'FAIL  clean {mode} k={k} [{hwq}]: exit codes {codes}')
                 fails.append(f'clean {mode} k={k} hwq {hwq}')
                 continue
             good = all(r['sums_exact'] and r['snap_exact'] and r['copy_exact'] and r['pos'] == r['want_pos'] for r in rs)
-            print(f'{"PASS" if good else "FAIL"}  clean {mode} k={k} GPU_MAX_HW_QUEUES={hwq}: exact on every rank: {good}')
+            print(f'{"PASS" if good else "FAIL"}  clean {mode} k={k} [{hwq}]: exact on every rank: {good}')
             print(f'      {overlap_line(rs)}')
             if not good:
                 fails.append(f'clean {mode} k={k} hwq {hwq}')
