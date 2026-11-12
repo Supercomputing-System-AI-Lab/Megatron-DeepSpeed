@@ -86,14 +86,17 @@ def worker(rank, port, k, out, mode, scenario, record):
     a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     a.record(); torch.cuda._sleep(int(5e7)); b.record(); torch.cuda.synchronize()
     cyc_ms = 5e7 / a.elapsed_time(b)
-    side_ms, main_ms = 120.0, 40.0              # the side stream is slower than one micro-batch: it falls behind (k = 1)
+    side_ms, main_ms = 60.0, 40.0               # a commit is longer than one micro-batch, shorter than two: hidden at k = 2
     w = torch.ones(1 << 18, device=dev)
     dist.all_reduce(w, group=pg_main)            # the communicators exist before the timed launches
     torch.cuda.synchronize()
     stop = {'v': False}
     stop_fn = lambda: stop['v']
     ok_fn = lambda: not stop['v']
-    res = {'rank': rank, 'k': k, 'mode': mode, 'scenario': scenario, 'record': record, 'launch_ms': [], 'wait_ms': []}
+    res = {'rank': rank, 'k': k, 'mode': mode, 'scenario': scenario, 'record': record, 'launch_ms': [], 'wait_ms': [],
+           'parts_ms': [], 'hwq': os.environ.get('GPU_MAX_HW_QUEUES', 'default'), 'n_commits': 0}
+    g_start = torch.cuda.Event(enable_timing=True)
+    g_start.record()
     g = [None] * len(SIZES)
     last_c = 0
     for mb in range(M):
@@ -114,6 +117,7 @@ def worker(rank, port, k, out, mode, scenario, record):
         if record:
             for t in g:
                 t.record_stream(side)
+        ta = time.time()
         with torch.cuda.stream(side):
             side.wait_event(ev)
             st = torch.cuda.Event(enable_timing=True)
@@ -126,11 +130,16 @@ def worker(rank, port, k, out, mode, scenario, record):
                 for i in range(len(SIZES)):
                     ad.keep[1][i].fill_(sum(val(o, j, i) for j in range(pos - k, pos)))
             c.side_t0 = st
+            tb = time.time()
             c.after_epilogue(False, False, pos=pos)
+        tc = time.time()
         g = [None] * len(SIZES)                                          # ZeRO's zero_grad: the host lets the gradient go
         x = torch.ones(1 << 18, device=dev)
         dist.all_reduce(x, group=pg_main)                                # the pipeline's traffic on the compute stream
-        res['launch_ms'].append(round(1000 * (time.time() - t1), 1))
+        td = time.time()
+        res['launch_ms'].append(round(1000 * (td - t1), 1))
+        res['parts_ms'].append([round(1000 * v, 1) for v in (ta - t1, tb - ta, tc - tb, td - tc)])
+        res['n_commits'] += 1
         last_c = pos
         if scenario == 'stop' and pos == STOP_AT:
             if rank == 0:                                                # rank 0 sees the commit's end before the stop
@@ -141,6 +150,12 @@ def worker(rank, port, k, out, mode, scenario, record):
     if scenario == 'clean':
         r = c.promote(True, stop_fn, ok_fn)                              # the step's end (the adapter's 'end')
         torch.cuda.current_stream().wait_stream(side)
+        g_end = torch.cuda.Event(enable_timing=True)
+        g_end.record()
+        torch.cuda.synchronize()
+        res['gpu_total_ms'] = round(g_start.elapsed_time(g_end), 1)
+        res['main_ms'], res['side_ms'] = main_ms, side_ms
+        res['side_meas'] = [b for b in c.ov_ms]
         for i in range(len(SIZES)):                                      # the engine's last reduction, on the compute stream
             if g[i] is not None:
                 ad.avg[i] = [ad.avg[i][0] + g[i]]
@@ -184,8 +199,9 @@ def worker(rank, port, k, out, mode, scenario, record):
     dist.destroy_process_group()
 
 
-def run(mode, k, scenario, record, n):
+def run(mode, k, scenario, record, n, extra=None):
     env = {kk: v for kk, v in os.environ.items() if 'proxy' not in kk.lower()}
+    env.update(extra or {})
     env['NCCL_P2P_DISABLE'] = '1'      # RCCL's wrong receive inside a node (2026-11-05) is not what this test is about
     out = os.path.join(os.environ.get('TMPDIR', '/tmp'), f'gpu_commit_ov_{os.getpid()}_{mode}{k}_{scenario}_{int(record)}')
     port = 26300 + os.getpid() % 500 + 7 * n
@@ -194,6 +210,22 @@ def run(mode, k, scenario, record, n):
     codes = [p.wait(timeout=600) for p in ps]
     rs = [json.load(open(f'{out}.{r}')) for r in range(4) if os.path.exists(f'{out}.{r}')]
     return codes, rs
+
+
+def overlap_line(rs):
+    """How much of the side stream's work the compute stream did NOT wait for: (serial - measured) / side work; 1 = all hidden,
+    0 = the two streams ran one after the other. serial = M micro-batches of compute + every commit's side work."""
+    out = []
+    for r in rs:
+        side = sum((a or 0) + b for a, b in r['side_meas'])
+        serial = M * r['main_ms'] + side
+        frac = (serial - r['gpu_total_ms']) / side if side else 0.0
+        best = (serial - max(M * r['main_ms'], r['main_ms'] + side)) / side if side else 0.0   # the most the streams can hide
+        out.append(f'r{r["rank"]} {r["gpu_total_ms"]:.0f} ms (serial {serial:.0f}): hidden {frac:.2f} of {best:.2f}')
+    parts = [p for r in rs for p in r['parts_ms']]
+    worst = max(parts, key=sum) if parts else []
+    return (f'hw queues {rs[0]["hwq"]}; GPU time: ' + '; '.join(out) +
+            f'; slowest launch parts (record_stream, side enqueue, commit work, compute-stream all-reduce) ms {worst}')
 
 
 def main():
@@ -212,6 +244,7 @@ def main():
         good = all(r['sums_exact'] and r['snap_exact'] and r['copy_exact'] and r['pos'] == r['want_pos'] and
                    r['token'] == [7, r['want_pos']] for r in rs)
         launch = max(max(r['launch_ms']) for r in rs)
+        print(f'      {overlap_line(rs)}')
         good = good and launch < 60                                   # the host never waited for the side stream at a launch
         print(f'{"PASS" if good else "FAIL"}  clean {mode} k={k}: position {rs[0]["pos"]} (want {rs[0]["want_pos"]}); sums, '
               f'snapshots, copies exact on every rank: {[(r["sums_exact"], r["snap_exact"], r["copy_exact"]) for r in rs]}; '
@@ -235,6 +268,19 @@ def main():
               f'{[r["exact"] for r in rs]}')
         if not good:
             fails.append(f'stop {mode} k={k}')
+    for hwq in ('8', '16'):                                           # the GPU's hardware queues per process (ROCm default 4)
+        for mode, k in (('keep', 1), ('keep', 2)):
+            n += 1
+            codes, rs = run(mode, k, 'clean', True, n, {'GPU_MAX_HW_QUEUES': hwq})
+            if codes != [0] * 4 or len(rs) != 4:
+                print(f'FAIL  clean {mode} k={k} GPU_MAX_HW_QUEUES={hwq}: exit codes {codes}')
+                fails.append(f'clean {mode} k={k} hwq {hwq}')
+                continue
+            good = all(r['sums_exact'] and r['snap_exact'] and r['copy_exact'] and r['pos'] == r['want_pos'] for r in rs)
+            print(f'{"PASS" if good else "FAIL"}  clean {mode} k={k} GPU_MAX_HW_QUEUES={hwq}: exact on every rank: {good}')
+            print(f'      {overlap_line(rs)}')
+            if not good:
+                fails.append(f'clean {mode} k={k} hwq {hwq}')
     n += 1
     codes, rs = run('keep', 1, 'clean', False, n)                     # control: no record_stream
     caught = codes != [0] * 4 or len(rs) != 4 or not all(r['sums_exact'] and r['snap_exact'] for r in rs)
