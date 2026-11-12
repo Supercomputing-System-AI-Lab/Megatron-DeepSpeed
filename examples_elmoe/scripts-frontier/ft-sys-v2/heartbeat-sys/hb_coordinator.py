@@ -23,6 +23,7 @@ Recovery (2026-11-06, ft-sys-v2/recovery/): a list whose plan replaces a node al
 The standby is then taken and the replaced node retired: neither is used or judged again. The recovered training writes its
 lines under a new run id (<run>.g<gen>), which the coordinator watches as a new run."""
 import json
+import re
 import os
 import time
 
@@ -32,6 +33,8 @@ STACK_WAIT = float(os.environ.get('FTV2_STACK_WAIT_S', '150'))   # seconds to wa
                                                                 #   (two dumps of at most 15 s, the evidence: a probe of up to 2 min)
 HOLD = 60.0              # seconds before the same suspect is sampled again after an ambiguous answer
 SUMMARY = float(os.environ.get('FTV2_SLOW_BEAT_S', '60'))
+STUCK_REDO = os.environ.get('FTV2_STUCK_REDO') == '1'           # experiment 5 (2026-11-12): a stall with no culprit is redone in place
+STUCK_REDO_MAX = int(os.environ.get('FTV2_STUCK_REDO_MAX', '1'))  # redos per run before a stall stops it (off by default)
 OOM_RECONFIG = os.environ.get('FTV2_OOM_RECONFIG', '1') == '1'   # out of memory: re-configure with the OOM ladder (on by default)
 
 
@@ -45,6 +48,7 @@ class Coordinator:
         self.track = hb_rules.Track()
         self.incident = None
         self.done_runs = set()
+        self.redos = {}            # experiment 5: base run -> redos done
         self.warned = set()
         self.hold = {}
         self.next_summary = 0.0
@@ -114,10 +118,17 @@ class Coordinator:
         val = {'gen': g, 'run': run, 'kind': kind, 'node': node, 'suspect': suspect, 'ranks': b.get('rank_ids', []),
                'why': why, 'plan': self._plan(beats, node, kind), 't': round(time.time(), 3), 'by': self.me}
         sb = self._standby(beats, node, kind)
-        val.update(standby=sb, replace=bool(sb))
+        base = re.sub(r'(\.g\d+)+$', '', str(run))
+        redo = kind == 'stuck' and STUCK_REDO and self.redos.get(base, 0) < STUCK_REDO_MAX
+        if redo:                       # experiment 5: no node is replaced and no rank is lost; every rank stops, rebuilds, redoes
+            val.update(ranks=[], plan=f'redo the step in place (FTV2_STUCK_REDO=1): every communicator aborted, the same world '
+                       f'rebuilt, each rank restores its own state; redo {self.redos.get(base, 0) + 1} of {STUCK_REDO_MAX}; no node replaced')
+        val.update(standby=sb, replace=bool(sb) or redo, redo=redo)
         ok = self.etcd.create_if_absent(f'failed/{g}', json.dumps(val), fence=('coordinator', self.me))
         if ok:
             self.done_runs.add(run)
+            if redo:
+                self.redos[base] = self.redos.get(base, 0) + 1
             if sb:
                 self.taken.add(sb)
                 self.retired.add(node)

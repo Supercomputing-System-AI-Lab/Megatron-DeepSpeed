@@ -284,7 +284,7 @@ class Agent:
             return
         write_json(failed_path(self.dir), f)
         self.log(f'failure list {f.get("gen")} copied to {failed_path(self.dir)}: {f.get("kind")} on {f.get("node")}')
-        if f.get('replace') and f.get('node') == self.node:
+        if f.get('replace') and f.get('node') == self.node and not f.get('redo'):   # a redo in place (experiment 5) keeps every rank
             grace = float(os.environ.get('FTV2_VICTIM_GRACE_S', '20'))
             threading.Timer(grace, self.end_my_ranks, args=(f,)).start()
         if f.get('standby') == self.node:

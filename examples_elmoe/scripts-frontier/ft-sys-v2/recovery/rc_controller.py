@@ -496,7 +496,7 @@ class Recovery:
             self.standby_event.set()
             return
         if self.c_mode and self.commit is not None and self.rank not in set(int(r) for r in f.get('ranks', [])) \
-                and f.get('replace'):
+                and f.get('replace') and not f.get('redo'):   # a redo in place (experiment 5) takes the full rebuild
             self.failure = f
             self.mark(g, 'list_written')
             self.T[g]['list_written'] = f.get('t')

@@ -55,6 +55,23 @@ class StopForRecovery(Exception):
     """Raised by the counter in the main thread once the recovery's stop has begun (S['stop']): the trainer leaves its step."""
 
 
+# experiment 5 (2026-11-12): the collectives a skip injection may leave out (every rank of the group must enter them)
+SKIPPABLE = ('all_reduce', 'all_to_all_single', 'all_to_all', 'all_gather_into_tensor', '_all_gather_base', 'reduce_scatter_tensor',
+             '_reduce_scatter_base')
+
+
+class _SkippedWork:
+    """What a skipped asynchronous collective returns (experiment 5): it never ran, so it reports itself complete."""
+    def wait(self, timeout=None):
+        return True
+
+    def is_completed(self):
+        return True
+
+    def is_success(self):
+        return True
+
+
 def _parse_inject():
     out = []
     for item in filter(None, os.environ.get('FTV2_INJECT', '').split(',')):
@@ -79,15 +96,25 @@ def _inject():
         if j['done'] or S['step'] < j['step'] or not _rank_in(j['rank']):
             continue
         k = j['kind']
-        if k in ('kill', 'hang', 'hip', 'hipabort', 'hwfault', 'dhang', 'nodump', 'abort', 'exit') and j['arg'] and \
+        if k in ('kill', 'hang', 'hip', 'hipabort', 'hwfault', 'dhang', 'nodump', 'abort', 'exit', 'skip', 'skipgen') and j['arg'] and \
                 S['step'] == j['step'] and \
                 S['micro_batch'] < j['arg']:
             continue                                   # kind:<rank>:<step>:<micro-batch>: wait for that micro-batch of the step
         if k == 'slow':
             time.sleep(j['arg'] / 1000.0)              # every call from this step on: a slow rank, not a hang
             continue
+        if k == 'skipgen':                             # experiment 5 (2026-11-12), persistent: one collective skipped once in every
+            run = os.environ.get('FTV2_RUN')           # generation of the run (begin_generation renames the run after a recovery)
+            if j.get('fired_run') == run:
+                continue
+            j['fired_run'] = run
+            _log(f'injecting skipgen at step {S["step"]}, call {S["calls"]} (run {run})')
+            S['skip_next'] = True
+            continue
         j['done'] = True
         _log(f'injecting {k} at step {S["step"]}, call {S["calls"]}')
+        if k == 'skip':                                # experiment 5 (2026-11-12): this rank does not enter its next collective (once);
+            S['skip_next'] = True                      # its peers wait in it: a collective with one fewer entered op
         if k == 'hang':
             while True:                                # before the count: this rank stays behind, its process lives on
                 time.sleep(3600)
@@ -417,6 +444,10 @@ def install_counter():
 
                 def wrapped(*a, _f=f, _gi=gi, _ai=ai, **k):
                     _count()
+                    if S.get('skip_next') and not getattr(_TL, 'depth', 0) and _f.__name__ in SKIPPABLE:
+                        S['skip_next'] = False             # experiment 5: the skip injection, the call is counted but never entered
+                        _log(f'skip: {_f.__name__} not entered by this rank (call {S["calls"]}, step {S["step"]})')
+                        return _SkippedWork() if (_ai is not None and _asked_async(a, k, _ai)) else None
                     nested = getattr(_TL, 'depth', 0)
                     if S['c_trace'] is not None and not nested:  # the outer call only (torch's recv calls irecv, batch_isend_irecv irecv)
                         _trace(_f.__name__, _gi, a, k)
