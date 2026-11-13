@@ -396,11 +396,42 @@ class ZeroAdapter:
         orig_sgrad = type(eng)._INSTRUCTION_MAP[pipe_sched.SendGrad]
         # Test-only knobs (2026-11-12, the 63B overlap runs turned NaN in step 2 or 3 while the gradient norm of the step before
         # equalled the synchronous run's; the 10B overlap runs were bit-identical):
-        #   FTV2_NAN_CHECK=1: at every optimizer step, count the non-finite values in the partition sums before the step and in
-        #     this rank's 16-bit parameters after it (one host wait per step), so a bad update is told apart from a bad forward;
+        #   FTV2_NAN_CHECK=1: at every optimizer step, count the tensors holding a non-finite value among the partition sums
+        #     before the step and this rank's 16-bit parameters after it (one host wait per step), so a bad update is told apart
+        #     from a bad forward; =2 also flags, per micro-batch and with no host wait (read at the optimizer step), a non-finite
+        #     value in: the stage's forward output (the loss on the last stage), the activation it received, the input gradient
+        #     it computed, the gradient it received; so a value broken in a transfer is told apart from one broken in compute.
+        #     The test is max and min (both propagate NaN), so no bool copy of a large tensor is made on a full GPU;
         #   FTV2_SIDE_DELAY_MS=<ms> (overlap only): sleep that long on the side stream before each reduction, so a reduction
         #     outlasts a micro-batch at 10B as it does at 63B (480-750 ms against 320 ms of compute).
-        nan_chk = os.environ.get('FTV2_NAN_CHECK', '0') == '1'
+        nan_lvl = int(os.environ.get('FTV2_NAN_CHECK', '0') or 0)
+        nan_chk = nan_lvl >= 1
+        NAN_KINDS = ('forward output', 'received activation', 'input gradient', 'received gradient')
+        if nan_lvl >= 2:
+            st['nanf'] = torch.zeros(len(NAN_KINDS), st['m'] + 8, dtype=torch.int32, device=torch.cuda.current_device())
+            st['nanc'] = [0] * len(NAN_KINDS)
+
+        def floats(x, out):
+            if torch.is_tensor(x):
+                if x.is_floating_point() and x.numel():
+                    out.append(x)
+            elif isinstance(x, (list, tuple)):
+                for u in x:
+                    floats(u, out)
+            return out
+
+        def bad(t):                                       # 0-dim int32 on the GPU: 1 if t holds a NaN or an infinity
+            d = t.detach()
+            return (~torch.isfinite(torch.stack([d.amax().float(), d.amin().float()]))).any().to(torch.int32)
+
+        def flag(kind, x):                                # FTV2_NAN_CHECK=2: no host wait
+            if nan_lvl < 2:
+                return
+            ts = floats(x, [])
+            i = st['nanc'][kind]
+            st['nanc'][kind] = i + 1
+            if ts and i < st['nanf'].shape[1]:
+                st['nanf'][kind, i] = torch.stack([bad(t) for t in ts]).amax()
         side_delay = float(os.environ.get('FTV2_SIDE_DELAY_MS', '0') or 0) if overlap is not None else 0.0
         if side_delay > 0:                                # cycles of torch.cuda._sleep per ms on this GPU, measured once
             torch.cuda.synchronize()
@@ -484,6 +515,9 @@ class ZeroAdapter:
 
         def backward(self_, buffer_id):
             orig_bwd(self_, buffer_id)
+            if nan_lvl >= 2:
+                inp = self_.pipe_buffers['inputs'][buffer_id]
+                flag(2, [getattr(t, 'grad', None) for t in (inp if isinstance(inp, (list, tuple)) else [inp])])
             st['pos'] += 1
             if st.get('c_bwd_only'):                      # milestone 3 C (rc_pipe_c): the commit runs apart, so that it can
                 return                                    # run again without the backward
@@ -547,11 +581,27 @@ class ZeroAdapter:
             orig_reduce(self_)
         orig_opt = type(eng)._INSTRUCTION_MAP[pipe_sched.OptimizerStep]
 
-        def nonfinite(ts):                                # (count, numel), one host wait
+        orig_fwd = type(eng)._INSTRUCTION_MAP[pipe_sched.ForwardPass]
+        orig_ract = type(eng)._INSTRUCTION_MAP[pipe_sched.RecvActivation]
+        orig_rgrad = type(eng)._INSTRUCTION_MAP[pipe_sched.RecvGrad]
+
+        def fwd_chk(self_, buffer_id):
+            orig_fwd(self_, buffer_id)
+            flag(0, self_.loss if self_.is_last_stage() else self_.pipe_buffers['outputs'][buffer_id])
+
+        def ract_chk(self_, buffer_id):
+            orig_ract(self_, buffer_id)
+            flag(1, self_.pipe_buffers['inputs'][buffer_id])
+
+        def rgrad_chk(self_, buffer_id):
+            orig_rgrad(self_, buffer_id)
+            flag(3, self_.grad_layer)
+
+        def nonfinite(ts):                                # (tensors with a non-finite value, tensors), one host wait
             ts = [t for t in ts if t is not None and t.numel()]
             if not ts:
                 return 0, 0
-            return int(torch.stack([(~torch.isfinite(t)).sum() for t in ts]).sum().item()), sum(t.numel() for t in ts)
+            return int(torch.stack([bad(t) for t in ts]).sum().item()), len(ts)
 
         def opt_step(self_):
             if not nan_chk:
@@ -560,9 +610,19 @@ class ZeroAdapter:
             g = nonfinite([t for i in sorted(ag) for t in (ag.get(i) or [])])
             orig_opt(self_)
             p = nonfinite([q for grp in z.bit16_groups for q in grp])
+            mb = ''
+            if nan_lvl >= 2:
+                f = st['nanf'].cpu()
+                parts = []
+                for k, name in enumerate(NAN_KINDS):
+                    n = min(st['nanc'][k], f.shape[1])
+                    idx = [i for i in range(n) if int(f[k, i])]
+                    parts.append(f'{name} {len(idx)} of {st["nanc"][k]} (first {idx[:6]})')
+                mb = '; per micro-batch, non-finite: ' + ', '.join(parts)
             import torch.distributed as dist
-            print(f'[ftv2 nan-check rank {dist.get_rank()}] step {getattr(eng, "global_steps", -1)}: non-finite in the partition '
-                  f'sums before the step {g[0]} of {g[1]}; in the 16-bit parameters after the step {p[0]} of {p[1]}', flush=True)
+            print(f'[ftv2 nan-check rank {dist.get_rank()}] step {getattr(eng, "global_steps", -1)}: tensors with a non-finite '
+                  f'value: partition sums before the step {g[0]} of {g[1]}; 16-bit parameters after the step {p[0]} of {p[1]}{mb}',
+                  flush=True)
         reduce_grads._ftv2_wrapped = True
         reduce_tied._ftv2_wrapped = True
         backward._ftv2_wrapped = True
@@ -573,6 +633,12 @@ class ZeroAdapter:
         imap[pipe_sched.ReduceTiedGrads] = reduce_tied
         if nan_chk:
             imap[pipe_sched.OptimizerStep] = opt_step
+        if nan_lvl >= 2:
+            for f_ in (fwd_chk, ract_chk, rgrad_chk):
+                f_._ftv2_wrapped = True
+            imap[pipe_sched.ForwardPass] = fwd_chk
+            imap[pipe_sched.RecvActivation] = ract_chk
+            imap[pipe_sched.RecvGrad] = rgrad_chk
         if overlap is not None:
             imap[pipe_sched.ReduceGrads] = reduce_grads
         if defer:
@@ -583,6 +649,9 @@ class ZeroAdapter:
         def train_batch(data_iter=None):
             J, drop = start()
             st['pos'], st['drop_until'], st['pending'] = int(J), int(drop), False
+            if nan_lvl >= 2:
+                st['nanc'] = [0] * len(NAN_KINDS)
+                st['nanf'].zero_()
             if st.get('c_replay_pos') is not None:        # milestone 3 C's joiner: the whole schedule, positions from its plan
                 st['pos'], st['drop_until'] = st['c_replay_pos']
                 st['c_replay_pos'], J = None, 0
