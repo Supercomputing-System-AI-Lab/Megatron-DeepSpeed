@@ -394,6 +394,22 @@ class ZeroAdapter:
               'at': 'send' if defer else 'backward'}
         orig_bwd = type(eng)._INSTRUCTION_MAP[pipe_sched.BackwardPass]
         orig_sgrad = type(eng)._INSTRUCTION_MAP[pipe_sched.SendGrad]
+        # Test-only knobs (2026-11-12, the 63B overlap runs turned NaN in step 2 or 3 while the gradient norm of the step before
+        # equalled the synchronous run's; the 10B overlap runs were bit-identical):
+        #   FTV2_NAN_CHECK=1: at every optimizer step, count the non-finite values in the partition sums before the step and in
+        #     this rank's 16-bit parameters after it (one host wait per step), so a bad update is told apart from a bad forward;
+        #   FTV2_SIDE_DELAY_MS=<ms> (overlap only): sleep that long on the side stream before each reduction, so a reduction
+        #     outlasts a micro-batch at 10B as it does at 63B (480-750 ms against 320 ms of compute).
+        nan_chk = os.environ.get('FTV2_NAN_CHECK', '0') == '1'
+        side_delay = float(os.environ.get('FTV2_SIDE_DELAY_MS', '0') or 0) if overlap is not None else 0.0
+        if side_delay > 0:                                # cycles of torch.cuda._sleep per ms on this GPU, measured once
+            torch.cuda.synchronize()
+            ea, eb = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            ea.record()
+            torch.cuda._sleep(int(2e7))
+            eb.record()
+            eb.synchronize()
+            st['cyc_ms'] = 2e7 / max(ea.elapsed_time(eb), 1e-3)
 
         def reduce_now():
             st['red_t0'] = time.time()                    # milestone 3 C: was this reduction cut by a loss after it began?
@@ -440,6 +456,8 @@ class ZeroAdapter:
             st['side_marked'] = n
             with torch.cuda.stream(side):
                 side.wait_event(ev)
+                if side_delay > 0:
+                    torch.cuda._sleep(int(side_delay * st['cyc_ms']))
                 t0 = torch.cuda.Event(enable_timing=True)
                 t0.record()
                 st['side_t0'] = t0                        # the reduction's start on the side stream (rc_controller reads it)
@@ -527,13 +545,34 @@ class ZeroAdapter:
         def reduce_grads(self_):
             settle_side()
             orig_reduce(self_)
+        orig_opt = type(eng)._INSTRUCTION_MAP[pipe_sched.OptimizerStep]
+
+        def nonfinite(ts):                                # (count, numel), one host wait
+            ts = [t for t in ts if t is not None and t.numel()]
+            if not ts:
+                return 0, 0
+            return int(torch.stack([(~torch.isfinite(t)).sum() for t in ts]).sum().item()), sum(t.numel() for t in ts)
+
+        def opt_step(self_):
+            if not nan_chk:
+                return orig_opt(self_)
+            ag = z.averaged_gradients if isinstance(z.averaged_gradients, dict) else {}
+            g = nonfinite([t for i in sorted(ag) for t in (ag.get(i) or [])])
+            orig_opt(self_)
+            p = nonfinite([q for grp in z.bit16_groups for q in grp])
+            import torch.distributed as dist
+            print(f'[ftv2 nan-check rank {dist.get_rank()}] step {getattr(eng, "global_steps", -1)}: non-finite in the partition '
+                  f'sums before the step {g[0]} of {g[1]}; in the 16-bit parameters after the step {p[0]} of {p[1]}', flush=True)
         reduce_grads._ftv2_wrapped = True
         reduce_tied._ftv2_wrapped = True
         backward._ftv2_wrapped = True
         send_grad._ftv2_wrapped = True
+        opt_step._ftv2_wrapped = True
         imap = dict(type(eng)._INSTRUCTION_MAP)
         imap[pipe_sched.BackwardPass] = backward
         imap[pipe_sched.ReduceTiedGrads] = reduce_tied
+        if nan_chk:
+            imap[pipe_sched.OptimizerStep] = opt_step
         if overlap is not None:
             imap[pipe_sched.ReduceGrads] = reduce_grads
         if defer:
