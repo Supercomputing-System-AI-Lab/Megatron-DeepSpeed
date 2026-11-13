@@ -55,6 +55,12 @@ seconds later; resubmit with the resume riders (`AUTORUN_LOAD_DIR`/`AUTORUN_SAVE
 
 ## Run from a fresh clone
 
+**Members of gen150 (2026-11-13):** every outside file a run needs has a readable copy under
+`/lustre/orion/world-shared/gen150/zixianw4` (the venv, ROCm 7.14.1 for gfx90a, the aws-ofi-nccl plugin, etcd, and the GPT-2
+data and vocabulary the runs use since 2026-11-11). `. env/shared_gen150_env.sh` sets the variables below to those copies and to
+this clone; then `bash env/ftv2_check_env.sh`. The DeepSeek tokenizer and data named in the table are no longer used or kept.
+The open problems of the 63B runs and how to reproduce them: `OPEN_63B_OVERLAP.md`.
+
 Every path a run reads is a variable of `env/ftv2_paths.sh`; a variable set in the shell wins. The defaults are the folders the
 runs used on 2026-11-06. Those in `/lustre/orion/world-shared/gen150` and `/opt` are readable by every member of gen150; those
 in `/lustre/orion/gen150/scratch/zixianw4` are not (the folder is `drwx------`). Another user sets the private ones to copies
