@@ -1,0 +1,305 @@
+#!/bin/bash
+# ftv2_job_min.slurm.template (ft-sys-v2, 2026-11-12): the job script of a ft-sys-v2 run, reduced to the lines such a run executes.
+# Not used yet: ftv2_run_common.sh still goes through local_autorun_frontier_0623_2026.sh and frontier_elmoe.slurm_0623_2026.template.
+# ftv2_launch_min.sh (this folder) fills the fields in double braces and submits it. Comments never contain a field: the fill
+# replaces text, and a multi-line value (PRE) would leave a comment.
+#
+# Source: frontier_elmoe.slurm_0623_2026.template (1,146 lines) as the 0623 launcher renders it for a ft-sys-v2 run (X-MOE, the EP
+# path, no checkpoint, no profiling), with the launcher's patches written in directly. Every kept command line is the rendered
+# line, unchanged. What was left out, and why:
+#   - branches a ft-sys-v2 run never takes: other MoE types, SFT_MODE, LC_MODE, INTRA_DOC, PIPE_MOE_AUX, the universal-checkpoint
+#     conversion, the profiling-cache collection, the planner;
+#   - settings PRE overwrites before training (FI_CXI_*, NCCL_SOCKET_IFNAME, TORCH_NCCL_ASYNC_ERROR_HANDLING, TORCH_EXTENSIONS_DIR,
+#     TRITON_CACHE_DIR), and with them the Triton cache warm-up, whose copy in /tmp no process reads afterwards;
+#   - the end-of-job log analysis and its SIGUSR1 guard: in ft-sys-v2 runs the rank logs are in ${JOB_DIR}/<arm>/, so it found
+#     no rank log; ft-sys-v2's own records are in ${JOB_DIR}/<arm>/ft/ (recovery/rc_report.py reads them);
+#   - lines with no reader: the environment printout step, the tensorboard and checkpoint folders, the Darshan settings
+#     (DARSHAN_DISABLE=1 turns Darshan off), NCCL_TIMEOUT(_MS), TRITON_PTXAS_NUM_WORKERS, DEBUG_ACTIVATION_OUTPUT;
+#   - the defaults of the tokenizer and the data: both are now required (FTV2_VOCAB_FILE, DATA_PATH).
+# Kept as found, on purpose: the ZeRO stage is 1 in the DeepSpeed json and in the arguments whatever the run asks (the 0623 template
+# does the same); --moe-train-capacity-factor and --save-interval appear twice (argparse keeps the last: 1.25); the X-MOE fallback
+# "--num-shared-experts 2 --swiglu" applies only when the model's registry entry declares no architecture field.
+#
+# Needs PRE (AUTORUN_PRE_CMD): the site's network settings and ROCm 7.14.1's libraries (NEWSTACK_PRE_CMD), the heartbeat
+# (heartbeat-sys/hb_start.sh) and the srun wrapper (recovery/launch/ftv2_srun.sh). Runs from examples_elmoe/scripts-frontier.
+
+# ---- Slurm ----------------------------------------------------------------------------------------------------------------------
+#SBATCH -A gen150
+#SBATCH -J {{MODEL_SIZE}}-ep-nbs{{NUM_BATCHES}}
+#SBATCH -o logs/job_%j_pp{{PP_SIZE}}_ep{{EP_PARALLEL_SIZE}}_X-MOE_ckpt_{{ACTIVATION_CHECKPOINT}}_planner_false/a-xmoe-ep-%j.o
+#SBATCH -e logs/job_%j_pp{{PP_SIZE}}_ep{{EP_PARALLEL_SIZE}}_X-MOE_ckpt_{{ACTIVATION_CHECKPOINT}}_planner_false/a-xmoe-ep-%j.e
+#SBATCH -t {{WALLTIME}}
+#SBATCH -p batch
+#SBATCH -N {{NODES}}
+#SBATCH -q {{QOS}}
+
+# ---- The run's layout (from the run file) -----------------------------------------------------------------------------------------
+BATCH_SIZE={{BATCH_SIZE}}
+NUM_BATCHES={{NUM_BATCHES}}
+PP_SIZE={{PP_SIZE}}
+EP_PARALLEL_SIZE={{EP_PARALLEL_SIZE}}
+MP_SIZE={{MP_SIZE}}
+NODES={{NODES}}
+TOTAL_GPUS={{TOTAL_GPUS}}
+TRAIN_ITERS={{TRAIN_ITERS}}
+MOE_TYPE="X-MOE"
+MODEL_SIZE="{{MODEL_SIZE}}"
+RUN_TYPE="ep"
+ACTIVATION_CHECKPOINT="{{ACTIVATION_CHECKPOINT}}"
+CHECKPOINT_NUM_LAYERS="{{CHECKPOINT_NUM_LAYERS}}"
+DYNAMIC_CHECKPOINT="False"
+UNEVEN_PP="False"
+ZERO_STAGE={{ZERO}}
+echo "MICRO_BATCH_SIZE $BATCH_SIZE NUM_BATCHES $NUM_BATCHES PP $PP_SIZE EP $EP_PARALLEL_SIZE TP $MP_SIZE NODES $NODES GPUS $TOTAL_GPUS ITERS $TRAIN_ITERS MODEL $MODEL_SIZE ACT_CKPT $ACTIVATION_CHECKPOINT/$CHECKPOINT_NUM_LAYERS"
+# 8 GPUs per training node, and the allocation's node count (ftv2_sbatch.sh adds the standby nodes to this check; keep its text)
+__gpn_guard=$(( TOTAL_GPUS / NODES )); if [ "${__gpn_guard}" -ne 8 ]; then echo "FATAL launch geometry: gpus_per_node=${__gpn_guard} (TOTAL_GPUS=${TOTAL_GPUS} / NODES=${NODES}); expected 8. Refusing to run at partial node occupancy."; exit 1; fi; if [ -n "${SLURM_NNODES:-}" ] && [ "${SLURM_NNODES}" -ne "${NODES}" ]; then echo "FATAL launch geometry: NODES=${NODES} but SLURM_NNODES=${SLURM_NNODES}."; exit 1; fi; echo "launch geometry OK: ${NODES} nodes x ${__gpn_guard} GCDs = ${TOTAL_GPUS}"
+ANALYZE_LOG_PROFILING_FLAG=""
+which python
+JOB_DIR="logs/job_${SLURM_JOB_ID}_pp{{PP_SIZE}}_ep{{EP_PARALLEL_SIZE}}_X-MOE_ckpt_{{ACTIVATION_CHECKPOINT}}_planner_false"
+echo "JOB_DIR: ${JOB_DIR}"
+# read by the X-MoE code (megatron/, deepspeed/)
+export DYNAMIC_CHECKPOINT=$DYNAMIC_CHECKPOINT
+export UNEVEN_PP=$UNEVEN_PP
+
+# ---- Darshan off (mpi4py links it; DARSHAN_DISABLE stops its start) -----------------------------------------------------------
+source /usr/share/lmod/lmod/init/bash 2>/dev/null || true
+module unload darshan-runtime 2>/dev/null || true
+DARSHAN_PRELOAD=""
+export DARSHAN_DISABLE=1
+
+# ---- Model and data ---------------------------------------------------------------------------------------------------------------
+export TRANSFORMERS_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export HF_HOME=$PWD/hfdata
+export OMP_NUM_THREADS=1
+export VOCAB_FILE={{VOCAB_FILE}}
+export DATA_PATH={{DATA_PATH}}
+DIR=`pwd`
+mkdir -p logs
+# the model's shape from examples_elmoe/utils/model_registry.py (HIDDEN_SIZE, FFN_HIDDEN_SIZE, NUM_LAYERS, ..., ARCH_FLAGS)
+CONFIG_VARS=$(python3 ../utils/model_registry.py get_vars --model_size "${MODEL_SIZE}")
+if [ $? -ne 0 ]; then
+    echo "Error: Model size '${MODEL_SIZE}' not found in registry."
+    exit 1
+fi
+eval "$CONFIG_VARS"
+{{SEQ_LEN_OVERRIDE}}
+echo "Model ${MODEL_SIZE}: HIDDEN_SIZE $HIDDEN_SIZE FFN_HIDDEN_SIZE $FFN_HIDDEN_SIZE NUM_LAYERS $NUM_LAYERS NUM_ATTN_HEADS $NUM_ATTN_HEADS EP_SIZE(experts) $EP_SIZE topk $topk SEQ_LEN $SEQ_LEN KV_HEADS $KV_HEADS"
+DS_SEQ_PAR_SIZE=${DS_SEQ_PAR_SIZE:-1}
+GLOBAL_BATCH_SIZE=$(( NUM_BATCHES * BATCH_SIZE * (TOTAL_GPUS / PP_SIZE / MP_SIZE / DS_SEQ_PAR_SIZE) ))
+echo "GLOBAL_BATCH_SIZE=$GLOBAL_BATCH_SIZE"
+
+# ---- Training parameters -----------------------------------------------------------------------------------------------------------
+LR=1.33e-4
+MIN_LR=1.33e-5
+TRAIN_TOKENS=11070000000
+WARMUP_TOKENS=100000000         # 200M tokens
+LR_DECAY_TOKENS=10970000000      # 9.8B = TRAIN_TOKENS - WARMUP_TOKENS
+EXIT_DURATION={{EXIT_MINS}}   # --exit-duration-in-mins: training stops cleanly before the wall time
+MLC=0.001
+MOE_TRAIN_CAP_FACTOR=1.0
+MOE_EVAL_CAP_FACTOR=1.0
+MOE_MIN_CAP=4
+MOE_DROP_TOKEN="${MOE_DROP_TOKEN:-true}"
+CL_ENABLED="false"
+CL_START_SEQLEN=80
+CL_AVG_SEQLEN=$(( (CL_START_SEQLEN + SEQ_LEN) / 2 ))
+CL_TOKENS=60
+CL_TOKENS=$((CL_TOKENS * 1000000000))
+CL_STEP=$(( CL_TOKENS / (GLOBAL_BATCH_SIZE * CL_AVG_SEQLEN) ))
+LOG_INTERVAL=1
+EVAL_ITERS=10
+EVAL_INTERVAL=300
+SAVE_INTERVAL=100
+INIT_STD=0.014
+NAME="gpt-${MODEL_SIZE}B-lr-${LR}-minlr-${MIN_LR}-bs-${GLOBAL_BATCH_SIZE}-gpus-${TOTAL_GPUS}-mp-${MP_SIZE}-pp-${PP_SIZE}-test"
+if [[ $EP_SIZE -gt 1 ]]; then
+    NAME="${NAME}-ep-${EP_SIZE}-mlc-${MLC}-cap-${MOE_TRAIN_CAP_FACTOR}-drop-${MOE_DROP_TOKEN}"
+fi
+OUTPUT_BASEPATH=$DIR/output
+
+# ---- wandb (online; the last rank logs) and the proxy it reaches the internet through ------------------------------------------------
+export WANDB_MODE="${WANDB_MODE:-online}"
+export WANDB_PROJECT="${WANDB_PROJECT:-DEBUG}"
+export WANDB_ENTITY="${WANDB_ENTITY:-zixianw4-university-of-illinois-urbana-champaign}"
+export WANDB_DIR="${WANDB_DIR:-${OUTPUT_BASEPATH}/wandb}"
+export WANDB_NAME="${WANDB_NAME:-job${SLURM_JOB_ID}_${NAME}}"
+export WANDB_GROUP="${WANDB_GROUP:-${MODEL_SIZE}_${MOE_TYPE}}"
+mkdir -p "${WANDB_DIR}"
+export http_proxy="${http_proxy:-http://proxy.ccs.ornl.gov:3128}"
+export https_proxy="${https_proxy:-http://proxy.ccs.ornl.gov:3128}"
+export no_proxy="${no_proxy:-localhost,127.0.0.1,.olcf.ornl.gov,.ccs.ornl.gov,.frontier.olcf.ornl.gov}"
+
+# ---- Megatron's arguments -------------------------------------------------------------------------------------------------------------
+data_options=" \
+         --tokenizer-type HFTokenizer \
+         --vocab-file ${VOCAB_FILE} \
+         --data-path ${DATA_PATH}"
+megatron_options=" \
+        --moe-expert-parallel-size ${EP_PARALLEL_SIZE} \
+        --num-experts ${EP_SIZE} \
+        --moe-loss-coeff ${MLC} \
+        --moe-train-capacity-factor ${MOE_TRAIN_CAP_FACTOR} \
+        --moe-eval-capacity-factor ${MOE_EVAL_CAP_FACTOR} \
+        --moe-min-capacity ${MOE_MIN_CAP} \
+        --override-opt_param-scheduler \
+        --adam-beta1 0.9 \
+        --adam-beta2 0.95 \
+        --tensor-model-parallel-size ${MP_SIZE} \
+        --init-method-std ${INIT_STD} \
+        --lr-decay-tokens ${LR_DECAY_TOKENS} \
+        --lr-warmup-tokens ${WARMUP_TOKENS} \
+        --micro-batch-size ${BATCH_SIZE} \
+        --exit-duration-in-mins ${EXIT_DURATION} \
+        --global-batch-size ${GLOBAL_BATCH_SIZE} \
+        --num-layers ${NUM_LAYERS} \
+        --hidden-size ${HIDDEN_SIZE} \
+        --ffn-hidden-size ${FFN_HIDDEN_SIZE} \
+        --num-attention-heads ${NUM_ATTN_HEADS} \
+        --seq-length ${SEQ_LEN} \
+        --max-position-embeddings ${SEQ_LEN} \
+        --train-tokens ${TRAIN_TOKENS} \
+        --train-iters ${TRAIN_ITERS} \
+        --lr ${LR} \
+        --min-lr ${MIN_LR} \
+        --lr-decay-style constant \
+        --split 98,2,0 \
+        --log-interval ${LOG_INTERVAL} \
+        --eval-interval ${EVAL_INTERVAL} \
+        --eval-iters ${EVAL_ITERS} \
+        --save-interval ${SAVE_INTERVAL} \
+        --weight-decay 0.1 \
+        --clip-grad 1.0 \
+        --hysteresis 2 \
+        --num-workers 0 \
+        --attention-dropout 0 \
+        --hidden-dropout 0 \
+        --fp32-residual-connection \
+        --bf16 \
+        --moe-train-capacity-factor 1.25 \
+	    --expert-interval 1 \
+	    --topk $topk \
+        --use-flash-attn-v2 \
+        --adam-eps 1e-8 \
+        --seed 1000 \
+        --save-interval ${SAVE_INTERVAL} \
+        --finetune \
+	--use-rotary-position-embeddings"
+WALL_CLOCK_BREAKDOWN="false"
+export WALL_CLOCK_BREAKDOWN="false"
+# X-MOE: the system flags; the architecture comes from the registry's ARCH_FLAGS, else the historical fallback
+megatron_options="${megatron_options} --use-uneven-all-to-all --use-pft --no-bias-gelu-fusion"
+if [ -z "${ARCH_FLAGS}" ]; then
+    megatron_options="${megatron_options} --num-shared-experts 2 --swiglu"
+fi
+# read by the X-MoE code
+export LAYER_TIMING=0
+export LAYER_TIMING_TARGETS=0
+if [ "${ACTIVATION_CHECKPOINT}" = "true" ]; then
+    megatron_options="${megatron_options} --checkpoint-activations"
+    megatron_options="${megatron_options} --checkpoint-num-layers $CHECKPOINT_NUM_LAYERS"
+fi
+if [[ $EP_SIZE -gt 1 ]]; then
+    megatron_options="${megatron_options} --create-moe-param-group"
+fi
+if [ "${MOE_DROP_TOKEN}" = "false" ]; then
+    megatron_options="${megatron_options} --disable-moe-token-dropping"
+fi
+if [ -n "${ARCH_FLAGS}" ]; then
+    megatron_options="${megatron_options} ${ARCH_FLAGS}"
+    echo "  ARCH_FLAGS: ${ARCH_FLAGS}"
+fi
+{{SP_OPTION}}
+
+# ---- DeepSpeed: the json of this job, and its arguments ------------------------------------------------------------------------------
+template_json="../ds_config_gpt_TEMPLATE.json"
+config_dir="temp_ds_json"
+config_json="${config_dir}/ds_config_gpt_Zero0_${NAME}_job${SLURM_JOB_ID}.json"
+mkdir -p "${config_dir}"
+sed "s/CONFIG_BATCH_SIZE/${GLOBAL_BATCH_SIZE}/" ${template_json} \
+    | sed "s/CONFIG_MBSIZE/${BATCH_SIZE}/" \
+    | sed "s/LOG_INTERVAL/${LOG_INTERVAL}/" \
+    | sed "s/ZERO_STAGE/1/" \
+    | sed "s/PRESCALE_GRAD/false/" \
+    | sed "s/CONFIG_FP16_ENABLED/false/" \
+    | sed "s/CONFIG_BF16_ENABLED/true/" \
+    | sed "s/CONFIG_CL_ENABLED/${CL_ENABLED}/" \
+    | sed "s/CONFIG_CL_MIN/${CL_START_SEQLEN}/" \
+    | sed "s/CONFIG_CL_MAX/${SEQ_LEN}/" \
+    | sed "s/CONFIG_CL_DURATION/${CL_STEP}/" \
+    | sed "s/WALL_CLOCK_BREAKDOWN/${WALL_CLOCK_BREAKDOWN}/" \
+    > ${config_json}
+deepspeed_options=" --deepspeed --deepspeed_config ${config_json}"
+if [[ $PP_SIZE -gt 1 ]]; then
+    deepspeed_options=" ${deepspeed_options} --pipeline-model-parallel-size ${PP_SIZE}"
+else
+    deepspeed_options=" ${deepspeed_options} --no-pipeline-parallel"
+fi
+if [ "${ACTIVATION_CHECKPOINT}" = "true" ]; then
+    deepspeed_options="${deepspeed_options} --deepspeed-activation-checkpointing"
+fi
+
+# ---- Process and network settings (PRE sets the site's network values afterwards) -------------------------------------------------------
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export RANK=$SLURM_PROCID
+export WORLD_SIZE=$SLURM_NTASKS
+export LOCAL_RANK=$SLURM_LOCALID
+export HIGH_SPEED_INTERFACE="hsn0"
+# the first training node's high-speed address: the first world's rendezvous (ft-sys-v2's later worlds use their own stores)
+readarray -t arr < <(scontrol show hostnames $SLURM_NODELIST)
+master_node=${arr[0]}
+export MASTER_ADDR=$(ssh $master_node "ip -4 addr show ${HIGH_SPEED_INTERFACE} | grep 'inet' | awk '{print \$2}' | cut -d/ -f1 | head -n1")
+if [[ -z "${MASTER_ADDR}" ]]; then
+    echo "FATAL: Could not determine MASTER_ADDR for interface '${HIGH_SPEED_INTERFACE}' on master node '${master_node}'."
+    exit 1
+fi
+export MASTER_PORT=29500
+echo "MASTER_NODE: ${master_node} MASTER_ADDR: ${MASTER_ADDR} (${HIGH_SPEED_INTERFACE})"
+export OMP_NUM_THREADS=1
+export TORCH_NCCL_BLOCKING_WAIT=0
+export NCCL_BLOCKING_WAIT=0
+export TORCH_NCCL_DUMP_ON_TIMEOUT=1
+export TORCH_NCCL_TRACE_BUFFER_SIZE=2000
+export TORCH_NCCL_DEBUG_INFO_TEMP_FILE="${JOB_DIR}/nccl_trace_rank_"
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export NCCL_DEBUG={{NCCL_DEBUG}}
+{{SP_ENV}}
+gpus_per_node=$(( TOTAL_GPUS / NODES ))
+
+# ---- The run-state monitor (a-monitor.txt: a py-spy sample every 2-4 minutes, ${JOB_DIR}/monitor/) ------------------------------------
+MON_FAST=120; MON_SLOW=240; MON_WINDOW=1200; MON_TRACE_FRAMES=20
+bash "${DIR:-.}/monitor_run.sh" "${JOB_DIR}" "${MON_FAST}" "${MON_SLOW}" "${MON_WINDOW}" "${MON_TRACE_FRAMES}" &
+MONITOR_PID=$!
+trap 'kill ${MONITOR_PID} 2>/dev/null' EXIT
+echo "[monitor] pid ${MONITOR_PID} -> ${JOB_DIR}/monitor/ (a-monitor.txt summary + per-node files; ${MON_FAST}s for first ${MON_WINDOW}s, then ${MON_SLOW}s)"
+
+# ---- Profiler switches (read by the X-MoE code; all off) -------------------------------------------------------------------------------
+export to_profile="False"
+export profile_memory="False"
+export mem_snapshot_ranks="all"          # which ranks dump a memory .pickle: "all", "0", or "0,8,16,..."
+export profile_dir="${JOB_DIR}/torch_profile"
+planner_mode="false"
+
+# ---- PRE: network settings and ROCm 7.14.1 (NEWSTACK_PRE_CMD), the heartbeat, the srun wrapper ----------------------------------------
+{{PRE_CMD}}
+
+# ---- Training: one srun; ftv2_srun.sh's srun function turns it into one step over training and standby nodes ---------------------------
+echo "--- Training starts at: $(date '+%F %T') ---"
+srun -N ${NODES} -n ${TOTAL_GPUS} -c6 \
+     --ntasks-per-node=${gpus_per_node} \
+     --gpus-per-node=${gpus_per_node} \
+     --kill-on-bad-exit=1 \
+     --export=ALL,FI_MR_CACHE_MONITOR,FI_CXI_DEFAULT_CQ_SIZE,FI_CXI_RX_MATCH_MODE,NCCL_DEBUG,UNEVEN_PP,TRITON_CACHE_DIR,TRITON_DISABLE_CACHE \
+     bash -c "
+     LD_PRELOAD=\"${DARSHAN_PRELOAD}\" python ../ELMoE_launch.py \
+        --run-planner ${planner_mode} \
+        --planner-profile-dir ./planner_profiling_cache \
+        ${megatron_options} \
+        ${data_options} \
+        ${deepspeed_options} \
+        --master-addr=$MASTER_ADDR \
+        --zero-stage 1 \
+        > ${JOB_DIR}/rank_\${SLURM_PROCID}.log" &
+TRAIN_PID=$!
+wait "${TRAIN_PID}"
+echo "--- Training ended at: $(date '+%F %T') ---"
