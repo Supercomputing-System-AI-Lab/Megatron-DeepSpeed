@@ -57,6 +57,15 @@ class FakeAdapter:
     def zero2_flat_partial(self, i):
         return self.avg[i][0].clone() if self.avg.get(i) else self.torch.zeros(SIZES[i], device=self.dev)
 
+    def zero2_flat_partial_into(self, i, out):
+        if out is None or out.numel() != SIZES[i]:
+            return self.zero2_flat_partial(i)
+        if self.avg.get(i):
+            out.copy_(self.avg[i][0])
+        else:
+            out.zero_()
+        return out
+
     def zero2_set_partial(self, i, flat):
         self.avg[i] = None if flat is None else [flat.clone()]
 
@@ -105,6 +114,7 @@ def worker(rank, port, k, out, mode, scenario, record):
     stop = {'v': False}
     stop_fn = lambda: stop['v']
     ok_fn = lambda: not stop['v']
+    snap_ptrs = set()
     res = {'rank': rank, 'k': k, 'mode': mode, 'scenario': scenario, 'record': record, 'launch_ms': [], 'wait_ms': [],
            'parts_ms': [], 'hwq': os.environ.get('GPU_MAX_HW_QUEUES', 'default'), 'n_commits': 0}
     g_start = torch.cuda.Event(enable_timing=True)
@@ -127,6 +137,8 @@ def worker(rank, port, k, out, mode, scenario, record):
         t0 = time.time()
         r = c.promote(True, stop_fn, ok_fn)                              # the adapter's 'before'
         res['wait_ms'].append(round(1000 * (time.time() - t0), 1))
+        if c.snap_cur is not None:
+            snap_ptrs.add(c.snap_cur[0].data_ptr())
         assert r in ('none', 'done'), r
         t1 = time.time()
         ev = torch.cuda.Event()
@@ -170,6 +182,10 @@ def worker(rank, port, k, out, mode, scenario, record):
             break
     if scenario == 'clean':
         r = c.promote(True, stop_fn, ok_fn)                              # the step's end (the adapter's 'end')
+        if c.snap_cur is not None:
+            snap_ptrs.add(c.snap_cur[0].data_ptr())
+        res['snap_bufs'] = len(snap_ptrs)                                # keep: the snapshots reuse two buffers
+        res['spare_none'] = c.copy_spare is None                         # keep: no fourth copy
         torch.cuda.current_stream().wait_stream(side)
         g_end = torch.cuda.Event(enable_timing=True)
         g_end.record()
@@ -276,6 +292,10 @@ def main():
         launch = max(max(r['launch_ms']) for r in rs)
         print(f'      {overlap_line(rs)}')
         good = good and launch < 60                                   # the host never waited for the side stream at a launch
+        if mode == 'keep':                                            # the overlap holds the synchronous commit's buffers
+            good = good and all(r['snap_bufs'] <= 2 and r['spare_none'] for r in rs)
+            print(f'      keep memory: snapshot buffers used per rank {[r["snap_bufs"] for r in rs]} (want <= 2); '
+                  f'no spare copy {[r["spare_none"] for r in rs]}')
         print(f'{"PASS" if good else "FAIL"}  clean {mode} k={k}: position {rs[0]["pos"]} (want {rs[0]["want_pos"]}); sums, '
               f'snapshots, copies exact on every rank: {[(r["sums_exact"], r["snap_exact"], r["copy_exact"]) for r in rs]}; '
               f'tokens {[r["token"] for r in rs]}; longest launch {launch} ms (side work 120 ms each); host waits for the commit '
@@ -299,6 +319,8 @@ def main():
         if not good:
             fails.append(f'stop {mode} k={k}')
     variants = [({'GPU_MAX_HW_QUEUES': '1', 'FTV2_COMMIT_SIDE_PRIORITY': 'normal'}, 'hwq 1, normal side (serial control)')]
+    if os.environ.get('TEST_QUICK') == '1':                           # the protocol and the control only
+        variants = []
     for crowd in ('0', '1'):
         for hwq in ('4', '8'):
             for prio in ('normal', 'high'):

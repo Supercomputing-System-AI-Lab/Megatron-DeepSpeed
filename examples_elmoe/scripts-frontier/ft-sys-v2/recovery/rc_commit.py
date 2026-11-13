@@ -35,7 +35,9 @@ it asynchronously"). Without it a commit's reduction runs on the compute stream 
 send, and the stages' reductions follow one another (63B PP 4: 0.45 s per commit, the step 186.6 -> 415.6 s at k = 1). With it the
 adapter enqueues the reduction, ZeRO's epilogue and this commit's work on self.side, after an event recorded on the compute stream at
 the backward's end; the host goes on to the gradient send and the next forward at once. What changes here:
-  - the work is written into spare buffers (copy_spare, tok_spare; the snapshot is a fresh tensor as before) and kept in self.pend;
+  - the work is written into spare buffers and kept in self.pend (keep: the piece itself holds the copy in flight and the snapshot
+    is taken at promote(), into the snapshot that drops out, so the buffers are the synchronous commit's; p2p: copy_spare and a
+    fresh snapshot, which is also what is sent); the token goes to tok_spare;
     the rank's position (c, snapshots, copies, tokens) moves only in promote(), when the host sees the work's end event complete
     and the stop flag still clear and no reduction communicator in error: the check FTV2_COMMIT_VERIFY made by waiting on the
     stream after every commit, made when the commit's end is seen instead. Until then the last two promoted commits stay intact,
@@ -93,8 +95,10 @@ class Commit:
         self.overlap = bool(overlap and spaced and self.cuda)
         self.pend, self.side_t0 = None, None
         self.ov_ms = []                                      # per promoted commit: (reduction ms, commit work ms) on the side stream
+        self.copy_spare = None
+        self.snap_pool = []                                  # overlap, keep: snapshot buffers free for the next promote (at most 2)
+        self.snap_owned = []                                 # overlap, keep: the snapshot buffers _snap_take made (only these are reused)
         if self.overlap:
-            self.copy_spare = [torch.zeros_like(t) for t in self.copy_cur]
             self.tok_spare = torch.full((2,), -1.0, dtype=torch.float64, device=device)
             self.tok_stream = torch.cuda.Stream(device=device, priority=self.side_prio)   # token reads never behind a reduction
             self.tok_pin_p = torch.empty(2, dtype=torch.float64, pin_memory=True)
@@ -113,11 +117,41 @@ class Commit:
             if self.k != 1 and not self.spaced:
                 raise ValueError('FTV2_COMMIT_MODE=keep folds in every micro-batch: FTV2_COMMIT_K must be 1')
             self.piece = [torch.zeros_like(t) for t in self.copy_cur]
-            adapter.wrap_reduce_keep(self.owner, self.piece)
+            adapter.wrap_reduce_keep(self.owner, self.piece)  # the hook reads self.piece[i] at each call: rotate in place only
+        # overlap memory (63B, 2026-11-12: keep_k2_ovnt 5912999 and keep_k4_ovnt 5912588 ran stage 0 out of HBM in step 2):
+        # keep mode folds the commit in flight into the piece itself and takes the snapshot at promote(), so it holds the same
+        # buffers as a synchronous keep commit (two copies, the piece, two snapshots); p2p mode receives into a spare copy.
+        if self.overlap and self.mode != 'keep':
+            self.copy_spare = [torch.zeros_like(t) for t in self.copy_cur]
+
+    def _snap_release(self):
+        """overlap, keep: the two snapshots' buffers go to the pool (reused by the next promotes) instead of the allocator."""
+        if self.overlap and self.mode == 'keep':
+            for s in (self.snap_cur, self.snap_prev):
+                if s is not None and any(s is o for o in self.snap_owned) and len(self.snap_pool) < 2:
+                    self.snap_pool.append(s)
+        self.snap_cur, self.snap_prev = None, None
+
+    def _snap_take(self):
+        """overlap, keep, in promote(): my sums at the commit just promoted, copied on the side stream (after the reduction that
+        made them, before the next one) into the buffer of the snapshot that drops out (snap_prev), or one from the pool. Only
+        buffers made here are ever written again (snap_owned): a snapshot handed in by set_position is never reused."""
+        buf = None
+        if self.snap_prev is not None and any(self.snap_prev is o for o in self.snap_owned):
+            buf = self.snap_prev
+        elif self.snap_pool:
+            buf = self.snap_pool.pop()
+        with torch.cuda.stream(self.side):
+            out = [self.ad.zero2_flat_partial_into(i, None if buf is None else buf[n]) for n, i in enumerate(self.groups)]
+        if buf is None or any(a is not b for a, b in zip(out, buf)):
+            self.snap_owned = [o for o in self.snap_owned if o is not buf][-3:] + [out]
+            return out
+        return buf
 
     def begin_step(self, step):
         """The top of an iteration: no micro-batch of this step is summed or committed yet."""
         self.settle()                                        # overlap: the buffers below are zeroed on this stream
+        self._snap_release()
         self.step, self.added, self.c, self.snap_cur, self.snap_prev = int(step), 0, 0, None, None
         if self.mode == 'keep':                              # the owner's sums at micro-batch 0 of this step are zeros
             for t in self.copy_cur + self.copy_prev + self.piece:
@@ -250,18 +284,21 @@ class Commit:
         step, pos = int(self.step), int(self.added)
         mid = torch.cuda.Event(enable_timing=True)
         mid.record()                                         # the reduction and ZeRO's epilogue end here on the side stream
-        flats = [self.ad.zero2_flat_partial(i) for i in self.groups]         # fresh copies: the snapshot S_pos
-        new, tok = self.copy_spare, self.tok_spare
+        tok = self.tok_spare
         if self.mode == 'keep':
-            for cur, base, pc in zip(new, self.copy_cur, self.piece):
-                if pos == self.k:
-                    cur.copy_(pc)                            # the owner's first commit of the step: its sums ARE the piece
-                else:
-                    torch.add(base, pc, out=cur)             # the owner's previous commit (promoted) + this interval's piece
-                pc.zero_()
+            # the copy in flight is folded into the piece itself (no fourth buffer): piece := the owner's previous commit +
+            # this interval's piece, the same bf16 sum as the synchronous torch.add(prv, pc, out=cur) (a + b == b + a); at
+            # pos == k the piece IS the owner's first commit of the step. The snapshot S_pos is taken at promote().
+            flats = None
+            for base, pc in zip(self.copy_cur, self.piece):
+                if pos != self.k:
+                    pc.add_(base)
+            new = list(self.piece)
             tok[0].fill_(float(step)); tok[1].fill_(float(pos))
             tok_h = [step, pos]
         else:
+            flats = [self.ad.zero2_flat_partial(i) for i in self.groups]     # fresh copies: the snapshot S_pos, sent as is
+            new = self.copy_spare
             tok.fill_(-1.0)
             self.tok_send[0].fill_(float(step)); self.tok_send[1].fill_(float(pos))
             works = dist.batch_isend_irecv([dist.P2POp(dist.isend, f, self.partner, group=self.pg) for f in flats] +
@@ -301,10 +338,22 @@ class Commit:
             self.ov_ms.append((round(red, 1) if red is not None else None, round(p['mid'].elapsed_time(p['ev']), 1)))
         except Exception:
             pass
-        self.copy_prev, self.copy_cur, self.copy_spare = self.copy_cur, p['copy'], self.copy_prev
+        if self.mode == 'keep':
+            # the copy dropping out (the owner's commit c - k) becomes the next piece, zeroed on the side stream before the
+            # next reduction writes into it; my snapshot of the commit promoted is copied now, into the snapshot dropping out
+            old = self.copy_prev
+            self.copy_prev, self.copy_cur = self.copy_cur, p['copy']
+            self.piece[:] = old
+            with torch.cuda.stream(self.side):
+                for t in self.piece:
+                    t.zero_()
+            snap = self._snap_take()
+        else:
+            self.copy_prev, self.copy_cur, self.copy_spare = self.copy_cur, p['copy'], self.copy_prev
+            snap = p['flats']
         self.tok_prev, self.tok_cur, self.tok_spare = self.tok_cur, p['tok'], self.tok_prev
         self.tok_prev_h, self.tok_cur_h = self.tok_cur_h, p['tok_h']
-        self.snap_prev, self.snap_cur, self.c = self.snap_cur, p['flats'], p['c']
+        self.snap_prev, self.snap_cur, self.c = self.snap_cur, snap, p['c']
         self.done_ev, self.pend = p['ev'], None
         return 'done'
 

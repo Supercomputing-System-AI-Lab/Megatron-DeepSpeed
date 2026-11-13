@@ -184,6 +184,24 @@ class ZeroAdapter:
         return flat
 
     @torch.no_grad()
+    def zero2_flat_partial_into(self, i, out):
+        """zero2_flat_partial written into `out` (a flat buffer of the partition's size and dtype, from an earlier snapshot), so
+        a snapshot needs no new memory (ft-sys-v2 overlap, keep mode). The same values in the same order as
+        _flatten_dense_tensors(lst) (torch.cat of the flattened tensors). out None, or a size or dtype that does not match: a
+        fresh tensor, as zero2_flat_partial."""
+        if out is None or out.numel() != self.zero2_partition_size(i) or out.dtype != self.zero2_dtype():
+            return self.zero2_flat_partial(i)
+        z = self.zero
+        lst = z.averaged_gradients.get(i) if isinstance(z.averaged_gradients, dict) else None
+        if not lst:
+            out.zero_()
+            return out
+        if sum(t.numel() for t in lst) != out.numel():
+            return self.zero2_flat_partial(i)
+        torch.cat([t.reshape(-1) for t in lst], out=out)
+        return out
+
+    @torch.no_grad()
     def zero2_set_partial(self, i, flat):
         """Group i's partial sum := flat (None: no sum yet, so the next micro-batch starts it, as at a step's start)."""
         z = self.zero
