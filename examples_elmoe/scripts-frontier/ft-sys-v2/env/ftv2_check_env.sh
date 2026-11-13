@@ -109,7 +109,12 @@ tmpl="$FTV2_SF/frontier_elmoe.slurm_0623_2026.template"
 data=${DATA_PATH:-$(sed -n 's/^export DATA_PATH=\${DATA_PATH:-\(.*\)}$/\1/p' "$tmpl" 2>/dev/null)}
 check p DATA_PATH "$data" "training data prefix (.bin + .idx)$([ -z "${DATA_PATH:-}" ] && echo ', the template default')"
 vocab=${FTV2_VOCAB_FILE:-$(sed -n 's/^export VOCAB_FILE=//p' "$tmpl" 2>/dev/null)}
-check f FTV2_VOCAB_FILE "$vocab" "tokenizer$([ -z "$FTV2_VOCAB_FILE" ] && echo ', the template VOCAB_FILE')"
+if [ "${AUTORUN_GPT2_TOKENIZER:-0}" = 1 ]; then   # the launcher's GPT-2 rider replaces the template's tokenizer (2026-11-13)
+  check f AUTORUN_GPT2_TOKENIZER "$FTV2_SF/../data/gpt2-vocab.json" "GPT-2 vocabulary (the launcher's rider reads ../data/gpt2-vocab.json)"
+  check f AUTORUN_GPT2_TOKENIZER "$FTV2_SF/../data/gpt2-merges.txt" "GPT-2 merges"
+else
+  check f FTV2_VOCAB_FILE "$vocab" "tokenizer$([ -z "$FTV2_VOCAB_FILE" ] && echo ', the template VOCAB_FILE')"
+fi
 if [ -d "$NEWSTACK_MEGATRON_COPY" ] && [ -x "$NEWSTACK_MEGATRON_COPY" ]; then st=present; else st=absent; fi
 printf '%-13s %-22s %s  -- %s\n' "unused" NEWSTACK_MEGATRON_COPY "$NEWSTACK_MEGATRON_COPY" "$st; on PYTHONPATH after FTV2_TREE, so megatron is not imported from it"
 
