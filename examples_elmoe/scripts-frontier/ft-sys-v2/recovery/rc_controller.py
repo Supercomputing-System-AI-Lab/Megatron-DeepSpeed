@@ -295,14 +295,26 @@ class Recovery:
             self.log('FTV2_COMMIT_OVERLAP=1 is not built for level C (its cut checks wait on the stream at every commit): '
                      'the reductions stay on the compute stream')
             ov = False
-        c = Commit(adapter, self.rank, self.world, self.device, self.log, group=pg, spaced=pipe, overlap=ov)
+        # FTV2_COMMIT_MODE=raw (2026-11-12, rc_commit_raw): a copy of the raw gradient instead of a spaced reduction
+        raw = os.environ.get('FTV2_COMMIT_MODE') == 'raw'
+        if raw and (not pipe or self.c_mode or self.device.type != 'cuda'):
+            self.log('FTV2_COMMIT_MODE=raw needs the pipeline engine on a GPU and is not built for level C: commits off')
+            self.commit_on = False
+            return
+        if raw:
+            from rc_commit_raw import RawCommit
+            c = RawCommit(adapter, self.rank, self.world, self.device, self.log, group=pg)
+        else:
+            c = Commit(adapter, self.rank, self.world, self.device, self.log, group=pg, spaced=pipe, overlap=ov)
         c.set_position(step, J, flats)
         c.seed(step, J, flats)
         if pipe:                                             # milestone 3: ZeRO-1 reduces every k micro-batches (spaced)
             self.ov_wait = []                                # overlap: the host's waits for the commit in flight, this step
             self.pipe_st = adapter.install_pipe_commits(
                 c.k, self._pipe_start,
-                overlap={'side': c.side, 'before': self._overlap_before, 'end': self._overlap_end} if c.overlap else None)
+                overlap={'side': c.side, 'before': self._overlap_before, 'end': self._overlap_end} if c.overlap else None,
+                raw={'launch': self._raw_launch, 'wait': c.wait_snapshot,
+                     'restore': lambda: c.restore_own(c.c)} if raw else None)
             adapter.wrap_epilogue(self._commit_after, last_fn=lambda: not self.pipe_st['spaced'])
         else:
             self.pipe_st = None
@@ -523,6 +535,11 @@ class Recovery:
         self.commit.after_epilogue(True, False)
         raise self.hb.StopForRecovery('a stop began while a commit was in flight')
 
+    def _raw_launch(self, pos):
+        """FTV2_COMMIT_MODE=raw: the commit after micro-batch pos (the adapter promoted the one in flight just before)."""
+        self.commit.launch(pos)
+        self.hb.S['micro_batch'] = int(pos)
+
     def _overlap_end(self):
         """The step's end (before ReduceTiedGrads and ReduceGrads): the last commit in flight promoted (a refusal is left to the
         last reduction's epilogue, which finds the stop flag), and one line with this step's side-stream times. Called twice
@@ -538,7 +555,8 @@ class Recovery:
             body = [b for _, b in ms]
             f = lambda xs: (f'{sum(xs) / len(xs):.1f} mean, {min(xs):.1f}-{max(xs):.1f}' if xs else '-')
             self.log(f'commit overlap step {self.commit.step}: {len(ms)} commits promoted ({r} at the end); side stream ms per '
-                     f'commit: reduction + ZeRO epilogue {f(red)}, commit work {f(body)}; the host waited {1000 * sum(w):.0f} ms '
+                     f'commit: {"snapshot" if self.commit.mode == "raw" else "reduction + ZeRO epilogue"} {f(red)}, '
+                     f'{"exchange" if self.commit.mode == "raw" else "commit work"} {f(body)}; the host waited {1000 * sum(w):.0f} ms '
                      f'in all for commits in flight (max {1000 * max(w) if w else 0:.0f})')
         self.commit.ov_ms, self.ov_wait = [], []
 
@@ -1064,7 +1082,26 @@ class Recovery:
             flats = None
             if self.commit_on and Jown > 0:                  # milestone 2: the partial sums of the step at micro-batch J
                 old_c = getattr(self, 'old_commit', None)
-                if role == 'joiner':
+                raw = os.environ.get('FTV2_COMMIT_MODE') == 'raw'
+                if raw:                                      # rc_commit_raw: one flat tensor of the rank's raw gradient sums
+                    if role == 'joiner':
+                        holder = rc_pairs.partner(self.rank, world, stride)
+                        flats = torch.empty(sum(int(p.numel()) for p in adapter.raw_params()), dtype=adapter.zero2_dtype(),
+                                            device=self.device)
+                        for w in dist.batch_isend_irecv([dist.P2POp(dist.irecv, flats, holder)]):
+                            w.wait()
+                    else:
+                        for o in lost:
+                            if rc_pairs.partner(o, world, stride) == self.rank:
+                                cp = old_c.copy_of(s, Jown)[0].to(self.device)
+                                for w in dist.batch_isend_irecv([dist.P2POp(dist.isend, cp, o)]):
+                                    w.wait()
+                                torch.cuda.synchronize(self.device)
+                                del cp
+                        flats = old_c.target(Jown)
+                    torch.cuda.synchronize(self.device)
+                    adapter.raw_set(flats, [int(p.numel()) for p in adapter.raw_params()])
+                elif role == 'joiner':
                     holder = rc_pairs.partner(self.rank, world, stride)
                     flats = [torch.empty(adapter.zero2_partition_size(i), dtype=adapter.zero2_dtype(), device=self.device)
                              for i in adapter.zero2_groups()]
@@ -1079,9 +1116,9 @@ class Recovery:
                     flats = old_c.target(Jown)
                 if self.device.type == 'cuda':
                     torch.cuda.synchronize(self.device)
-                for n, i in enumerate(adapter.zero2_groups()):
+                for n, i in enumerate(adapter.zero2_groups() if not raw else []):
                     adapter.zero2_set_partial(i, None if flats is None else flats[n])
-                if os.environ.get('FTV2_COMMIT_DEBUG') == '1':
+                if os.environ.get('FTV2_COMMIT_DEBUG') == '1' and not raw:
                     ns = [round(float(adapter.zero2_flat_partial(i).float().norm()), 6) for i in adapter.zero2_groups()]
                     self.log(f'commit debug step {s} restored at micro-batch {Jown} ({role}): group norms {ns}')
             if os.environ.get('FTV2_STEP_SUMS_FROM') and self.out:

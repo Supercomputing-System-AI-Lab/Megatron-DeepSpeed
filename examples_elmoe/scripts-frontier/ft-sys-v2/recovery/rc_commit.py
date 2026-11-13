@@ -495,7 +495,11 @@ def decide_microbatch_pipe(reports, lost, world, stride, step):
     Js, whys = {}, []
     for st, reps in sorted(by.items()):
         lost_s = [o for o in lost if rc_pairs.stage_of(o, world) == st]
-        ok, J, why = decide_microbatch(reps, lost_s, world, stride, step)
+        if any(r.get('raw') for r in reps.values()):      # FTV2_COMMIT_MODE=raw: own snapshots and host copies (rc_commit_raw)
+            from rc_commit_raw import decide_microbatch_raw
+            ok, J, why = decide_microbatch_raw(reps, lost_s, world, stride, step)
+        else:
+            ok, J, why = decide_microbatch(reps, lost_s, world, stride, step)
         whys.append(f'stage {st}: {why}')
         if not ok:
             return False, None, None, '; '.join(whys)

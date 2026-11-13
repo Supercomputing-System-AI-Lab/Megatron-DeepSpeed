@@ -221,6 +221,19 @@ class ZeroAdapter:
         assert off == flat.numel(), f'group {i}: {off} != {flat.numel()}'
         z.averaged_gradients[i] = lst
 
+    # ------------------------------------------------------------------ raw gradient commits (rc_commit_raw, FTV2_COMMIT_MODE=raw)
+    def raw_params(self):
+        """Every trainable 16-bit parameter of this rank, in ZeRO's group order (a new list each call: no reference is kept)."""
+        return [p for g in self.zero.bit16_groups for p in g if p.requires_grad]
+
+    @torch.no_grad()
+    def raw_set(self, flat, sizes):
+        """Every parameter's .grad := its slice of flat (own storage each); None: no gradient yet (.grad = None)."""
+        off = 0
+        for p, n in zip(self.raw_params(), sizes):
+            p.grad = None if flat is None else flat[off:off + n].view_as(p).clone()
+            off += n
+
     def wrap_epilogue(self, after, last_fn=None):
         """Milestone 2's hook: after ZeRO's per-micro-batch epilogue (stage 2: the micro-batch's reduced piece was just added to
         the owner's sums), call after(last), last = the gradient-accumulation boundary. Wrapped on the object. Milestone 3
@@ -350,7 +363,7 @@ class ZeroAdapter:
         except Exception:
             return 0
 
-    def install_pipe_commits(self, k, start, overlap=None):
+    def install_pipe_commits(self, k, start, overlap=None, raw=None):
         """Reduce the stage's gradients after every k-th backward pass, with ZeRO-1's own code, in place of the one reduction
         after the last backward. Why it is DeepSpeed's code and nothing else (stage_1_and_2.py, DeepSpeed 0.15.5):
           - under the pipeline DeepSpeed turns overlap_comm off (engine.py:1711), so ZeRO-1 has no gradient hooks and the
@@ -380,7 +393,14 @@ class ZeroAdapter:
             DeepSpeed changes. After it every .grad is None (the epilogue's zero_grad), so the next backward writes new tensors;
           - the step's end (ReduceTiedGrads, ReduceGrads) calls 'end'() and makes the compute stream wait for the side stream
             before anything reads the partition sums (the tied exchange, the last reduction's adds, the optimizer step).
-        FTV2_COMMIT_AT=send is ignored with overlap (nothing is kept waiting for a reduction)."""
+        FTV2_COMMIT_AT=send is ignored with overlap (nothing is kept waiting for a reduction).
+
+        raw (FTV2_COMMIT_MODE=raw, rc_commit_raw; needs overlap): {'launch': fn(pos), 'wait': fn(), 'restore': fn()}. No spaced
+        reduction at all: at every k-th backward the commit's snapshot and exchange are launched ('launch', after 'before'());
+        every backward first makes the compute stream wait for the snapshot in flight ('wait': the backward adds into .grad in
+        place); the tied exchange is skipped (no sums are committed, DeepSpeed's own ReduceTiedGrads and ReduceGrads see every
+        micro-batch in .grad). After a resume at (J, Jown) the gradients of micro-batches J+1..Jown are replaced by the restored
+        snapshot at Jown before the next backward ('restore')."""
         import os
         from deepspeed.runtime.pipe import schedule as pipe_sched
         eng, z = self.engine, self.zero
@@ -505,6 +525,11 @@ class ZeroAdapter:
             p = st['pos']
             if p >= st['m'] or p % st['k']:
                 return
+            if raw is not None:
+                if p > st['drop_until']:                  # up to drop_until the restored snapshot holds them (backward())
+                    overlap['before']()
+                    raw['launch'](p)
+                return
             if p <= st['drop_until']:
                 z.zero_grad(set_to_none=True)             # these micro-batches are in this stage's sums already
                 return
@@ -514,6 +539,11 @@ class ZeroAdapter:
                 reduce_now()
 
         def backward(self_, buffer_id):
+            if raw is not None:
+                if st.get('raw_restore') and st['pos'] == st['drop_until']:
+                    st['raw_restore'] = False
+                    raw['restore']()                      # .grad := my snapshot at Jown (replaces J+1..Jown's gradients)
+                raw['wait']()
             orig_bwd(self_, buffer_id)
             if nan_lvl >= 2:
                 inp = self_.pipe_buffers['inputs'][buffer_id]
@@ -571,7 +601,7 @@ class ZeroAdapter:
 
         def reduce_tied(self_):
             settle_side()
-            if tied and st['k'] < st['m']:
+            if tied and st['k'] < st['m'] and raw is None:
                 tied_exchange()
             orig_tied(self_)
         orig_reduce = type(eng)._INSTRUCTION_MAP[pipe_sched.ReduceGrads]
@@ -620,8 +650,13 @@ class ZeroAdapter:
                     parts.append(f'{name} {len(idx)} of {st["nanc"][k]} (first {idx[:6]})')
                 mb = '; per micro-batch, non-finite: ' + ', '.join(parts)
             import torch.distributed as dist
+            ms = torch.cuda.memory_stats() if torch.cuda.is_available() else {}
+            al = '; allocator: ' + ', '.join(f'{k_} {ms.get(k_, "-")}' for k_ in (
+                'num_alloc_retries', 'num_ooms', 'num_sync_all_streams', 'num_device_alloc', 'num_device_free')) + \
+                f', reserved GB {ms.get("reserved_bytes.all.current", 0) / 2 ** 30:.1f} (peak {ms.get("reserved_bytes.all.peak", 0) / 2 ** 30:.1f})' \
+                f', allocated peak GB {ms.get("allocated_bytes.all.peak", 0) / 2 ** 30:.1f}'
             print(f'[ftv2 nan-check rank {dist.get_rank()}] step {getattr(eng, "global_steps", -1)}: tensors with a non-finite '
-                  f'value: partition sums before the step {g[0]} of {g[1]}; 16-bit parameters after the step {p[0]} of {p[1]}{mb}',
+                  f'value: partition sums before the step {g[0]} of {g[1]}; 16-bit parameters after the step {p[0]} of {p[1]}{mb}{al}',
                   flush=True)
         reduce_grads._ftv2_wrapped = True
         reduce_tied._ftv2_wrapped = True
@@ -649,6 +684,7 @@ class ZeroAdapter:
         def train_batch(data_iter=None):
             J, drop = start()
             st['pos'], st['drop_until'], st['pending'] = int(J), int(drop), False
+            st['raw_restore'] = raw is not None and int(drop) > 0
             if nan_lvl >= 2:
                 st['nanc'] = [0] * len(NAN_KINDS)
                 st['nanf'].zero_()
